@@ -1,0 +1,8 @@
+{
+  "firestore": {
+    "databaseId": "ai-studio-meetmindatlas-03f64441-6c75-42b0-a492-292ea95f0b2b",
+    "rules": "firestore.rules",
+    "edition": "ENTERPRISE",
+    "dataAccessMode": "FIRESTORE_NATIVE"
+  }
+}
