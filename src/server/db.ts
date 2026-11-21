@@ -1,17 +1,38 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { getDataDir, getDbFilePath, getRecordingsDir } from "./storage";
 
 const DATA_DIR = getDataDir();
 const DB_FILE = getDbFilePath();
 const RECORDINGS_DIR = getRecordingsDir();
 
-// Ensure data directories exist
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+function getModuleDir(): string {
+  try {
+    if (typeof import.meta !== "undefined" && import.meta.url) {
+      return path.dirname(fileURLToPath(import.meta.url));
+    }
+  } catch {
+    // fallback to process.cwd()
+  }
+  return process.cwd();
 }
-if (!fs.existsSync(RECORDINGS_DIR)) {
-  fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+
+// Ensure data directories exist
+try {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+} catch {
+  // best effort in serverless environments
+}
+
+try {
+  if (!fs.existsSync(RECORDINGS_DIR)) {
+    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+  }
+} catch {
+  // best effort in serverless environments
 }
 
 export interface UserRecord {
@@ -544,14 +565,16 @@ class DatabaseManager {
     }
 
     // 2. Try candidate bundled seed files (essential for Vercel Serverless / Lambda cold starts)
+    const moduleDir = getModuleDir();
     const candidates = [
       path.resolve(process.cwd(), "data", "meetmind_db.json"),
       path.resolve(process.cwd(), "meetmind_db.json"),
-      path.join(process.cwd(), "data", "meetmind_db.json"),
-      path.resolve(__dirname, "../../data/meetmind_db.json"),
-      path.resolve(__dirname, "../data/meetmind_db.json"),
-      path.resolve(__dirname, "data/meetmind_db.json"),
-      path.resolve(__dirname, "meetmind_db.json"),
+      path.resolve(moduleDir, "../../data/meetmind_db.json"),
+      path.resolve(moduleDir, "../data/meetmind_db.json"),
+      path.resolve(moduleDir, "data/meetmind_db.json"),
+      path.resolve(moduleDir, "meetmind_db.json"),
+      path.resolve("/var/task/data/meetmind_db.json"),
+      path.resolve("/var/task/meetmind_db.json"),
     ];
 
     for (const candidate of candidates) {
