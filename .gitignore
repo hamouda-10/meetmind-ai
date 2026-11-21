@@ -20,6 +20,10 @@ dist-ssr
 .wrangler/
 .dev.vars
 
+# Vercel
+.vercel/
+
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -41,6 +45,8 @@ data/recordings/*
 !data/recordings/.gitkeep
 data/avatars/*
 !data/avatars/.gitkeep
+data/chunks/*
+!data/chunks/.gitkeep
 services/ai_service/packages/
 services/ai_service/models/
 

@@ -8509,7 +8509,8 @@
     "m_1795233615151_7f69",
     "m_1795233691441",
     "m_1795233715993",
-    "m_1795231692683"
+    "m_1795231692683",
+    "m_1795296309686_afb5"
   ],
   "chatMessages": [
     {
@@ -9198,15 +9199,15 @@
       "lastUsedAt": "2026-11-21T03:18:55.968Z"
     },
     {
-      "id": "ses_mwqu35vc_661d3b61b7350beca5a9",
-      "userId": "usr_mwof27f2_63af8ce1b051",
-      "refreshTokenHash": "1635420de519cde366908dd6dffc97dd32305469e7cee8e48995e0d51df9a817",
-      "isGuest": false,
-      "rememberMe": true,
+      "id": "ses_mwqx1ixu_e525e2a61a68eeff9aa6",
+      "userId": "guest_mwqx1ixu_507628cee904",
+      "refreshTokenHash": "b2f12425d2e8efdfdb89ec02e4682164b3f3aad9c6a7f5e58276118f59d8d00f",
+      "isGuest": true,
+      "rememberMe": false,
       "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36",
-      "expiresAt": "2026-12-21T20:01:41.497Z",
-      "createdAt": "2026-11-21T20:01:41.497Z",
-      "lastUsedAt": "2026-11-21T20:01:41.497Z"
+      "expiresAt": "2026-11-22T09:24:23.970Z",
+      "createdAt": "2026-11-21T21:24:23.970Z",
+      "lastUsedAt": "2026-11-21T21:24:23.970Z"
     }
   ],
   "passwordResetTokens": [
@@ -9238,6 +9239,30 @@
     {
       "jti": "jti_9647721317b1fbeb96cd9ad4",
       "exp": 1795336040
+    },
+    {
+      "jti": "jti_f3352be64353fc4e10963834",
+      "exp": 1795334501
+    },
+    {
+      "jti": "jti_2e234fa9efa2bbe1a3907c62",
+      "exp": 1795339456
+    },
+    {
+      "jti": "jti_7b793238079c3d1ed9027138",
+      "exp": 1795340453
+    },
+    {
+      "jti": "jti_9bff68492ddb101642cf4c57",
+      "exp": 1795340453
+    },
+    {
+      "jti": "jti_271f4df2b1fd81c663f4244e",
+      "exp": 1795340724
+    },
+    {
+      "jti": "jti_bc1c48e5fc3cc002df54c0a3",
+      "exp": 1795340724
     }
   ]
 }
