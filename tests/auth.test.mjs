@@ -66,11 +66,13 @@ describe("MeetMind AI — Production Host, Auth, Autofill, Remember Me & Securit
     }
   });
 
-  it("allows meetmind-atlas.ai.studio, project-graduation.ai.studio, and localhost while blocking untrusted hosts", async () => {
+  it("allows meetmind-atlas.ai.studio, project-graduation.ai.studio, vercel.app, and localhost while blocking untrusted hosts", async () => {
+    const targetPort = new URL(BASE_URL).port || "3000";
     for (const host of [
       "meetmind-atlas.ai.studio",
       "project-graduation.ai.studio",
-      "localhost:3000",
+      "meetmind-atlas.vercel.app",
+      `localhost:${targetPort}`,
     ]) {
       const res = await requestWithHostHeader(host, "/login");
       assert.equal(res.status, 200, `Host "${host}" must be allowed (got ${res.status})`);
@@ -454,5 +456,35 @@ describe("MeetMind AI — Production Host, Auth, Autofill, Remember Me & Securit
       (await fetch(`${BASE_URL}/api/v1/auth/me`, { headers: guestHeaders })).status,
       401,
     );
+  });
+
+  it("returns ACCOUNT_NOT_FOUND with actionable message when email does not exist", async () => {
+    const unknownRes = await fetch(`${BASE_URL}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "unknown_nonexistent_user@meetmind.local",
+        password: "ValidPassword123!",
+      }),
+    });
+    assert.equal(unknownRes.status, 404);
+    const body = await unknownRes.json();
+    assert.equal(body.code, "ACCOUNT_NOT_FOUND");
+    assert.equal(body.error, "Account not found. Please create an account first.");
+  });
+
+  it("returns INVALID_CREDENTIALS when password is wrong for existing account", async () => {
+    const wrongPassRes = await fetch(`${BASE_URL}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "alex.kim@acme.edu",
+        password: "WrongPassword999!",
+      }),
+    });
+    assert.equal(wrongPassRes.status, 401);
+    const body = await wrongPassRes.json();
+    assert.equal(body.code, "INVALID_CREDENTIALS");
+    assert.equal(body.error, "Incorrect email or password.");
   });
 });

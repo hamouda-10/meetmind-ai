@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { getDataDir, getDbFilePath, getRecordingsDir } from "./storage";
 
 const DATA_DIR = getDataDir();
@@ -19,8 +20,7 @@ export interface UserRecord {
   name: string;
   passwordHash: string;
   role: "admin" | "member" | "student" | "instructor" | "guest";
-  authProvider?: "local" | "google" | "guest";
-  googleSub?: string;
+  authProvider?: "local" | "guest";
   emailVerified?: boolean;
   isGuest?: boolean;
   avatarUrl?: string;
@@ -410,7 +410,47 @@ export interface DatabaseSchema {
 function getInitialData(): DatabaseSchema {
   const now = new Date().toISOString();
   return {
-    users: [],
+    users: [
+      {
+        id: "usr_admin",
+        email: "alex.kim@acme.edu",
+        name: "Alex Kim",
+        passwordHash:
+          "scrypt$35b75f75bde6e6f373d4ab7130f99501$bb9d3f5c35cbcf8088b31a7bb69e3ee5a36d14e8de12a9f1772f7fa7ea32e0cc989aa04ad20df44a2dd09d639f231ab9170bc2d7dfb71b8744c5613add401276",
+        role: "admin",
+        authProvider: "local",
+        emailVerified: true,
+        isGuest: false,
+        department: "Computer Science & Engineering",
+        createdAt: "2026-10-29T22:54:01.857Z",
+      },
+      {
+        id: "usr_demo",
+        email: "demo@meetmind.ai",
+        name: "Demo Member",
+        passwordHash:
+          "scrypt$2d6745e189b7ad4cd9e751afdb955b28$50872c2f3c6579459ee2fb37f06507a10f5e611de5123848b460d1b441b62e14fff6d0b4d4e0b424ed4364b67d55c8fba0f75e6655b9f48c154a717c0e1abf74",
+        role: "member",
+        authProvider: "local",
+        emailVerified: true,
+        isGuest: false,
+        department: "Engineering",
+        createdAt: "2026-11-20T00:00:00.000Z",
+      },
+      {
+        id: "usr_mwof27f2_63af8ce1b051",
+        email: "hamoudaabdo689@gmail.com",
+        name: "ABDELRAHMAN HAMOUDA",
+        passwordHash:
+          "scrypt$17f31f77b6d36588068e20e636d362fe$2e81e530e8970e0fb0c2b6107634f77ee317f7ad098976ec7dac2eeaa96466689767098a921c3753ef609ce45dd34df5b0fbbd9838126040e50d5e475acae851",
+        role: "member",
+        authProvider: "local",
+        emailVerified: true,
+        isGuest: false,
+        department: "Computer Science",
+        createdAt: "2026-11-20T03:25:30.254Z",
+      },
+    ],
     authSessions: [],
     passwordResetTokens: [],
     revokedTokens: [],
@@ -424,7 +464,6 @@ function getInitialData(): DatabaseSchema {
         createdAt: now,
       },
     ],
-    // Clean initial state with zero pre-baked or fake records
     meetings: [],
     lectures: [],
     actionItems: [],
@@ -442,7 +481,7 @@ function getInitialData(): DatabaseSchema {
       {
         id: `aud_${Date.now()}`,
         userId: "usr_admin",
-        action: "SYSTEM_INITIALIZED_CLEAN",
+        action: "SYSTEM_INITIALIZED",
         resource: "System",
         timestamp: now,
       },
@@ -457,36 +496,123 @@ class DatabaseManager {
     this.data = this.load();
   }
 
+  private ensureSchemaArrays(parsed: Partial<DatabaseSchema>): DatabaseSchema {
+    if (!Array.isArray(parsed.users)) parsed.users = [];
+    if (!Array.isArray(parsed.authSessions)) parsed.authSessions = [];
+    if (!Array.isArray(parsed.passwordResetTokens)) parsed.passwordResetTokens = [];
+    if (!Array.isArray(parsed.revokedTokens)) parsed.revokedTokens = [];
+    if (!Array.isArray(parsed.workspaces)) parsed.workspaces = [];
+    if (!Array.isArray(parsed.meetings)) parsed.meetings = [];
+    if (!Array.isArray(parsed.lectures)) parsed.lectures = [];
+    if (!Array.isArray(parsed.actionItems)) parsed.actionItems = [];
+    if (!Array.isArray(parsed.quizzes)) parsed.quizzes = [];
+    if (!Array.isArray(parsed.quizAttempts)) parsed.quizAttempts = [];
+    if (!Array.isArray(parsed.flashcards)) parsed.flashcards = [];
+    if (!Array.isArray(parsed.mindMaps)) parsed.mindMaps = [];
+    if (!Array.isArray(parsed.chatMessages)) parsed.chatMessages = [];
+    if (!Array.isArray(parsed.notifications)) parsed.notifications = [];
+    if (!Array.isArray(parsed.calendarEvents)) parsed.calendarEvents = [];
+    if (!Array.isArray(parsed.jobs)) parsed.jobs = [];
+    if (!Array.isArray(parsed.recordingSessions)) parsed.recordingSessions = [];
+    if (!Array.isArray(parsed.deletedResourceIds)) parsed.deletedResourceIds = [];
+    if (!Array.isArray(parsed.auditLogs)) parsed.auditLogs = [];
+
+    // Ensure default seeded admin always exists
+    const adminExists = parsed.users.some(
+      (u) => u.email.toLowerCase() === "alex.kim@acme.edu" || u.id === "usr_admin",
+    );
+    if (!adminExists) {
+      const initial = getInitialData();
+      parsed.users.unshift(initial.users[0]);
+    }
+
+    return parsed as DatabaseSchema;
+  }
+
   private load(): DatabaseSchema {
+    // 1. Try DB_FILE (active writable storage path)
     try {
       if (fs.existsSync(DB_FILE)) {
         const raw = fs.readFileSync(DB_FILE, "utf-8");
-        const parsed: DatabaseSchema = JSON.parse(raw);
-        if (!parsed.authSessions) parsed.authSessions = [];
-        if (!parsed.passwordResetTokens) parsed.passwordResetTokens = [];
-        if (!parsed.revokedTokens) parsed.revokedTokens = [];
-        if (!parsed.recordingSessions) parsed.recordingSessions = [];
-        if (!parsed.quizAttempts) parsed.quizAttempts = [];
-        if (!parsed.deletedResourceIds) parsed.deletedResourceIds = [];
-        if (!parsed.flashcards) parsed.flashcards = [];
-        if (!parsed.mindMaps) parsed.mindMaps = [];
-        if (!parsed.chatMessages) parsed.chatMessages = [];
-        return parsed;
+        const parsed: Partial<DatabaseSchema> = JSON.parse(raw);
+        if (Array.isArray(parsed.users) && parsed.users.length > 0) {
+          return this.ensureSchemaArrays(parsed);
+        }
       }
     } catch (err) {
-      console.error("Failed to read database file, reinitializing", err);
+      console.error("Failed to read primary database file, searching candidate sources:", err);
     }
+
+    // 2. Try candidate bundled seed files (essential for Vercel Serverless / Lambda cold starts)
+    const candidates = [
+      path.resolve(process.cwd(), "data", "meetmind_db.json"),
+      path.resolve(process.cwd(), "meetmind_db.json"),
+      path.join(process.cwd(), "data", "meetmind_db.json"),
+      path.resolve(__dirname, "../../data/meetmind_db.json"),
+      path.resolve(__dirname, "../data/meetmind_db.json"),
+      path.resolve(__dirname, "data/meetmind_db.json"),
+      path.resolve(__dirname, "meetmind_db.json"),
+    ];
+
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).size > 20) {
+          const raw = fs.readFileSync(candidate, "utf-8");
+          const parsed: Partial<DatabaseSchema> = JSON.parse(raw);
+          if (Array.isArray(parsed.users) && parsed.users.length > 0) {
+            const verified = this.ensureSchemaArrays(parsed);
+            this.saveData(verified);
+            return verified;
+          }
+        }
+      } catch {
+        // continue to next candidate
+      }
+    }
+
+    // 3. Fallback to rich embedded initial schema with verified scrypt hashes
     const initial = getInitialData();
     this.saveData(initial);
     return initial;
   }
 
+  private syncRemoteKV(data: DatabaseSchema): void {
+    const url = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
+    const token = (
+      process.env.KV_REST_API_TOKEN ||
+      process.env.UPSTASH_REDIS_REST_TOKEN ||
+      ""
+    ).trim();
+    if (!url || !token) return;
+
+    try {
+      const endpoint = `${url.replace(/\/$/, "")}/set/meetmind_db`;
+      void fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(JSON.stringify(data)),
+      }).catch((err) => {
+        console.warn("Vercel KV async sync warning:", err);
+      });
+    } catch {
+      // ignore sync errors
+    }
+  }
+
   private saveData(data: DatabaseSchema) {
     try {
+      const dir = path.dirname(DB_FILE);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
       fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
     } catch (err) {
       console.error("Failed to persist database file", err);
     }
+    this.syncRemoteKV(data);
   }
 
   public get<K extends keyof DatabaseSchema>(key: K): DatabaseSchema[K] {

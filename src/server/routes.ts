@@ -58,7 +58,6 @@ import {
   appendClearAuthCookies,
   authenticateRequest,
   createSessionTokens,
-  getConfiguredGoogleClientId,
   hashPasswordSecure,
   hashToken,
   normalizeEmail,
@@ -68,7 +67,6 @@ import {
   validateEmailAddress,
   validatePasswordStrength,
   verifyAccessJwt,
-  verifyGoogleIdentity,
   verifyPasswordSecure,
 } from "./auth";
 
@@ -416,7 +414,11 @@ function getScopedResourceIds(user: UserRecord): Set<string> {
 
 export async function handleApiRequest(req: Request): Promise<Response | null> {
   const url = new URL(req.url);
-  const pathname = url.pathname;
+  let pathname = url.pathname;
+
+  if (pathname.startsWith("/api/") && !pathname.startsWith("/api/v1/")) {
+    pathname = pathname.replace(/^\/api\//, "/api/v1/");
+  }
 
   if (!pathname.startsWith("/api/v1")) {
     return null; // Not an API request
@@ -444,6 +446,8 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       return Response.json({
         googleEnabled: false,
         googleClientId: null,
+        emailPasswordEnabled: true,
+        guestEnabled: true,
       });
     }
 

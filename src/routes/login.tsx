@@ -1,6 +1,17 @@
-import { useState, type FormEvent } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import { createFileRoute, Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Eye, EyeOff, Loader2, AlertCircle, ArrowRight, UserPlus } from "lucide-react";
+import {
+  Eye,
+  EyeOff,
+  Loader2,
+  AlertCircle,
+  ArrowRight,
+  UserPlus,
+  Compass,
+  Sparkles,
+  Lock,
+  Mail,
+} from "lucide-react";
 import { toast } from "sonner";
 import { AuthShell } from "@/components/auth/auth-shell";
 import { useAuthStore } from "@/stores/auth-store";
@@ -27,6 +38,7 @@ function LoginPage() {
   const { language } = useTranslation();
 
   const login = useAuthStore((s) => s.login);
+  const loginAsGuest = useAuthStore((s) => s.loginAsGuest);
   const sessionNotice = useAuthStore((s) => s.sessionNotice);
   const clearSessionNotice = useAuthStore((s) => s.clearSessionNotice);
 
@@ -35,13 +47,22 @@ function LoginPage() {
   const [rememberMe, setRememberMe] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
 
-  const [submitting, setSubmitting] = useState<"credentials" | null>(null);
+  const [submitting, setSubmitting] = useState<"credentials" | "guest" | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isAccountNotFound, setIsAccountNotFound] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string }>({});
 
   const isAr = language === "AR";
   const isBusy = submitting !== null;
+
+  // Prefill email if passed in query string (e.g. from registration redirect)
+  useEffect(() => {
+    const params = new URLSearchParams(searchStr || "");
+    const queryEmail = params.get("email");
+    if (queryEmail) {
+      setEmail((prev) => (prev ? prev : queryEmail.trim()));
+    }
+  }, [searchStr]);
 
   const validateFields = (): boolean => {
     const errors: { email?: string; password?: string } = {};
@@ -71,7 +92,7 @@ function LoginPage() {
 
     setSubmitting("credentials");
     try {
-      const normalizedEmail = email.trim();
+      const normalizedEmail = email.trim().toLowerCase();
       const user = await login({ email: normalizedEmail, password, rememberMe });
       void storeBrowserPasswordCredential({
         email: normalizedEmail,
@@ -99,11 +120,36 @@ function LoginPage() {
       } else {
         const msg =
           rawMsg ||
-          (isAr
-            ? "تعذر تسجيل الدخول. يرجى المحاولة مرة أخرى."
-            : "Unable to sign in. Please try again.");
+          (isAr ? "البريد الإلكتروني أو كلمة المرور غير صحيحة." : "Invalid email or password.");
         setErrorMessage(msg);
       }
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  const handleGuestLogin = async () => {
+    if (isBusy) return;
+    setErrorMessage(null);
+    setIsAccountNotFound(false);
+    clearSessionNotice();
+    setSubmitting("guest");
+
+    try {
+      const guest = await loginAsGuest();
+      toast.success(
+        isAr ? "مرحباً بك في وضع الاستكشاف كضيف!" : "Welcome to MeetMind AI Guest Mode!",
+      );
+      const destination = getSafeRedirect(searchStr);
+      void navigate({ to: destination as never, replace: true });
+    } catch (err: unknown) {
+      const rawMsg = (err as Error)?.message || "";
+      toast.error(
+        rawMsg ||
+          (isAr
+            ? "تعذر بدء جلسة الضيف. يرجى المحاولة مرة أخرى."
+            : "Could not initialize guest session. Please try again."),
+      );
     } finally {
       setSubmitting(null);
     }
@@ -124,6 +170,7 @@ function LoginPage() {
           </span>
           <Link
             to={"/register" as never}
+            search={{ email: email.trim() || undefined } as never}
             className="font-bold text-amber-400 transition-colors hover:text-amber-300 underline-offset-4 hover:underline"
           >
             {isAr ? "إنشاء حساب" : "Create account"}
@@ -143,8 +190,44 @@ function LoginPage() {
         </div>
       )}
 
-      {/* Real backend or validation error banner */}
-      {errorMessage && (
+      {/* Account Not Found Alert (Prominent with direct Create Account action) */}
+      {isAccountNotFound && (
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="mb-5 rounded-xl border border-amber-500/50 bg-gradient-to-br from-amber-950/60 via-zinc-950/90 to-amber-950/40 p-4 text-xs leading-relaxed text-amber-200 shadow-[0_4px_24px_rgba(212,175,55,0.15)] animate-in fade-in slide-in-from-top-2 duration-300"
+        >
+          <div className="flex items-start gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/20 text-amber-400 border border-amber-500/30">
+              <AlertCircle className="h-4 w-4" />
+            </div>
+            <div className="flex-1 space-y-2.5">
+              <div>
+                <p className="font-bold text-amber-100 text-sm">
+                  {isAr ? "الحساب غير موجود" : "Account not found"}
+                </p>
+                <p className="text-zinc-300 text-xs mt-0.5 leading-relaxed">
+                  {isAr
+                    ? "لم يتم العثور على حساب مسجل بهذا البريد الإلكتروني. يرجى إنشاء حساب جديد أولاً."
+                    : "No account was found with this email address. Please create an account first."}
+                </p>
+              </div>
+              <Link
+                to={"/register" as never}
+                search={{ email: email.trim() } as never}
+                className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-amber-400 via-amber-500 to-amber-400 px-4 py-2 text-xs font-bold text-zinc-950 shadow-[0_4px_16px_rgba(212,175,55,0.4)] transition-all hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
+              >
+                <UserPlus className="h-3.5 w-3.5" />
+                <span>{isAr ? "إنشاء حساب الآن" : "Create Account"}</span>
+                <ArrowRight className="h-3.5 w-3.5 rtl:rotate-180" />
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Generic error banner (e.g. incorrect credentials, network) */}
+      {errorMessage && !isAccountNotFound && (
         <div
           role="alert"
           aria-live="assertive"
@@ -152,33 +235,20 @@ function LoginPage() {
         >
           <div className="flex items-start gap-2.5">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
-            <div className="flex-1 space-y-2">
-              <p className="font-medium">{errorMessage}</p>
-              {isAccountNotFound && (
-                <div className="pt-1">
-                  <Link
-                    to={"/register" as never}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-amber-400 to-amber-500 px-3 py-1.5 text-xs font-bold text-zinc-950 shadow-[0_4px_16px_rgba(212,175,55,0.4)] transition-all hover:from-amber-300 hover:to-amber-400 active:scale-[0.98]"
-                  >
-                    <UserPlus className="h-3.5 w-3.5" />
-                    <span>{isAr ? "إنشاء حساب الآن" : "Create account"}</span>
-                    <ArrowRight className="h-3.5 w-3.5 rtl:rotate-180" />
-                  </Link>
-                </div>
-              )}
-            </div>
+            <p className="font-medium">{errorMessage}</p>
           </div>
         </div>
       )}
 
       <form method="post" onSubmit={handleSubmit} noValidate className="space-y-4">
-        {/* Email / Username */}
+        {/* Email */}
         <div className="auth-field-group">
           <label
             htmlFor="login-email"
-            className="mb-1.5 block text-xs font-semibold tracking-wide text-zinc-200"
+            className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-zinc-200"
           >
-            {isAr ? "البريد الإلكتروني" : "Email address"}
+            <Mail className="h-3.5 w-3.5 text-amber-400/80" />
+            <span>{isAr ? "البريد الإلكتروني" : "Email address"}</span>
           </label>
           <input
             id="login-email"
@@ -216,9 +286,10 @@ function LoginPage() {
         <div className="auth-field-group">
           <label
             htmlFor="login-password"
-            className="mb-1.5 block text-xs font-semibold tracking-wide text-zinc-200"
+            className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-zinc-200"
           >
-            {isAr ? "كلمة المرور" : "Password"}
+            <Lock className="h-3.5 w-3.5 text-amber-400/80" />
+            <span>{isAr ? "كلمة المرور" : "Password"}</span>
           </label>
           <div className="relative">
             <input
@@ -277,17 +348,17 @@ function LoginPage() {
               checked={rememberMe}
               disabled={isBusy}
               onChange={(e) => setRememberMe(e.target.checked)}
-              className="h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-amber-400 accent-amber-400 transition-transform active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50"
+              className="h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-amber-400 accent-amber-400 transition-transform active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 cursor-pointer"
             />
             <span>{isAr ? "تذكرني على هذا الجهاز" : "Remember me on this device"}</span>
           </label>
         </div>
 
-        {/* Submit Login */}
+        {/* Submit Sign In */}
         <button
           type="submit"
           disabled={isBusy}
-          className="auth-btn-primary mt-2 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-400 via-amber-500 to-amber-400 px-4 text-sm font-bold text-zinc-950 shadow-[0_8px_30px_-8px_rgba(212,175,55,0.55)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 disabled:cursor-not-allowed disabled:opacity-65 cursor-pointer"
+          className="auth-btn-primary mt-2 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-400 via-amber-500 to-amber-400 px-4 text-sm font-bold text-zinc-950 shadow-[0_8px_30px_-8px_rgba(212,175,55,0.55)] transition-all hover:scale-[1.01] active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 disabled:cursor-not-allowed disabled:opacity-65 cursor-pointer"
         >
           {submitting === "credentials" ? (
             <>
@@ -298,6 +369,37 @@ function LoginPage() {
             <>
               <span>{isAr ? "تسجيل الدخول" : "Sign in"}</span>
               <ArrowRight className="h-4 w-4 rtl:rotate-180" />
+            </>
+          )}
+        </button>
+
+        {/* OR Divider */}
+        <div className="relative my-4 flex items-center justify-center">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-zinc-800" />
+          </div>
+          <span className="relative bg-[#0a0a0f] px-3 text-xs uppercase tracking-wider text-zinc-500 font-medium">
+            {isAr ? "أو" : "or"}
+          </span>
+        </div>
+
+        {/* Continue as Guest Button */}
+        <button
+          type="button"
+          disabled={isBusy}
+          onClick={handleGuestLogin}
+          className="flex h-11 w-full items-center justify-center gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 text-sm font-semibold text-amber-200 transition-all hover:border-amber-400/60 hover:bg-amber-500/10 active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 disabled:opacity-60 cursor-pointer"
+        >
+          {submitting === "guest" ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
+              <span>{isAr ? "جارٍ الدخول كضيف..." : "Entering guest mode..."}</span>
+            </>
+          ) : (
+            <>
+              <Compass className="h-4 w-4 text-amber-400" />
+              <span>{isAr ? "المتابعة كضيف" : "Continue as Guest"}</span>
+              <Sparkles className="h-3.5 w-3.5 text-amber-400/80" />
             </>
           )}
         </button>

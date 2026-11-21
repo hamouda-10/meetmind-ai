@@ -34,8 +34,13 @@ const allowedPreviewHosts = Array.from(
     "meetmind-atlas.ai.studio",
     "project-graduation.ai.studio",
     ".ai.studio",
+    ".vercel.app",
+    "meetmind-atlas.vercel.app",
     "ais-dev-ylbfqaeognwr3zaimsleqn-422352775581.europe-west1.run.app",
     "ais-pre-ylbfqaeognwr3zaimsleqn-422352775581.europe-west1.run.app",
+    ...(process.env.VERCEL_URL
+      ? [process.env.VERCEL_URL.toLowerCase().replace(/^https?:\/\//, "")]
+      : []),
     ...parseEnvHosts(),
   ]),
 );

@@ -1,6 +1,20 @@
-import { useState, type FormEvent } from "react";
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { Eye, EyeOff, Loader2, AlertCircle, Check, X, ArrowRight } from "lucide-react";
+import { useState, useEffect, type FormEvent } from "react";
+import { createFileRoute, Link, useNavigate, useRouterState } from "@tanstack/react-router";
+import {
+  Eye,
+  EyeOff,
+  Loader2,
+  AlertCircle,
+  Check,
+  X,
+  ArrowRight,
+  Compass,
+  Sparkles,
+  User,
+  Mail,
+  Lock,
+  ShieldCheck,
+} from "lucide-react";
 import { toast } from "sonner";
 import { AuthShell } from "@/components/auth/auth-shell";
 import { useAuthStore } from "@/stores/auth-store";
@@ -57,9 +71,11 @@ function getPasswordRules(password: string): PasswordRule[] {
 
 function RegisterPage() {
   const navigate = useNavigate();
+  const searchStr = useRouterState({ select: (r) => r.location.searchStr });
   const { language } = useTranslation();
 
   const register = useAuthStore((s) => s.register);
+  const loginAsGuest = useAuthStore((s) => s.loginAsGuest);
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -68,7 +84,7 @@ function RegisterPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
-  const [submitting, setSubmitting] = useState<"register" | null>(null);
+  const [submitting, setSubmitting] = useState<"register" | "guest" | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{
     name?: string;
@@ -82,6 +98,15 @@ function RegisterPage() {
   const rules = getPasswordRules(password);
   const passedCount = rules.filter((r) => r.passed).length;
   const passwordsMatch = confirmPassword.length > 0 && password === confirmPassword;
+
+  // Prefill email if passed in query string (e.g. from Account Not Found on login page)
+  useEffect(() => {
+    const params = new URLSearchParams(searchStr || "");
+    const queryEmail = params.get("email");
+    if (queryEmail) {
+      setEmail((prev) => (prev ? prev : queryEmail.trim()));
+    }
+  }, [searchStr]);
 
   const validateFields = (): boolean => {
     const errors: {
@@ -130,7 +155,7 @@ function RegisterPage() {
 
     setSubmitting("register");
     try {
-      const normalizedEmail = email.trim();
+      const normalizedEmail = email.trim().toLowerCase();
       const user = await register({
         name: name.trim(),
         email: normalizedEmail,
@@ -144,30 +169,84 @@ function RegisterPage() {
       });
       toast.success(
         isAr
-          ? `تم إنشاء حسابك بنجاح، مرحباً ${user.name}`
-          : `Account created. Welcome to MeetMind AI, ${user.name}!`,
+          ? `تم إنشاء الحساب بنجاح! مرحباً بك، ${user.name}`
+          : `Account created successfully! Welcome, ${user.name}`,
       );
       void navigate({ to: "/" as never, replace: true });
-    } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : isAr
-            ? "تعذر إنشاء الحساب. يرجى المحاولة مرة أخرى."
-            : "Unable to create account. Please try again.";
-      setErrorMessage(msg);
+    } catch (err: unknown) {
+      const rawMsg = (err as Error)?.message || "";
+      const isDuplicate =
+        rawMsg.includes("already registered") ||
+        rawMsg.includes("already exists") ||
+        rawMsg.includes("مسجل مسبقاً");
+
+      if (isDuplicate) {
+        setErrorMessage(
+          isAr
+            ? "هذا البريد الإلكتروني مسجل مسبقاً. يرجى تسجيل الدخول أو استخدام بريد آخر."
+            : "This email is already registered. Please sign in or use another email.",
+        );
+      } else {
+        setErrorMessage(
+          rawMsg ||
+            (isAr
+              ? "تعذر إنشاء الحساب. يرجى مراجعة البيانات والمحاولة مرة أخرى."
+              : "Unable to create account. Please check your information and try again."),
+        );
+      }
     } finally {
       setSubmitting(null);
     }
   };
 
+  const handleGuestLogin = async () => {
+    if (isBusy) return;
+    setErrorMessage(null);
+    setSubmitting("guest");
+
+    try {
+      await loginAsGuest();
+      toast.success(
+        isAr ? "مرحباً بك في وضع الاستكشاف كضيف!" : "Welcome to MeetMind AI Guest Mode!",
+      );
+      void navigate({ to: "/" as never, replace: true });
+    } catch (err: unknown) {
+      const rawMsg = (err as Error)?.message || "";
+      toast.error(
+        rawMsg ||
+          (isAr
+            ? "تعذر بدء جلسة الضيف. يرجى المحاولة مرة أخرى."
+            : "Could not initialize guest session. Please try again."),
+      );
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  // Progress percentage
+  const strengthPercent = Math.round((passedCount / rules.length) * 100);
+  const strengthColor =
+    passedCount <= 2 ? "bg-red-500" : passedCount <= 4 ? "bg-amber-400" : "bg-emerald-400";
+  const strengthLabel =
+    passedCount <= 2
+      ? isAr
+        ? "ضعيفة"
+        : "Weak"
+      : passedCount <= 4
+        ? isAr
+          ? "متوسطة"
+          : "Medium"
+        : isAr
+          ? "قوية"
+          : "Strong";
+
   return (
     <AuthShell
-      title={isAr ? "إنشاء حساب MeetMind AI" : "Create your MeetMind AI account"}
+      title={isAr ? "إنشاء حساب MeetMind AI" : "Create MeetMind AI account"}
       subtitle={
         isAr
-          ? "ابدأ مساحة عملك الخاصة للاجتماعات والمحاضرات والتحليل الذكي."
-          : "Start your private workspace for real-time transcripts, summaries, and quizzes."
+          ? "ابدأ بتوثيق وتلخيص اجتماعاتك ومحاضراتك مع أحدث تقنيات الذكاء الاصطناعي."
+          : "Start transcribing, summarizing, and studying your meetings and lectures with AI."
       }
       footer={
         <div className="flex items-center justify-center gap-1.5 text-sm">
@@ -176,6 +255,7 @@ function RegisterPage() {
           </span>
           <Link
             to={"/login" as never}
+            search={{ email: email.trim() || undefined } as never}
             className="font-bold text-amber-400 transition-colors hover:text-amber-300 underline-offset-4 hover:underline"
           >
             {isAr ? "تسجيل الدخول" : "Sign in"}
@@ -183,25 +263,43 @@ function RegisterPage() {
         </div>
       }
     >
+      {/* Error alert banner */}
       {errorMessage && (
         <div
           role="alert"
           aria-live="assertive"
-          className="mb-5 flex items-start gap-2.5 rounded-xl border border-red-500/40 bg-red-950/60 p-3.5 text-xs leading-relaxed text-red-200 animate-in fade-in slide-in-from-top-1 duration-200"
+          className="mb-5 rounded-xl border border-red-500/40 bg-red-950/60 p-3.5 text-xs leading-relaxed text-red-200 animate-in fade-in slide-in-from-top-1 duration-200"
         >
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
-          <span className="font-medium">{errorMessage}</span>
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+            <div className="flex-1">
+              <p className="font-medium">{errorMessage}</p>
+              {errorMessage.includes("already registered") && (
+                <div className="mt-2">
+                  <Link
+                    to={"/login" as never}
+                    search={{ email: email.trim() } as never}
+                    className="inline-flex items-center gap-1 font-bold text-amber-300 hover:text-amber-200 underline"
+                  >
+                    <span>{isAr ? "الانتقال إلى صفحة الدخول" : "Go to Sign in page"}</span>
+                    <ArrowRight className="h-3 w-3 rtl:rotate-180" />
+                  </Link>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
-      <form method="post" onSubmit={handleSubmit} noValidate className="space-y-3.5">
+      <form method="post" onSubmit={handleSubmit} noValidate className="space-y-4">
         {/* Full Name */}
         <div className="auth-field-group">
           <label
             htmlFor="register-name"
-            className="mb-1.5 block text-xs font-semibold tracking-wide text-zinc-200"
+            className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-zinc-200"
           >
-            {isAr ? "الاسم الكامل" : "Full name"}
+            <User className="h-3.5 w-3.5 text-amber-400/80" />
+            <span>{isAr ? "الاسم الكامل" : "Full name"}</span>
           </label>
           <input
             id="register-name"
@@ -232,9 +330,10 @@ function RegisterPage() {
         <div className="auth-field-group">
           <label
             htmlFor="register-email"
-            className="mb-1.5 block text-xs font-semibold tracking-wide text-zinc-200"
+            className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-zinc-200"
           >
-            {isAr ? "البريد الإلكتروني" : "Email address"}
+            <Mail className="h-3.5 w-3.5 text-amber-400/80" />
+            <span>{isAr ? "البريد الإلكتروني" : "Email address"}</span>
           </label>
           <input
             id="register-email"
@@ -269,9 +368,10 @@ function RegisterPage() {
         <div className="auth-field-group">
           <label
             htmlFor="register-password"
-            className="mb-1.5 block text-xs font-semibold tracking-wide text-zinc-200"
+            className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-zinc-200"
           >
-            {isAr ? "كلمة المرور" : "Password"}
+            <Lock className="h-3.5 w-3.5 text-amber-400/80" />
+            <span>{isAr ? "كلمة المرور" : "Password"}</span>
           </label>
           <div className="relative">
             <input
@@ -313,49 +413,56 @@ function RegisterPage() {
             </button>
           </div>
 
-          {/* Live Password Strength Bar + Checklist */}
-          {(password.length > 0 || fieldErrors.password) && (
-            <div
-              id="register-password-rules"
-              className="mt-2.5 rounded-xl border border-zinc-800/90 bg-zinc-950/75 p-3"
-            >
-              <div className="mb-2 flex gap-1" aria-hidden="true">
-                {rules.map((r, idx) => (
-                  <div
-                    key={r.key}
-                    className={`h-1 flex-1 rounded-full transition-colors duration-200 ${
-                      idx < passedCount
-                        ? passedCount === rules.length
-                          ? "bg-emerald-400"
-                          : passedCount >= 3
-                            ? "bg-amber-400"
-                            : "bg-red-400"
-                        : "bg-zinc-800"
-                    }`}
-                  />
-                ))}
+          {/* Password strength progress meter */}
+          {password.length > 0 && (
+            <div className="mt-2 space-y-1.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-zinc-400">
+                  {isAr ? "قوة كلمة المرور:" : "Password strength:"}
+                </span>
+                <span className="font-semibold text-zinc-200">{strengthLabel}</span>
               </div>
-              <ul className="grid grid-cols-1 gap-1 sm:grid-cols-2">
-                {rules.map((rule) => (
-                  <li
-                    key={rule.key}
-                    className={`flex items-center gap-1.5 text-[11px] transition-colors ${
-                      rule.passed ? "text-emerald-300" : "text-zinc-400"
-                    }`}
-                  >
-                    {rule.passed ? (
-                      <Check className="h-3 w-3 shrink-0 text-emerald-400" />
-                    ) : (
-                      <X className="h-3 w-3 shrink-0 text-zinc-600" />
-                    )}
-                    <span>{isAr ? rule.labelAr : rule.labelEn}</span>
-                  </li>
-                ))}
-              </ul>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                <div
+                  className={`h-full transition-all duration-300 ${strengthColor}`}
+                  style={{ width: `${strengthPercent}%` }}
+                />
+              </div>
             </div>
           )}
+
+          {/* Password rules checklist */}
+          <div
+            id="register-password-rules"
+            className="mt-2.5 rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-3"
+          >
+            <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-zinc-300">
+              <ShieldCheck className="h-3.5 w-3.5 text-amber-400" />
+              <span>{isAr ? "متطلبات كلمة المرور:" : "Password requirements:"}</span>
+            </div>
+            <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[11px]">
+              {rules.map((rule) => (
+                <li
+                  key={rule.key}
+                  className={`flex items-center gap-1.5 transition-colors ${
+                    rule.passed ? "text-emerald-400" : "text-zinc-400"
+                  }`}
+                >
+                  {rule.passed ? (
+                    <Check className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  ) : (
+                    <X className="h-3.5 w-3.5 shrink-0 text-zinc-600" />
+                  )}
+                  <span>{isAr ? rule.labelAr : rule.labelEn}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+
           {fieldErrors.password && (
-            <p className="mt-1 text-xs text-red-400">{fieldErrors.password}</p>
+            <p id="register-password-error" className="mt-1 text-xs text-red-400">
+              {fieldErrors.password}
+            </p>
           )}
         </div>
 
@@ -363,9 +470,10 @@ function RegisterPage() {
         <div className="auth-field-group">
           <label
             htmlFor="register-confirm-password"
-            className="mb-1.5 block text-xs font-semibold tracking-wide text-zinc-200"
+            className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-zinc-200"
           >
-            {isAr ? "تأكيد كلمة المرور" : "Confirm password"}
+            <Lock className="h-3.5 w-3.5 text-amber-400/80" />
+            <span>{isAr ? "تأكيد كلمة المرور" : "Confirm password"}</span>
           </label>
           <div className="relative">
             <input
@@ -378,9 +486,8 @@ function RegisterPage() {
               value={confirmPassword}
               onChange={(e) => {
                 setConfirmPassword(e.target.value);
-                if (fieldErrors.confirmPassword) {
+                if (fieldErrors.confirmPassword)
                   setFieldErrors((p) => ({ ...p, confirmPassword: undefined }));
-                }
                 if (errorMessage) setErrorMessage(null);
               }}
               aria-invalid={Boolean(fieldErrors.confirmPassword)}
@@ -433,7 +540,7 @@ function RegisterPage() {
         <button
           type="submit"
           disabled={isBusy}
-          className="auth-btn-primary mt-2 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-400 via-amber-500 to-amber-400 px-4 text-sm font-bold text-zinc-950 shadow-[0_8px_30px_-8px_rgba(212,175,55,0.55)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 disabled:cursor-not-allowed disabled:opacity-65 cursor-pointer"
+          className="auth-btn-primary mt-2 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-400 via-amber-500 to-amber-400 px-4 text-sm font-bold text-zinc-950 shadow-[0_8px_30px_-8px_rgba(212,175,55,0.55)] transition-all hover:scale-[1.01] active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 disabled:cursor-not-allowed disabled:opacity-65 cursor-pointer"
         >
           {submitting === "register" ? (
             <>
@@ -444,6 +551,37 @@ function RegisterPage() {
             <>
               <span>{isAr ? "إنشاء الحساب" : "Create account"}</span>
               <ArrowRight className="h-4 w-4 rtl:rotate-180" />
+            </>
+          )}
+        </button>
+
+        {/* OR Divider */}
+        <div className="relative my-4 flex items-center justify-center">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-zinc-800" />
+          </div>
+          <span className="relative bg-[#0a0a0f] px-3 text-xs uppercase tracking-wider text-zinc-500 font-medium">
+            {isAr ? "أو" : "or"}
+          </span>
+        </div>
+
+        {/* Continue as Guest Button */}
+        <button
+          type="button"
+          disabled={isBusy}
+          onClick={handleGuestLogin}
+          className="flex h-11 w-full items-center justify-center gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 text-sm font-semibold text-amber-200 transition-all hover:border-amber-400/60 hover:bg-amber-500/10 active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 disabled:opacity-60 cursor-pointer"
+        >
+          {submitting === "guest" ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
+              <span>{isAr ? "جارٍ الدخول كضيف..." : "Entering guest mode..."}</span>
+            </>
+          ) : (
+            <>
+              <Compass className="h-4 w-4 text-amber-400" />
+              <span>{isAr ? "المتابعة كضيف" : "Continue as Guest"}</span>
+              <Sparkles className="h-3.5 w-3.5 text-amber-400/80" />
             </>
           )}
         </button>

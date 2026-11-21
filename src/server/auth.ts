@@ -47,68 +47,6 @@ function getJwtSecret(): string {
   }
 }
 
-let cachedFirebaseOAuthConfig: { clientId: string; projectNumber: string } | null | undefined;
-
-function getFirebaseAppletOAuthConfig(): { clientId: string; projectNumber: string } {
-  if (cachedFirebaseOAuthConfig !== undefined) {
-    return cachedFirebaseOAuthConfig || { clientId: "", projectNumber: "" };
-  }
-  try {
-    const configPath = path.resolve(process.cwd(), "firebase-applet-config.json");
-    if (fs.existsSync(configPath)) {
-      const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
-        oAuthClientId?: string;
-        messagingSenderId?: string;
-      };
-      cachedFirebaseOAuthConfig = {
-        clientId: (parsed.oAuthClientId || "").trim(),
-        projectNumber: (parsed.messagingSenderId || "").trim(),
-      };
-      return cachedFirebaseOAuthConfig;
-    }
-  } catch {
-    // ignore unreadable config
-  }
-  cachedFirebaseOAuthConfig = { clientId: "", projectNumber: "" };
-  return cachedFirebaseOAuthConfig;
-}
-
-export function getAllowedGoogleClientIds(): string[] {
-  const fb = getFirebaseAppletOAuthConfig();
-  const candidates = [
-    process.env.GOOGLE_CLIENT_ID || "",
-    process.env.VITE_GOOGLE_CLIENT_ID || "",
-    fb.clientId,
-  ]
-    .map((v) => v.trim())
-    .filter(Boolean);
-  return Array.from(new Set(candidates));
-}
-
-export function isAllowedGoogleAudience(aud?: string, azp?: string): boolean {
-  const allowed = getAllowedGoogleClientIds();
-  const fb = getFirebaseAppletOAuthConfig();
-  if (allowed.length === 0 && !fb.projectNumber) return true;
-  const targets = [aud || "", azp || ""].filter(Boolean);
-  if (targets.length === 0) return true;
-
-  for (const t of targets) {
-    if (allowed.includes(t)) return true;
-    if (
-      fb.projectNumber &&
-      t.startsWith(`${fb.projectNumber}-`) &&
-      t.endsWith(".apps.googleusercontent.com")
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-export function getConfiguredGoogleClientId(): string {
-  return getAllowedGoogleClientIds()[0] || "";
-}
-
 export function normalizeEmail(email: string): string {
   return String(email || "")
     .trim()
@@ -483,7 +421,7 @@ export function appendAuthCookies(
   },
 ) {
   const https = isHttpsRequest(req);
-  const sameSiteAndSecure = https ? "; SameSite=None; Secure" : "; SameSite=Lax";
+  const sameSiteAndSecure = https ? "; SameSite=Lax; Secure" : "; SameSite=Lax";
   const accessMaxAge = tokens.rememberMe ? `; Max-Age=${tokens.expiresInSeconds}` : "";
   const refreshMaxAge = tokens.rememberMe ? `; Max-Age=${tokens.refreshMaxAgeSeconds}` : "";
 
@@ -493,20 +431,20 @@ export function appendAuthCookies(
   );
   headers.append(
     "Set-Cookie",
-    `meetmind_refresh_token=${encodeURIComponent(tokens.refreshToken)}; Path=/api/v1/auth; HttpOnly${sameSiteAndSecure}${refreshMaxAge}`,
+    `meetmind_refresh_token=${encodeURIComponent(tokens.refreshToken)}; Path=/api; HttpOnly${sameSiteAndSecure}${refreshMaxAge}`,
   );
 }
 
 export function appendClearAuthCookies(headers: Headers, req: Request) {
   const https = isHttpsRequest(req);
-  const sameSiteAndSecure = https ? "; SameSite=None; Secure" : "; SameSite=Lax";
+  const sameSiteAndSecure = https ? "; SameSite=Lax; Secure" : "; SameSite=Lax";
   headers.append(
     "Set-Cookie",
     `meetmind_token=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly${sameSiteAndSecure}`,
   );
   headers.append(
     "Set-Cookie",
-    `meetmind_refresh_token=; Path=/api/v1/auth; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly${sameSiteAndSecure}`,
+    `meetmind_refresh_token=; Path=/api; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly${sameSiteAndSecure}`,
   );
 }
 
@@ -598,182 +536,4 @@ export function authenticateRequest(req: Request): AuthRequestResult {
     claims: verified.claims,
     isGuest: Boolean(verified.claims.isGuest || user.isGuest || user.role === "guest"),
   };
-}
-
-export interface VerifiedGoogleIdentity {
-  sub: string;
-  email: string;
-  name: string;
-  picture?: string;
-}
-
-export async function verifyGoogleIdentity(input: {
-  idToken?: string;
-  accessToken?: string;
-}): Promise<
-  { ok: true; identity: VerifiedGoogleIdentity } | { ok: false; status: number; error: string }
-> {
-  try {
-    if (input.idToken && input.idToken.trim()) {
-      const rawToken = input.idToken.trim();
-      // Pre-validate JWT structure: Google tokens are always signed RS256 JWTs with 3 parts and a non-empty signature
-      const jwtParts = rawToken.split(".");
-      if (jwtParts.length !== 3 || !jwtParts[2]) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google identity verification failed. Token is invalid or expired.",
-        };
-      }
-      try {
-        const header = JSON.parse(Buffer.from(jwtParts[0], "base64url").toString("utf8"));
-        if (!header.alg || header.alg.toLowerCase() === "none" || header.alg !== "RS256") {
-          return {
-            ok: false,
-            status: 401,
-            error: "Google identity verification failed. Token is invalid or expired.",
-          };
-        }
-      } catch {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google identity verification failed. Token is invalid or expired.",
-        };
-      }
-
-      const res = await fetch(
-        `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(rawToken)}`,
-        { method: "GET" },
-      );
-
-      if (!res.ok) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google identity verification failed. Token is invalid or expired.",
-        };
-      }
-
-      const payload = (await res.json()) as {
-        sub?: string;
-        email?: string;
-        email_verified?: string | boolean;
-        name?: string;
-        picture?: string;
-        aud?: string;
-        azp?: string;
-        exp?: string;
-      };
-
-      const emailVerified = payload.email_verified === true || payload.email_verified === "true";
-      if (!payload.sub || !payload.email || !emailVerified) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google account must have a verified email address.",
-        };
-      }
-
-      if (!isAllowedGoogleAudience(payload.aud, payload.azp)) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google token audience mismatch. Check your Google OAuth Client ID configuration.",
-        };
-      }
-
-      const expSec = Number(payload.exp || 0);
-      if (expSec > 0 && expSec <= Math.floor(Date.now() / 1000)) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google authentication token has expired. Please try again.",
-        };
-      }
-
-      return {
-        ok: true,
-        identity: {
-          sub: payload.sub,
-          email: normalizeEmail(payload.email),
-          name: (payload.name || payload.email.split("@")[0] || "Google User").trim(),
-          picture: payload.picture,
-        },
-      };
-    }
-
-    if (input.accessToken && input.accessToken.trim()) {
-      const accessToken = input.accessToken.trim();
-      // Always validate token authenticity & expiry against Google's tokeninfo endpoint
-      const tiRes = await fetch(
-        `https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(accessToken)}`,
-      );
-      if (!tiRes.ok) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google access token is invalid or expired.",
-        };
-      }
-
-      const ti = (await tiRes.json()) as { aud?: string; azp?: string; expires_in?: string };
-      if (!isAllowedGoogleAudience(ti.aud, ti.azp)) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google access token was not issued for this application.",
-        };
-      }
-
-      const infoRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-      if (!infoRes.ok) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Unable to verify Google profile. Please try signing in again.",
-        };
-      }
-
-      const profile = (await infoRes.json()) as {
-        sub?: string;
-        email?: string;
-        email_verified?: boolean;
-        name?: string;
-        picture?: string;
-      };
-
-      if (!profile.sub || !profile.email || !profile.email_verified) {
-        return {
-          ok: false,
-          status: 401,
-          error: "Google account must have a verified email address.",
-        };
-      }
-
-      return {
-        ok: true,
-        identity: {
-          sub: profile.sub,
-          email: normalizeEmail(profile.email),
-          name: (profile.name || profile.email.split("@")[0] || "Google User").trim(),
-          picture: profile.picture,
-        },
-      };
-    }
-
-    return {
-      ok: false,
-      status: 400,
-      error: "Google credential token is required.",
-    };
-  } catch {
-    return {
-      ok: false,
-      status: 503,
-      error: "Unable to reach Google authentication servers. Please try again later.",
-    };
-  }
 }

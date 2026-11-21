@@ -53,7 +53,7 @@ export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {
       const url = new URL(request.url);
-      if (url.pathname.startsWith("/api/v1")) {
+      if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/api/v1")) {
         const apiResponse = await handleApiRequest(request);
         if (apiResponse) return apiResponse;
       }

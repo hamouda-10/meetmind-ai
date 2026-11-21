@@ -260,7 +260,7 @@ export interface AuthUser {
   email: string;
   name: string;
   role: "admin" | "member" | "student" | "instructor" | "guest" | string;
-  authProvider?: "local" | "google" | "guest";
+  authProvider?: "local" | "guest";
   emailVerified?: boolean;
   hasPassword?: boolean;
   isGuest?: boolean;
@@ -399,8 +399,8 @@ export interface AuthSessionResponse {
 }
 
 export interface AuthConfigResponse {
-  googleEnabled: boolean;
-  googleClientId: string | null;
+  emailPasswordEnabled: boolean;
+  guestEnabled: boolean;
 }
 
 function sanitizeAsciiHeaderValue(value: string): string {
@@ -674,18 +674,6 @@ class ApiClient {
     department?: string;
   }): Promise<AuthSessionResponse> {
     return this.request<AuthSessionResponse>("/api/v1/auth/register", {
-      method: "POST",
-      body: JSON.stringify(payload),
-      retries: 0,
-      skipAuthRefresh: true,
-    });
-  }
-
-  async authGoogle(payload: {
-    idToken?: string;
-    accessToken?: string;
-  }): Promise<AuthSessionResponse> {
-    return this.request<AuthSessionResponse>("/api/v1/auth/google", {
       method: "POST",
       body: JSON.stringify(payload),
       retries: 0,

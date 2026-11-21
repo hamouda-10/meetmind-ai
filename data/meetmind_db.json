@@ -4,10 +4,25 @@
       "id": "usr_admin",
       "email": "alex.kim@acme.edu",
       "name": "Alex Kim",
-      "passwordHash": "hash_admin_123456",
+      "passwordHash": "scrypt$35b75f75bde6e6f373d4ab7130f99501$bb9d3f5c35cbcf8088b31a7bb69e3ee5a36d14e8de12a9f1772f7fa7ea32e0cc989aa04ad20df44a2dd09d639f231ab9170bc2d7dfb71b8744c5613add401276",
       "role": "admin",
+      "authProvider": "local",
+      "emailVerified": true,
+      "isGuest": false,
       "department": "Computer Science & Engineering",
       "createdAt": "2026-10-29T22:54:01.857Z"
+    },
+    {
+      "id": "usr_demo",
+      "email": "demo@meetmind.ai",
+      "name": "Demo Member",
+      "passwordHash": "scrypt$2d6745e189b7ad4cd9e751afdb955b28$50872c2f3c6579459ee2fb37f06507a10f5e611de5123848b460d1b441b62e14fff6d0b4d4e0b424ed4364b67d55c8fba0f75e6655b9f48c154a717c0e1abf74",
+      "role": "member",
+      "authProvider": "local",
+      "emailVerified": true,
+      "isGuest": false,
+      "department": "Engineering",
+      "createdAt": "2026-11-20T00:00:00.000Z"
     },
     {
       "id": "usr_ava",
@@ -9183,15 +9198,15 @@
       "lastUsedAt": "2026-11-21T03:18:55.968Z"
     },
     {
-      "id": "ses_mwqbqitm_83b8dc82716c2aac63d4",
+      "id": "ses_mwqu35vc_661d3b61b7350beca5a9",
       "userId": "usr_mwof27f2_63af8ce1b051",
-      "refreshTokenHash": "76168d345b852fbc70f3a455262b4886ad5598b5a3a54f2f12bcbc1557b88da2",
+      "refreshTokenHash": "1635420de519cde366908dd6dffc97dd32305469e7cee8e48995e0d51df9a817",
       "isGuest": false,
       "rememberMe": true,
       "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36",
-      "expiresAt": "2026-12-21T11:27:58.666Z",
-      "createdAt": "2026-11-21T11:27:58.666Z",
-      "lastUsedAt": "2026-11-21T11:27:58.666Z"
+      "expiresAt": "2026-12-21T20:01:41.497Z",
+      "createdAt": "2026-11-21T20:01:41.497Z",
+      "lastUsedAt": "2026-11-21T20:01:41.497Z"
     }
   ],
   "passwordResetTokens": [
@@ -9205,132 +9220,24 @@
   ],
   "revokedTokens": [
     {
-      "jti": "jti_c3a71e98069f2f0071dac28d",
-      "exp": 1795266656
+      "jti": "jti_a95ad58c9064755343aeb950",
+      "exp": 1795303678
     },
     {
-      "jti": "jti_ff673182dd852e7863a1a556",
-      "exp": 1795266656
+      "jti": "jti_38156ca5bfdb3e36b8ce0147",
+      "exp": 1795336015
     },
     {
-      "jti": "jti_cc5ae3199cd252b101ceb38e",
-      "exp": 1795266738
+      "jti": "jti_e4f2789fd52abedbaad60661",
+      "exp": 1795336015
     },
     {
-      "jti": "jti_f2f09d1592d65aa1b709c432",
-      "exp": 1795266738
+      "jti": "jti_0469743bdfdf69e4f386cfb8",
+      "exp": 1795336040
     },
     {
-      "jti": "jti_00e1be0c6d0618ebfba2abf9",
-      "exp": 1795266790
-    },
-    {
-      "jti": "jti_b7d2bb5f13ee37117ee41df8",
-      "exp": 1795266790
-    },
-    {
-      "jti": "jti_8648b7d7f9fc977891cb3967",
-      "exp": 1795267981
-    },
-    {
-      "jti": "jti_dec317caaa672cba4bfbb87c",
-      "exp": 1795267981
-    },
-    {
-      "jti": "jti_c9a2348f4d5b11904b453ba1",
-      "exp": 1795270312
-    },
-    {
-      "jti": "jti_ef5e4a158f89c25ba142c8e3",
-      "exp": 1795270312
-    },
-    {
-      "jti": "jti_11b6e56d482f70d563c028f3",
-      "exp": 1795270754
-    },
-    {
-      "jti": "jti_a0e8dda3e3ccca69fc1dcfd1",
-      "exp": 1795270754
-    },
-    {
-      "jti": "jti_d97cc15d3b1dfc587d008185",
-      "exp": 1795271236
-    },
-    {
-      "jti": "jti_bffbe534dd722063b560df7b",
-      "exp": 1795272715
-    },
-    {
-      "jti": "jti_3416041f7f76293c5ddc5c29",
-      "exp": 1795272715
-    },
-    {
-      "jti": "jti_09e20dd356468b25e90e9e61",
-      "exp": 1795271484
-    },
-    {
-      "jti": "jti_42fff653c0eeffcf28d7a335",
-      "exp": 1795272996
-    },
-    {
-      "jti": "jti_d7ff5bf8aa92a3c374da11c6",
-      "exp": 1795274287
-    },
-    {
-      "jti": "jti_3dd8798e1c95a1d15ffd3a49",
-      "exp": 1795274287
-    },
-    {
-      "jti": "jti_61691e2ed480c15547dec7fa",
-      "exp": 1795274335
-    },
-    {
-      "jti": "jti_edeab5b6fb9a14676a317968",
-      "exp": 1795274375
-    },
-    {
-      "jti": "jti_99674f3948f2a611b47721c2",
-      "exp": 1795274375
-    },
-    {
-      "jti": "jti_73a1f1e5be7488cd5cdef7c0",
-      "exp": 1795274492
-    },
-    {
-      "jti": "jti_4b690ef25d2de618e11bcf8f",
-      "exp": 1795274517
-    },
-    {
-      "jti": "jti_4c4e446db88b759efc99fee8",
-      "exp": 1795276394
-    },
-    {
-      "jti": "jti_449aec36be98d900b8887647",
-      "exp": 1795276394
-    },
-    {
-      "jti": "jti_c57b200ab5fe93de3e88a681",
-      "exp": 1795276520
-    },
-    {
-      "jti": "jti_dd7141a5f4b9b33d9d3ef0d1",
-      "exp": 1795276520
-    },
-    {
-      "jti": "jti_65c33425d4a2f5579703e331",
-      "exp": 1795274529
-    },
-    {
-      "jti": "jti_e6d7e6e4c44c36458e269e84",
-      "exp": 1795276733
-    },
-    {
-      "jti": "jti_a9ec1210538f5677da98810d",
-      "exp": 1795276756
-    },
-    {
-      "jti": "jti_9f2c4fc82777bf7b26696a27",
-      "exp": 1795276780
+      "jti": "jti_9647721317b1fbeb96cd9ad4",
+      "exp": 1795336040
     }
   ]
 }
