@@ -1,7 +1,7 @@
 const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 
-function probe(url, timeoutMs = 800) {
+function probe(url, timeoutMs = 3000) {
   return new Promise((resolve) => {
     try {
       const u = new URL(url);
@@ -9,11 +9,12 @@ function probe(url, timeoutMs = 800) {
         {
           hostname: u.hostname,
           port: u.port,
-          path: u.pathname,
+          path: u.pathname + (u.search || ""),
           method: "GET",
           timeout: timeoutMs,
         },
         (res) => {
+          res.resume();
           resolve(res.statusCode < 500);
         },
       );
@@ -29,18 +30,18 @@ function probe(url, timeoutMs = 800) {
   });
 }
 
-async function waitForServer(url, maxWaitMs = 15000) {
+async function waitForServer(url, maxWaitMs = 35000) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     if (await probe(url)) return true;
-    await new Promise((r) => setTimeout(r, 600));
+    await new Promise((r) => setTimeout(r, 800));
   }
   return false;
 }
 
 async function main() {
-  const isPort3000Ready = await probe("http://127.0.0.1:3000/login");
-  const isPort5173Ready = await probe("http://127.0.0.1:5173/login");
+  const isPort3000Ready = await probe("http://127.0.0.1:3000/api/v1/auth/config");
+  const isPort5173Ready = await probe("http://127.0.0.1:5173/api/v1/auth/config");
 
   let serverProcess = null;
   let testUrl = "http://127.0.0.1:3000";
@@ -65,7 +66,7 @@ async function main() {
       }
     });
 
-    const ready = await waitForServer("http://127.0.0.1:5173/login", 15000);
+    const ready = await waitForServer("http://127.0.0.1:5173/api/v1/auth/config", 35000);
     if (!ready) {
       console.error("Test server failed to start within timeout.");
       try {
@@ -73,6 +74,8 @@ async function main() {
       } catch {}
       process.exit(1);
     }
+    // Warm up SSR route
+    await probe("http://127.0.0.1:5173/login", 5000);
     console.log("Test server ready on http://127.0.0.1:5173");
   }
 

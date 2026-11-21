@@ -17,34 +17,36 @@ const REFRESH_TOKEN_REMEMBER_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 let cachedJwtSecret: string | null = null;
 
-function getJwtSecret(): string {
+export function getJwtSecret(): string {
   if (cachedJwtSecret) return cachedJwtSecret;
 
-  const envSecret = process.env.JWT_SECRET?.trim();
+  const envSecret = process.env.JWT_SECRET?.trim() || process.env.SESSION_SECRET?.trim();
   if (envSecret && envSecret.length >= 24) {
     cachedJwtSecret = envSecret;
     return cachedJwtSecret;
   }
 
-  // Persist a cryptographically random 48-byte server-only signing key on disk so restarts preserve active sessions
-  const secretFile = path.join(getDataDir(), ".jwt_secret");
-  try {
-    if (fs.existsSync(secretFile)) {
-      const existing = fs.readFileSync(secretFile, "utf-8").trim();
-      if (existing.length >= 32) {
-        cachedJwtSecret = existing;
-        return cachedJwtSecret;
-      }
-    }
-    const generated = crypto.randomBytes(48).toString("hex");
-    fs.mkdirSync(path.dirname(secretFile), { recursive: true });
-    fs.writeFileSync(secretFile, generated, { mode: 0o600 });
-    cachedJwtSecret = generated;
-    return cachedJwtSecret;
-  } catch {
-    cachedJwtSecret = crypto.randomBytes(48).toString("hex");
-    return cachedJwtSecret;
-  }
+  // In multi-instance serverless environments (e.g. Vercel), instances do not share ephemeral /tmp.
+  // We derive a cryptographically stable secret based on persistent deployment identifiers,
+  // guaranteeing that JWT signatures created by Container A verify seamlessly on Container B.
+  const deploymentEntropy = [
+    process.env.VERCEL_DEPLOYMENT_ID,
+    process.env.VERCEL_GIT_COMMIT_SHA,
+    process.env.PROJECT_ID,
+    process.env.VERCEL_PROJECT_ID,
+    process.env.PUBLIC_APP_URL,
+    "meetmind-ai-production-auth-stable-seed-2026",
+  ]
+    .filter(Boolean)
+    .join("::");
+
+  const derived = crypto
+    .createHmac("sha256", "meetmind-auth-deterministic-signing-salt-v1")
+    .update(deploymentEntropy)
+    .digest("hex");
+
+  cachedJwtSecret = derived;
+  return cachedJwtSecret;
 }
 
 export function normalizeEmail(email: string): string {
@@ -182,6 +184,108 @@ export function signAccessJwt(
   return { token: `${signingInput}.${sigSegment}`, jti, exp };
 }
 
+export interface RefreshJwtClaims {
+  sub: string;
+  email: string;
+  name: string;
+  role: UserRecord["role"];
+  isGuest: boolean;
+  sid: string;
+  jti: string;
+  iss: string;
+  type: "refresh";
+  rememberMe: boolean;
+  iat: number;
+  exp: number;
+}
+
+export function signRefreshJwt(
+  claims: Omit<RefreshJwtClaims, "iss" | "iat" | "exp" | "jti" | "type">,
+  ttlSeconds: number,
+): { token: string; jti: string; exp: number } {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const jti = `rjti_${crypto.randomBytes(12).toString("hex")}`;
+  const exp = nowSec + ttlSeconds;
+  const fullClaims: RefreshJwtClaims = {
+    ...claims,
+    type: "refresh",
+    jti,
+    iss: "meetmind-ai",
+    iat: nowSec,
+    exp,
+  };
+
+  const headerSegment = base64UrlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const payloadSegment = base64UrlEncode(JSON.stringify(fullClaims));
+  const signingInput = `${headerSegment}.${payloadSegment}`;
+  const sig = crypto.createHmac("sha256", getJwtSecret()).update(signingInput).digest();
+  const sigSegment = base64UrlEncode(sig);
+
+  return { token: `${signingInput}.${sigSegment}`, jti, exp };
+}
+
+export type RefreshJwtVerifyResult =
+  | { valid: true; claims: RefreshJwtClaims }
+  | { valid: false; reason: "MALFORMED" | "INVALID_SIGNATURE" | "EXPIRED" | "REVOKED" };
+
+export function verifyRefreshJwt(token: string): RefreshJwtVerifyResult {
+  if (!token || typeof token !== "string") return { valid: false, reason: "MALFORMED" };
+  const parts = token.split(".");
+  if (parts.length !== 3) return { valid: false, reason: "MALFORMED" };
+
+  const [headerSeg, payloadSeg, sigSeg] = parts;
+  if (!headerSeg || !payloadSeg || !sigSeg) return { valid: false, reason: "MALFORMED" };
+
+  try {
+    const signingInput = `${headerSeg}.${payloadSeg}`;
+    const expectedSig = crypto.createHmac("sha256", getJwtSecret()).update(signingInput).digest();
+    const actualSig = base64UrlDecode(sigSeg);
+
+    if (
+      expectedSig.length !== actualSig.length ||
+      !crypto.timingSafeEqual(expectedSig, actualSig)
+    ) {
+      return { valid: false, reason: "INVALID_SIGNATURE" };
+    }
+
+    const header = JSON.parse(base64UrlDecode(headerSeg).toString("utf-8"));
+    if (header?.alg !== "HS256") return { valid: false, reason: "INVALID_SIGNATURE" };
+
+    const claims = JSON.parse(base64UrlDecode(payloadSeg).toString("utf-8")) as RefreshJwtClaims;
+    if (
+      !claims?.sub ||
+      !claims?.jti ||
+      !claims?.exp ||
+      claims.iss !== "meetmind-ai" ||
+      claims.type !== "refresh"
+    ) {
+      return { valid: false, reason: "MALFORMED" };
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (claims.exp <= nowSec) {
+      return { valid: false, reason: "EXPIRED" };
+    }
+
+    const revokedList = db.get("revokedTokens") || [];
+    if (revokedList.some((r) => r.jti === claims.jti)) {
+      return { valid: false, reason: "REVOKED" };
+    }
+
+    if (claims.sid) {
+      const sessions = db.get("authSessions") || [];
+      const session = sessions.find((s) => s.id === claims.sid);
+      if (session && session.revokedAt) {
+        return { valid: false, reason: "REVOKED" };
+      }
+    }
+
+    return { valid: true, claims };
+  } catch {
+    return { valid: false, reason: "MALFORMED" };
+  }
+}
+
 export type JwtVerifyResult =
   | { valid: true; claims: JwtClaims }
   | { valid: false; reason: "MALFORMED" | "INVALID_SIGNATURE" | "EXPIRED" | "REVOKED" };
@@ -278,7 +382,6 @@ export function createSessionTokens(
   const isGuest = Boolean(options.isGuest || user.isGuest || user.role === "guest");
   const rememberMe = Boolean(options.rememberMe && !isGuest);
   const sessionId = `ses_${Date.now().toString(36)}_${crypto.randomBytes(10).toString("hex")}`;
-  const rawRefreshToken = `mmr_${crypto.randomBytes(36).toString("hex")}`;
 
   const accessTtl = isGuest
     ? GUEST_TOKEN_TTL_SECONDS
@@ -292,8 +395,28 @@ export function createSessionTokens(
       ? REFRESH_TOKEN_REMEMBER_TTL_SECONDS
       : REFRESH_TOKEN_TTL_SECONDS;
 
+  const signedRefresh = signRefreshJwt(
+    {
+      sub: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      isGuest,
+      sid: sessionId,
+      rememberMe,
+    },
+    refreshTtl,
+  );
+  const rawRefreshToken = signedRefresh.token;
+
   const userAgent = (options.req?.headers.get("user-agent") || "").slice(0, 200) || undefined;
-  const forwardedFor = (options.req?.headers.get("x-forwarded-for") || "").split(",")[0]?.trim();
+  const forwardedFor = (
+    options.req?.headers.get("x-forwarded-for") ||
+    options.req?.headers.get("x-real-ip") ||
+    ""
+  )
+    .split(",")[0]
+    ?.trim();
   const ipAddress = forwardedFor ? forwardedFor.slice(0, 64) : undefined;
 
   const now = Date.now();
@@ -316,7 +439,7 @@ export function createSessionTokens(
     return [...active.slice(-200), sessionRecord];
   });
 
-  const signed = signAccessJwt(
+  const signedAccess = signAccessJwt(
     {
       sub: user.id,
       email: user.email,
@@ -329,9 +452,9 @@ export function createSessionTokens(
   );
 
   return {
-    accessToken: signed.token,
+    accessToken: signedAccess.token,
     refreshToken: rawRefreshToken,
-    expiresAt: new Date(signed.exp * 1000).toISOString(),
+    expiresAt: new Date(signedAccess.exp * 1000).toISOString(),
     expiresInSeconds: accessTtl,
     refreshMaxAgeSeconds: refreshTtl,
     sessionId,
@@ -381,7 +504,7 @@ export function revokeAllUserSessions(userId: string) {
 }
 
 export function parseCookies(req: Request): Record<string, string> {
-  const header = req.headers.get("Cookie") || "";
+  const header = req.headers.get("cookie") || req.headers.get("Cookie") || "";
   const out: Record<string, string> = {};
   for (const part of header.split(";")) {
     const idx = part.indexOf("=");
@@ -431,7 +554,7 @@ export function appendAuthCookies(
   );
   headers.append(
     "Set-Cookie",
-    `meetmind_refresh_token=${encodeURIComponent(tokens.refreshToken)}; Path=/api; HttpOnly${sameSiteAndSecure}${refreshMaxAge}`,
+    `meetmind_refresh_token=${encodeURIComponent(tokens.refreshToken)}; Path=/; HttpOnly${sameSiteAndSecure}${refreshMaxAge}`,
   );
 }
 
@@ -441,6 +564,10 @@ export function appendClearAuthCookies(headers: Headers, req: Request) {
   headers.append(
     "Set-Cookie",
     `meetmind_token=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly${sameSiteAndSecure}`,
+  );
+  headers.append(
+    "Set-Cookie",
+    `meetmind_refresh_token=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly${sameSiteAndSecure}`,
   );
   headers.append(
     "Set-Cookie",
@@ -458,7 +585,7 @@ export type AuthRequestResult =
     };
 
 export function authenticateRequest(req: Request): AuthRequestResult {
-  const authHeader = req.headers.get("Authorization") || "";
+  const authHeader = req.headers.get("authorization") || req.headers.get("Authorization") || "";
   const cookies = parseCookies(req);
   let token = "";
 
@@ -504,30 +631,39 @@ export function authenticateRequest(req: Request): AuthRequestResult {
   }
 
   const users = db.get("users") || [];
-  let user = users.find((u) => u.id === verified.claims.sub);
-
-  if (!user && verified.claims.isGuest) {
-    // Reconstruct ephemeral guest principal strictly from cryptographically verified JWT claims
-    user = {
-      id: verified.claims.sub,
-      email: verified.claims.email,
-      name: verified.claims.name,
-      passwordHash: "",
-      role: "guest",
-      isGuest: true,
-      authProvider: "guest",
-      department: "Guest Session",
-      createdAt: new Date(verified.claims.iat * 1000).toISOString(),
-    };
-  }
+  let user = users.find(
+    (u) =>
+      u.id === verified.claims.sub ||
+      (verified.claims.email && u.email.toLowerCase() === verified.claims.email.toLowerCase()),
+  );
 
   if (!user) {
-    return {
-      ok: false,
-      status: 401,
-      code: "UNAUTHORIZED",
-      error: "Account no longer exists. Please sign in again.",
+    // Reconstruct user principal from cryptographically verified claims for serverless continuity
+    const isGuest = Boolean(verified.claims.isGuest || verified.claims.role === "guest");
+    user = {
+      id: verified.claims.sub,
+      email:
+        verified.claims.email ||
+        (isGuest ? `${verified.claims.sub}@session.meetmind.ai` : "user@meetmind.ai"),
+      name: verified.claims.name || (isGuest ? "Guest Explorer" : "MeetMind User"),
+      passwordHash: "",
+      role: verified.claims.role || (isGuest ? "guest" : "member"),
+      authProvider: isGuest ? "guest" : "local",
+      emailVerified: true,
+      isGuest,
+      department: isGuest ? "Guest Session" : "",
+      createdAt: new Date(verified.claims.iat * 1000).toISOString(),
     };
+    db.update("users", (existing = []) => {
+      if (
+        existing.some(
+          (u) => u.id === user!.id || u.email.toLowerCase() === user!.email.toLowerCase(),
+        )
+      ) {
+        return existing;
+      }
+      return [...existing, user!];
+    });
   }
 
   return {

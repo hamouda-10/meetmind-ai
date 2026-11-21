@@ -71,16 +71,25 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   sessionNotice: null,
 
   restoreSession: async () => {
+    const currentStatus = get().status;
+    if (currentStatus === "authenticated" || currentStatus === "guest") {
+      return;
+    }
     if (restoreInFlight) return restoreInFlight;
 
     restoreInFlight = (async () => {
       try {
         const user = await api.authMe();
-        set({
-          user,
-          status: user.isGuest ? "guest" : "authenticated",
-          initialized: true,
-          sessionNotice: null,
+        set((state) => {
+          if (state.status === "authenticated" && !state.user?.isGuest && user.isGuest) {
+            return state;
+          }
+          return {
+            user,
+            status: user.isGuest ? "guest" : "authenticated",
+            initialized: true,
+            sessionNotice: null,
+          };
         });
       } catch {
         // Attempt silent refresh using HttpOnly refresh cookie before concluding unauthenticated
@@ -92,11 +101,20 @@ export const useAuthStore = create<AuthState>((set, get) => ({
             const shouldPersist =
               typeof refreshed.rememberMe === "boolean" ? refreshed.rememberMe : hadLocalToken;
             persistAccessToken(refreshed.token, shouldPersist && !refreshed.user.isGuest);
-            set({
-              user: refreshed.user,
-              status: refreshed.user.isGuest ? "guest" : "authenticated",
-              initialized: true,
-              sessionNotice: null,
+            set((state) => {
+              if (
+                state.status === "authenticated" &&
+                !state.user?.isGuest &&
+                refreshed.user.isGuest
+              ) {
+                return state;
+              }
+              return {
+                user: refreshed.user,
+                status: refreshed.user.isGuest ? "guest" : "authenticated",
+                initialized: true,
+                sessionNotice: null,
+              };
             });
             return;
           }
@@ -104,13 +122,19 @@ export const useAuthStore = create<AuthState>((set, get) => ({
           // refresh cookie missing or expired
         }
 
-        const hadToken = Boolean(getStoredAccessToken());
-        clearStoredAccessToken();
-        set({
-          user: null,
-          status: hadToken ? "session_expired" : "unauthenticated",
-          initialized: true,
-          sessionNotice: hadToken ? "Your session expired. Please sign in again." : null,
+        set((state) => {
+          if (state.status === "authenticated" || state.status === "guest") {
+            // Concurrent login or guest session succeeded while restore was in flight
+            return state;
+          }
+          const hadToken = Boolean(getStoredAccessToken());
+          clearStoredAccessToken();
+          return {
+            user: null,
+            status: hadToken ? "session_expired" : "unauthenticated",
+            initialized: true,
+            sessionNotice: hadToken ? "Your session expired. Please sign in again." : null,
+          };
         });
       } finally {
         restoreInFlight = null;

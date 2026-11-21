@@ -68,6 +68,7 @@ import {
   validatePasswordStrength,
   verifyAccessJwt,
   verifyPasswordSecure,
+  verifyRefreshJwt,
 } from "./auth";
 
 const escapeHtml = (unsafe: string) =>
@@ -691,47 +692,120 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
         );
       }
 
-      const refreshHash = hashToken(rawRefresh);
-      const sessions = db.get("authSessions") || [];
-      const session = sessions.find((s) => s.refreshTokenHash === refreshHash);
-      if (!session || session.revokedAt || new Date(session.expiresAt).getTime() <= Date.now()) {
-        const headers = new Headers({ "Content-Type": "application/json" });
-        appendClearAuthCookies(headers, req);
-        return new Response(
-          JSON.stringify({
-            error: "Session expired. Please sign in again.",
-            code: "TOKEN_EXPIRED",
-          }),
-          { status: 401, headers },
+      const verifiedRefresh = verifyRefreshJwt(rawRefresh);
+      let sessionUserId = "";
+      let sessionIsGuest = false;
+      let sessionRememberMe = false;
+      let sessionId = "";
+
+      if (verifiedRefresh.valid) {
+        sessionUserId = verifiedRefresh.claims.sub;
+        sessionIsGuest = Boolean(
+          verifiedRefresh.claims.isGuest || verifiedRefresh.claims.role === "guest",
         );
+        sessionRememberMe = Boolean(verifiedRefresh.claims.rememberMe);
+        sessionId = verifiedRefresh.claims.sid;
+      } else {
+        // Fallback for legacy opaque refresh tokens
+        const refreshHash = hashToken(rawRefresh);
+        const sessions = db.get("authSessions") || [];
+        const session = sessions.find((s) => s.refreshTokenHash === refreshHash);
+        if (!session || session.revokedAt || new Date(session.expiresAt).getTime() <= Date.now()) {
+          const headers = new Headers({ "Content-Type": "application/json" });
+          appendClearAuthCookies(headers, req);
+          return new Response(
+            JSON.stringify({
+              error: "Session expired. Please sign in again.",
+              code: "TOKEN_EXPIRED",
+            }),
+            { status: 401, headers },
+          );
+        }
+        sessionUserId = session.userId;
+        sessionIsGuest = session.isGuest;
+        sessionRememberMe = session.rememberMe;
+        sessionId = session.id;
+      }
+
+      // Check if session has been explicitly revoked
+      if (sessionId) {
+        const sessions = db.get("authSessions") || [];
+        const session = sessions.find((s) => s.id === sessionId);
+        if (session && session.revokedAt) {
+          const headers = new Headers({ "Content-Type": "application/json" });
+          appendClearAuthCookies(headers, req);
+          return new Response(
+            JSON.stringify({
+              error: "Session has been signed out. Please sign in again.",
+              code: "SESSION_REVOKED",
+            }),
+            { status: 401, headers },
+          );
+        }
       }
 
       const users = db.get("users") || [];
-      let user = users.find((u) => u.id === session.userId);
-      if (!user && session.isGuest) {
+      let user = users.find(
+        (u) =>
+          u.id === sessionUserId ||
+          (verifiedRefresh.valid &&
+            verifiedRefresh.claims.email &&
+            u.email.toLowerCase() === verifiedRefresh.claims.email.toLowerCase()),
+      );
+
+      if (!user && verifiedRefresh.valid) {
         user = {
-          id: session.userId,
-          email: `${session.userId}@session.meetmind.ai`,
+          id: verifiedRefresh.claims.sub,
+          email:
+            verifiedRefresh.claims.email ||
+            (sessionIsGuest ? `${sessionUserId}@session.meetmind.ai` : "user@meetmind.ai"),
+          name:
+            verifiedRefresh.claims.name || (sessionIsGuest ? "Guest Explorer" : "MeetMind User"),
+          passwordHash: "",
+          role: verifiedRefresh.claims.role || (sessionIsGuest ? "guest" : "member"),
+          authProvider: sessionIsGuest ? "guest" : "local",
+          emailVerified: true,
+          isGuest: sessionIsGuest,
+          department: sessionIsGuest ? "Guest Session" : "",
+          createdAt: new Date(verifiedRefresh.claims.iat * 1000).toISOString(),
+        };
+        db.update("users", (existing = []) => {
+          if (
+            existing.some(
+              (u) => u.id === user!.id || u.email.toLowerCase() === user!.email.toLowerCase(),
+            )
+          ) {
+            return existing;
+          }
+          return [...existing, user!];
+        });
+      } else if (!user && sessionIsGuest) {
+        user = {
+          id: sessionUserId,
+          email: `${sessionUserId}@session.meetmind.ai`,
           name: "Guest Explorer",
           passwordHash: "",
           role: "guest",
           authProvider: "guest",
           isGuest: true,
           department: "Guest Session",
-          createdAt: session.createdAt,
+          createdAt: new Date().toISOString(),
         };
       }
 
       if (!user) {
-        revokeSessionAndToken({ sessionId: session.id });
+        if (sessionId) revokeSessionAndToken({ sessionId });
         return Response.json({ error: "Account does not exist." }, { status: 401 });
       }
 
       // Rotate refresh session securely
-      revokeSessionAndToken({ sessionId: session.id });
+      if (sessionId) {
+        revokeSessionAndToken({ sessionId, refreshToken: rawRefresh });
+      }
+
       const newTokens = createSessionTokens(user, {
-        rememberMe: session.rememberMe,
-        isGuest: session.isGuest,
+        rememberMe: sessionRememberMe,
+        isGuest: sessionIsGuest,
         req,
       });
 

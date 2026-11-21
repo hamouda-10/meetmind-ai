@@ -377,6 +377,56 @@
       "avatarFileName": "av_usr_mwpvphud_14a7901eab16_1795233574197_a6a53011e47f.jpg",
       "avatarUrl": "/api/v1/profile/avatars/av_usr_mwpvphud_14a7901eab16_1795233574197_a6a53011e47f.jpg",
       "avatarCustomized": true
+    },
+    {
+      "id": "guest_mwqzamap_504c76a22bf0",
+      "email": "guest+504c76a22bf0@session.meetmind.ai",
+      "name": "Guest Explorer",
+      "passwordHash": "",
+      "role": "guest",
+      "authProvider": "guest",
+      "emailVerified": true,
+      "isGuest": true,
+      "department": "Guest Session",
+      "createdAt": "2026-11-21T22:27:27.000Z"
+    },
+    {
+      "id": "guest_mwqzb9jv_7dc43ee42248",
+      "email": "guest+7dc43ee42248@session.meetmind.ai",
+      "name": "Guest Explorer",
+      "passwordHash": "",
+      "role": "guest",
+      "authProvider": "guest",
+      "emailVerified": true,
+      "isGuest": true,
+      "department": "Guest Session",
+      "createdAt": "2026-11-21T22:27:57.000Z"
+    },
+    {
+      "id": "usr_mwqzckn4_82461d0785d5",
+      "email": "production_test_1795300138544@example.com",
+      "name": "Vercel Verification User",
+      "passwordHash": "scrypt$512cbc9399725a9adaba3ea4c23b13ff$6f79cf3e2f996e6a3bdce296b5d4c534710c501ef8407a15bb57d0a168e3524c24a55c788d05f6afd3feb036710b2ba2e22b1d29050d928f4d7f870ae53c5924",
+      "role": "member",
+      "authProvider": "local",
+      "emailVerified": false,
+      "isGuest": false,
+      "department": "Engineering",
+      "nameCustomized": true,
+      "createdAt": "2026-11-21T22:28:58.622Z",
+      "updatedAt": "2026-11-21T22:28:58.622Z"
+    },
+    {
+      "id": "guest_mwqzdx0p_893462566dfe",
+      "email": "guest+893462566dfe@session.meetmind.ai",
+      "name": "Guest Explorer",
+      "passwordHash": "",
+      "role": "guest",
+      "authProvider": "guest",
+      "emailVerified": true,
+      "isGuest": true,
+      "department": "Guest Session",
+      "createdAt": "2026-11-21T22:30:01.000Z"
     }
   ],
   "workspaces": [
@@ -9208,6 +9258,46 @@
       "expiresAt": "2026-11-22T09:24:23.970Z",
       "createdAt": "2026-11-21T21:24:23.970Z",
       "lastUsedAt": "2026-11-21T21:24:23.970Z"
+    },
+    {
+      "id": "ses_mwqyguuf_99b8dbc27fbd52dab73e",
+      "userId": "guest_mwqyguuf_1ee0653e3abb",
+      "refreshTokenHash": "1e7969fe7dd4efd75ca416f8c779c9246e431ba729ac9526d362cc8cf62850e7",
+      "isGuest": true,
+      "rememberMe": false,
+      "expiresAt": "2026-11-22T10:04:18.855Z",
+      "createdAt": "2026-11-21T22:04:18.855Z",
+      "lastUsedAt": "2026-11-21T22:04:18.855Z"
+    },
+    {
+      "id": "ses_mwqzcko8_56cfe7b5596e350209ee",
+      "userId": "usr_mwqzckn4_82461d0785d5",
+      "refreshTokenHash": "10a1521aa08895f25e951ca2d0e2f7b470542f86f22ea37da2ff254f527f8807",
+      "isGuest": false,
+      "rememberMe": true,
+      "expiresAt": "2026-12-21T22:28:58.665Z",
+      "createdAt": "2026-11-21T22:28:58.665Z",
+      "lastUsedAt": "2026-11-21T22:28:58.665Z"
+    },
+    {
+      "id": "ses_mwqzckpr_953ec0ad392134e83690",
+      "userId": "usr_mwqzckn4_82461d0785d5",
+      "refreshTokenHash": "7af13d0405611fb72e384d40167abbcd742fc3234714bcb3cc59240029f87969",
+      "isGuest": false,
+      "rememberMe": true,
+      "expiresAt": "2026-12-21T22:28:58.719Z",
+      "createdAt": "2026-11-21T22:28:58.719Z",
+      "lastUsedAt": "2026-11-21T22:28:58.719Z"
+    },
+    {
+      "id": "ses_mwqzckpx_f1a2d66432233b8a9254",
+      "userId": "guest_mwqzckpx_8cd6cf01aaaf",
+      "refreshTokenHash": "4f196b87c87ee8a7543e1e5b43d3399b046540efcc140b33390d55c1e0fc0770",
+      "isGuest": true,
+      "rememberMe": false,
+      "expiresAt": "2026-11-22T10:28:58.725Z",
+      "createdAt": "2026-11-21T22:28:58.725Z",
+      "lastUsedAt": "2026-11-21T22:28:58.725Z"
     }
   ],
   "passwordResetTokens": [
@@ -9263,6 +9353,42 @@
     {
       "jti": "jti_bc1c48e5fc3cc002df54c0a3",
       "exp": 1795340724
+    },
+    {
+      "jti": "jti_f1c8682c450e7a2d3e843fce",
+      "exp": 1795341799
+    },
+    {
+      "jti": "jti_e2457154c6089c8c2975fd53",
+      "exp": 1795341799
+    },
+    {
+      "jti": "jti_88c2fb549b5c8a3bc18ec7a1",
+      "exp": 1795341933
+    },
+    {
+      "jti": "jti_9c74168dc800aef6dee7bb92",
+      "exp": 1795341934
+    },
+    {
+      "jti": "jti_a94d0a8818a3df6a48d9ceb1",
+      "exp": 1795343247
+    },
+    {
+      "jti": "jti_406ad43f5e30c898c70a1aa2",
+      "exp": 1795343277
+    },
+    {
+      "jti": "jti_8946130b0e6fe706d741326e",
+      "exp": 1795343277
+    },
+    {
+      "jti": "jti_a440d170b520b194bf7dec27",
+      "exp": 1795343401
+    },
+    {
+      "jti": "jti_fc3ea29ed6b7ce42e461862e",
+      "exp": 1795343401
     }
   ]
 }

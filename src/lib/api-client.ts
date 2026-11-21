@@ -521,7 +521,11 @@ class ApiClient {
         const data = (await res.json()) as AuthSessionResponse;
         if (data?.token && typeof window !== "undefined") {
           try {
-            const useLocal = Boolean(localStorage.getItem("meetmind_token")) && !data.user?.isGuest;
+            const hadLocalToken = Boolean(localStorage.getItem("meetmind_token"));
+            const useLocal =
+              typeof data.rememberMe === "boolean"
+                ? data.rememberMe && !data.user?.isGuest
+                : hadLocalToken && !data.user?.isGuest;
             localStorage.removeItem("meetmind_token");
             sessionStorage.removeItem("meetmind_token");
             if (useLocal) {
