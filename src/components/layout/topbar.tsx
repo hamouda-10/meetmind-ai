@@ -11,15 +11,18 @@ import {
   User as UserIcon,
   LogIn,
   ShieldCheck,
+  Loader2,
 } from "lucide-react";
 import { LanguageSwitch } from "@/components/topbar/language-switch";
+import { ThemeToggle } from "@/components/topbar/theme-toggle";
 import { NotificationsButton } from "@/components/topbar/notifications-button";
 import { UserAvatar } from "@/components/auth/user-avatar";
 import { useUIStore } from "@/stores/ui-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useTranslation } from "@/lib/i18n";
+import { api, type AiStatusResponse } from "@/lib/api-client";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 export function Topbar() {
@@ -72,6 +75,48 @@ export function Topbar() {
 
   const isGuest = authStatus === "guest" || Boolean(user?.isGuest);
 
+  const { data: aiStatus } = useQuery<AiStatusResponse>({
+    queryKey: ["ai-status"],
+    queryFn: () => api.getAiStatus(),
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return 6000;
+      if (data.warming || data.asr?.state === "loading" || data.llm?.state === "loading") {
+        return 3000;
+      }
+      if (!data.ready) return 12000;
+      return 30000;
+    },
+    staleTime: 2500,
+    retry: false,
+  });
+
+  const isAiWarming = Boolean(
+    aiStatus &&
+    (aiStatus.warming || aiStatus.asr?.state === "loading" || aiStatus.llm?.state === "loading"),
+  );
+  const hasAiError = Boolean(
+    aiStatus && (aiStatus.asr?.state === "error" || aiStatus.llm?.state === "error"),
+  );
+  const isAiReady = Boolean(aiStatus && aiStatus.ready && !hasAiError);
+  const aiPillLabel = isAiWarming
+    ? language === "AR"
+      ? "جاري تجهيز الذكاء المدمج..."
+      : "Warming Built-in AI..."
+    : isAiReady
+      ? language === "AR"
+        ? "الذكاء المدمج نشط"
+        : "Built-in AI Ready"
+      : language === "AR"
+        ? "الذكاء المدمج جاهز"
+        : "Built-in AI Active";
+
+  const aiPillTooltip = aiStatus
+    ? `ASR: ${aiStatus.asr.model} (${aiStatus.asr.state}) • LLM: ${aiStatus.llm.model} (${aiStatus.llm.state})${aiStatus.cloudGemini ? " • Cloud Gemini" : ""}`
+    : language === "AR"
+      ? "محرك الذكاء الاصطناعي المدمج في MeetMind"
+      : "MeetMind Built-in AI Engine";
+
   let recordTitle = "Start New Recording or Upload";
   if (language === "AR") {
     recordTitle = "بدء تسجيل صوتي جديد أو رفع ملف";
@@ -102,14 +147,28 @@ export function Topbar() {
           <span>{language === "AR" ? "تسجيل جديد" : "+ Record Audio"}</span>
         </button>
 
-        {/* AI Live Engine Indicator */}
-        <div className="hidden lg:flex items-center gap-2 rounded-full border border-amber-500/20 bg-zinc-950/80 px-3 py-1 text-[11px] font-semibold text-zinc-300 shadow-inner">
-          <span className="relative flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+        {/* Built-in AI Live Engine Indicator */}
+        <button
+          type="button"
+          onClick={() => {
+            void api.warmupAi().catch(() => {});
+            openAI(true);
+          }}
+          title={aiPillTooltip}
+          className="hidden lg:flex items-center gap-2 rounded-full border border-amber-500/20 bg-zinc-950/80 px-3 py-1 text-[11px] font-semibold text-zinc-300 shadow-inner transition-colors hover:border-amber-400/45 hover:bg-zinc-900 cursor-pointer"
+        >
+          {isAiWarming ? (
+            <Loader2 className="h-3 w-3 animate-spin text-amber-400 shrink-0" />
+          ) : (
+            <span className="relative flex h-2 w-2 shrink-0">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+            </span>
+          )}
+          <span className="text-amber-300/90 tracking-wide font-mono whitespace-nowrap">
+            {aiPillLabel}
           </span>
-          <span className="text-amber-300/90 tracking-wide font-mono">AI v3.5 Active</span>
-        </div>
+        </button>
       </div>
 
       {/* CENTER SECTION: Search Bar Perfectly Centered */}
@@ -159,6 +218,9 @@ export function Topbar() {
 
         {/* Notifications Button */}
         <NotificationsButton />
+
+        {/* Theme Switch (Dark / Crisp White & Black Light Mode) */}
+        <ThemeToggle />
 
         {/* Language Switch */}
         <LanguageSwitch />

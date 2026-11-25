@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useRouterState } from "@tanstack/react-router";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Send,
@@ -25,6 +26,165 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   citations?: { speaker: string; timestamp: string; quote: string }[];
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const tokenRegex = /(`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|\*[^*\n]+?\*)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let keyIdx = 0;
+
+  while ((match = tokenRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index).replace(/\*\*/g, ""));
+    }
+    const token = match[0];
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(
+        <code
+          key={`code-${keyIdx++}`}
+          className="rounded bg-background/80 border border-border/60 px-1 py-0.5 font-mono text-[11px] text-primary"
+        >
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else if (
+      (token.startsWith("**") && token.endsWith("**")) ||
+      (token.startsWith("__") && token.endsWith("__"))
+    ) {
+      nodes.push(
+        <strong key={`b-${keyIdx++}`} className="font-bold text-foreground">
+          {token.slice(2, -2)}
+        </strong>,
+      );
+    } else if (token.startsWith("*") && token.endsWith("*")) {
+      nodes.push(
+        <em key={`i-${keyIdx++}`} className="italic">
+          {token.slice(1, -1)}
+        </em>,
+      );
+    }
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex).replace(/\*\*/g, ""));
+  }
+
+  return nodes;
+}
+
+function AssistantMarkdown({ text }: { text: string }) {
+  const segments = (text || "").split(/(```[\s\S]*?```)/g);
+  const blocks: ReactNode[] = [];
+  let blockKey = 0;
+
+  for (const segment of segments) {
+    if (!segment) continue;
+
+    if (segment.startsWith("```") && segment.endsWith("```")) {
+      const inner = segment.slice(3, -3).replace(/^[a-zA-Z0-9_-]*\n/, "");
+      blocks.push(
+        <pre
+          key={`pre-${blockKey++}`}
+          dir="ltr"
+          className="my-2 overflow-x-auto rounded-lg border border-border/60 bg-background/85 p-2.5 font-mono text-[11px] leading-relaxed text-foreground"
+        >
+          <code>{inner.trimEnd()}</code>
+        </pre>,
+      );
+      continue;
+    }
+
+    const lines = segment.split(/\r?\n/);
+    let i = 0;
+    while (i < lines.length) {
+      const rawLine = lines[i];
+      const trimmed = rawLine.trim();
+
+      if (!trimmed) {
+        i++;
+        continue;
+      }
+
+      if (/^---+$/.test(trimmed)) {
+        blocks.push(<hr key={`hr-${blockKey++}`} className="my-2 border-border/50" />);
+        i++;
+        continue;
+      }
+
+      const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+      if (headingMatch) {
+        const level = headingMatch[1].length;
+        const headingText = headingMatch[2].trim();
+        blocks.push(
+          level <= 2 ? (
+            <h4
+              key={`h-${blockKey++}`}
+              className="mt-2 mb-1 text-[13px] font-bold text-primary leading-snug"
+            >
+              {renderInlineMarkdown(headingText)}
+            </h4>
+          ) : (
+            <h5
+              key={`h-${blockKey++}`}
+              className="mt-1.5 mb-0.5 text-xs font-bold text-foreground leading-snug"
+            >
+              {renderInlineMarkdown(headingText)}
+            </h5>
+          ),
+        );
+        i++;
+        continue;
+      }
+
+      if (/^\s*[-*•]\s+/.test(rawLine)) {
+        const items: string[] = [];
+        while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*[-*•]\s+/, "").trim());
+          i++;
+        }
+        blocks.push(
+          <ul key={`ul-${blockKey++}`} className="my-1.5 list-disc space-y-1 ps-4">
+            {items.map((item, idx) => (
+              <li key={idx} className="leading-relaxed">
+                {renderInlineMarkdown(item)}
+              </li>
+            ))}
+          </ul>,
+        );
+        continue;
+      }
+
+      if (/^\s*\d+[.)]\s+/.test(rawLine)) {
+        const items: string[] = [];
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*\d+[.)]\s+/, "").trim());
+          i++;
+        }
+        blocks.push(
+          <ol key={`ol-${blockKey++}`} className="my-1.5 list-decimal space-y-1 ps-4">
+            {items.map((item, idx) => (
+              <li key={idx} className="leading-relaxed">
+                {renderInlineMarkdown(item)}
+              </li>
+            ))}
+          </ol>,
+        );
+        continue;
+      }
+
+      blocks.push(
+        <p key={`p-${blockKey++}`} className="leading-relaxed">
+          {renderInlineMarkdown(trimmed)}
+        </p>,
+      );
+      i++;
+    }
+  }
+
+  return <div className="space-y-1.5">{blocks}</div>;
 }
 
 interface LaserEvent {
@@ -353,11 +513,23 @@ export function FloatingAIAssistant() {
   });
 
   useEffect(() => {
-    if (!open || typeof window === "undefined") return;
-    const urlId = new URLSearchParams(window.location.search).get("id");
+    setMessages((prev) => (prev.length <= 1 ? [defaultGreeting] : prev));
+    setSuggestions(defaultSuggestions);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isArabic]);
+
+  const locationSearchStr = useRouterState({ select: (r) => r.location.searchStr });
+
+  useEffect(() => {
+    const urlId = new URLSearchParams(locationSearchStr || "").get("id")?.trim();
     if (urlId) {
       setSelectedResourceId(urlId);
     }
+  }, [locationSearchStr]);
+
+  useEffect(() => {
+    if (!open) return;
+    void api.warmupAi().catch(() => {});
   }, [open]);
 
   const prevOpenRef = useRef<boolean>(open);
@@ -561,15 +733,18 @@ export function FloatingAIAssistant() {
       if (res.suggestedFollowUps && res.suggestedFollowUps.length > 0) {
         setSuggestions(res.suggestedFollowUps);
       }
-    } catch {
-      toast.error(isArabic ? "تعذر استرجاع الإجابة" : "Failed to retrieve response");
+    } catch (err) {
+      const serverErr = err instanceof Error && err.message ? err.message : "";
+      toast.error(serverErr || (isArabic ? "تعذر استرجاع الإجابة" : "Failed to retrieve response"));
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          text: isArabic
-            ? "حدث خطأ أثناء التواصل مع محرك الذكاء الاصطناعي. يرجى المحاولة مرة أخرى."
-            : "An error occurred while communicating with the AI engine. Please try again.",
+          text:
+            serverErr ||
+            (isArabic
+              ? "حدث خطأ أثناء التواصل مع محرك الذكاء الاصطناعي. يرجى المحاولة مرة أخرى."
+              : "An error occurred while communicating with the AI engine. Please try again."),
         },
       ]);
     } finally {
@@ -1060,7 +1235,11 @@ export function FloatingAIAssistant() {
                   }`}
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-center gap-1.5 text-[10px] font-semibold text-muted-foreground mb-1">
+                    <div
+                      className={`flex items-center gap-1.5 text-[10px] font-semibold mb-1 ${
+                        m.role === "user" ? "text-primary-foreground/85" : "text-muted-foreground"
+                      }`}
+                    >
                       {m.role === "user" ? (
                         <>
                           <User className="h-3 w-3" />
@@ -1091,7 +1270,12 @@ export function FloatingAIAssistant() {
                     )}
                   </div>
 
-                  <div className="whitespace-pre-line">{m.text}</div>
+                  <div
+                    dir={/[\u0600-\u06FF]/.test(m.text) ? "rtl" : "ltr"}
+                    className={m.role === "assistant" ? "space-y-1" : "whitespace-pre-line"}
+                  >
+                    {m.role === "assistant" ? <AssistantMarkdown text={m.text} /> : m.text}
+                  </div>
 
                   {m.citations && m.citations.length > 0 && (
                     <div className="mt-2.5 pt-2 border-t border-border/40 space-y-1.5">

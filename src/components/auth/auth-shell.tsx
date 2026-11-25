@@ -3,6 +3,7 @@ import { motion, useReducedMotion } from "framer-motion";
 import { Mic, BookOpen, ShieldCheck, Globe } from "lucide-react";
 import { useTranslation } from "@/lib/i18n";
 import { useUIStore } from "@/stores/ui-store";
+import { ThemeToggle } from "@/components/topbar/theme-toggle";
 import authBgImage from "@/assets/images/auth_neural_acoustic_bg_1795141085443.jpg";
 
 interface AuthShellProps {
@@ -144,6 +145,8 @@ export function AuthShell({ title, subtitle, children, footer }: AuthShellProps)
   const prefersReducedMotion = useReducedMotion();
   const { language, setLanguage, isRtl } = useTranslation();
   const setUiLanguage = useUIStore((s) => s.setLanguage);
+  const resolvedTheme = useUIStore((s) => s.resolvedTheme);
+  const isLight = resolvedTheme === "light";
 
   const toggleLanguage = () => {
     const next = language === "AR" ? "EN" : "AR";
@@ -193,166 +196,176 @@ export function AuthShell({ title, subtitle, children, footer }: AuthShellProps)
       dir={isRtl ? "rtl" : "ltr"}
       className="relative min-h-screen w-full overflow-x-hidden bg-[#050507] text-zinc-100 selection:bg-amber-500/30 selection:text-amber-100"
     >
-      {/* Cinematic Dark Obsidian & Gold AI Atmospheric Background */}
+      {/* Atmospheric Background (Obsidian Gold in Dark Mode / Crisp White Grid in Light Mode) */}
       <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
-        <img
-          src={authBgImage}
-          alt=""
-          className="h-full w-full object-cover object-center opacity-35 scale-[1.03]"
-          loading="eager"
-          decoding="async"
-        />
-
-        {/* Deep obsidian scrim keeping the authentication form crisp and dominant */}
-        <div className="absolute inset-0 bg-gradient-to-br from-[#040406]/94 via-[#06060a]/88 to-[#0a0805]/92" />
-
-        {/* Subtle golden atmospheric radial lighting */}
-        <div
-          className="absolute inset-0"
-          style={{
-            background:
-              "radial-gradient(circle at 20% 28%, rgba(212, 175, 55, 0.13), transparent 48%), radial-gradient(circle at 82% 76%, rgba(190, 140, 40, 0.08), transparent 46%)",
-          }}
-        />
-
-        {/* Architectural hairline grid masked smoothly to the center */}
-        <div className="auth-bg-grid absolute inset-0 opacity-75" />
-
-        {/* Very subtle drifting golden light ray */}
-        <div
-          className="auth-bg-ray absolute -top-1/3 left-[12%] h-[135%] w-[36%] blur-3xl"
-          style={{
-            background:
-              "linear-gradient(180deg, rgba(212, 175, 55, 0.14) 0%, rgba(212, 175, 55, 0.03) 55%, transparent 100%)",
-          }}
-        />
-
-        {/* Fine AI Neural Constellation & Orbital Arcs SVG */}
-        <svg
-          viewBox="0 0 1440 900"
-          preserveAspectRatio="xMidYMid slice"
-          className="absolute inset-0 h-full w-full opacity-45"
-        >
-          <defs>
-            <linearGradient id="authGoldArc" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="#d4af37" stopOpacity="0" />
-              <stop offset="50%" stopColor="#f5c95c" stopOpacity="0.28" />
-              <stop offset="100%" stopColor="#d4af37" stopOpacity="0" />
-            </linearGradient>
-            <linearGradient id="authConstellationLine" x1="0%" y1="0%" x2="100%" y2="0%">
-              <stop offset="0%" stopColor="#d4af37" stopOpacity="0.06" />
-              <stop offset="50%" stopColor="#fde68a" stopOpacity="0.22" />
-              <stop offset="100%" stopColor="#d4af37" stopOpacity="0.06" />
-            </linearGradient>
-          </defs>
-
-          {/* Subtle orbital lines */}
-          <ellipse
-            cx="360"
-            cy="390"
-            rx="420"
-            ry="230"
-            fill="none"
-            stroke="url(#authGoldArc)"
-            strokeWidth="1"
-            transform="rotate(-14 360 390)"
-          />
-          <ellipse
-            cx="1120"
-            cy="520"
-            rx="380"
-            ry="210"
-            fill="none"
-            stroke="url(#authGoldArc)"
-            strokeWidth="0.9"
-            transform="rotate(18 1120 520)"
-          />
-
-          {/* AI Network connections */}
-          <g stroke="url(#authConstellationLine)" strokeWidth="0.85">
-            <line x1="140" y1="180" x2="310" y2="260" />
-            <line x1="310" y1="260" x2="210" y2="490" />
-            <line x1="210" y1="490" x2="430" y2="620" />
-            <line x1="1140" y1="170" x2="1280" y2="330" />
-            <line x1="1280" y1="330" x2="1180" y2="590" />
-            <line x1="1180" y1="590" x2="1320" y2="760" />
-          </g>
-
-          {/* Subtle glowing network nodes */}
-          <g fill="#f5c95c">
-            <circle cx="140" cy="180" r="2.2" className="auth-bg-node" />
-            <circle
-              cx="310"
-              cy="260"
-              r="2.6"
-              className="auth-bg-node"
-              style={{ animationDelay: "1.1s" }}
+        {isLight ? (
+          <>
+            <div className="absolute inset-0 bg-white" />
+            <div className="auth-bg-grid absolute inset-0 opacity-70" />
+          </>
+        ) : (
+          <>
+            <img
+              src={authBgImage}
+              alt=""
+              className="h-full w-full object-cover object-center opacity-35 scale-[1.03]"
+              loading="eager"
+              decoding="async"
             />
-            <circle
-              cx="210"
-              cy="490"
-              r="2"
-              className="auth-bg-node"
-              style={{ animationDelay: "2.2s" }}
-            />
-            <circle
-              cx="430"
-              cy="620"
-              r="2.4"
-              className="auth-bg-node"
-              style={{ animationDelay: "0.7s" }}
-            />
-            <circle
-              cx="1140"
-              cy="170"
-              r="2.2"
-              className="auth-bg-node"
-              style={{ animationDelay: "1.8s" }}
-            />
-            <circle
-              cx="1280"
-              cy="330"
-              r="2.6"
-              className="auth-bg-node"
-              style={{ animationDelay: "2.9s" }}
-            />
-            <circle
-              cx="1180"
-              cy="590"
-              r="2.2"
-              className="auth-bg-node"
-              style={{ animationDelay: "0.4s" }}
-            />
-            <circle
-              cx="1320"
-              cy="760"
-              r="2"
-              className="auth-bg-node"
-              style={{ animationDelay: "3.4s" }}
-            />
-          </g>
-        </svg>
 
-        {/* Slow-moving golden micro-particles (CSS transform only, zero JS loop) */}
-        {AMBIENT_PARTICLES.map((p, idx) => (
-          <span
-            key={idx}
-            className={`absolute rounded-full bg-amber-300/75 shadow-[0_0_10px_rgba(212,175,55,0.6)] ${
-              p.variant === "a" ? "auth-bg-particle-a" : "auth-bg-particle-b"
-            }`}
-            style={{
-              left: p.left,
-              top: p.top,
-              width: `${p.size}px`,
-              height: `${p.size}px`,
-              animationDelay: p.delay,
-            }}
-          />
-        ))}
+            {/* Deep obsidian scrim keeping the authentication form crisp and dominant */}
+            <div className="absolute inset-0 bg-gradient-to-br from-[#040406]/94 via-[#06060a]/88 to-[#0a0805]/92" />
+
+            {/* Subtle golden atmospheric radial lighting */}
+            <div
+              className="absolute inset-0"
+              style={{
+                background:
+                  "radial-gradient(circle at 20% 28%, rgba(212, 175, 55, 0.13), transparent 48%), radial-gradient(circle at 82% 76%, rgba(190, 140, 40, 0.08), transparent 46%)",
+              }}
+            />
+
+            {/* Architectural hairline grid masked smoothly to the center */}
+            <div className="auth-bg-grid absolute inset-0 opacity-75" />
+
+            {/* Very subtle drifting golden light ray */}
+            <div
+              className="auth-bg-ray absolute -top-1/3 left-[12%] h-[135%] w-[36%] blur-3xl"
+              style={{
+                background:
+                  "linear-gradient(180deg, rgba(212, 175, 55, 0.14) 0%, rgba(212, 175, 55, 0.03) 55%, transparent 100%)",
+              }}
+            />
+
+            {/* Fine AI Neural Constellation & Orbital Arcs SVG */}
+            <svg
+              viewBox="0 0 1440 900"
+              preserveAspectRatio="xMidYMid slice"
+              className="absolute inset-0 h-full w-full opacity-45"
+            >
+              <defs>
+                <linearGradient id="authGoldArc" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stopColor="#d4af37" stopOpacity="0" />
+                  <stop offset="50%" stopColor="#f5c95c" stopOpacity="0.28" />
+                  <stop offset="100%" stopColor="#d4af37" stopOpacity="0" />
+                </linearGradient>
+                <linearGradient id="authConstellationLine" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="#d4af37" stopOpacity="0.06" />
+                  <stop offset="50%" stopColor="#fde68a" stopOpacity="0.22" />
+                  <stop offset="100%" stopColor="#d4af37" stopOpacity="0.06" />
+                </linearGradient>
+              </defs>
+
+              {/* Subtle orbital lines */}
+              <ellipse
+                cx="360"
+                cy="390"
+                rx="420"
+                ry="230"
+                fill="none"
+                stroke="url(#authGoldArc)"
+                strokeWidth="1"
+                transform="rotate(-14 360 390)"
+              />
+              <ellipse
+                cx="1120"
+                cy="520"
+                rx="380"
+                ry="210"
+                fill="none"
+                stroke="url(#authGoldArc)"
+                strokeWidth="0.9"
+                transform="rotate(18 1120 520)"
+              />
+
+              {/* AI Network connections */}
+              <g stroke="url(#authConstellationLine)" strokeWidth="0.85">
+                <line x1="140" y1="180" x2="310" y2="260" />
+                <line x1="310" y1="260" x2="210" y2="490" />
+                <line x1="210" y1="490" x2="430" y2="620" />
+                <line x1="1140" y1="170" x2="1280" y2="330" />
+                <line x1="1280" y1="330" x2="1180" y2="590" />
+                <line x1="1180" y1="590" x2="1320" y2="760" />
+              </g>
+
+              {/* Subtle glowing network nodes */}
+              <g fill="#f5c95c">
+                <circle cx="140" cy="180" r="2.2" className="auth-bg-node" />
+                <circle
+                  cx="310"
+                  cy="260"
+                  r="2.6"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "1.1s" }}
+                />
+                <circle
+                  cx="210"
+                  cy="490"
+                  r="2"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "2.2s" }}
+                />
+                <circle
+                  cx="430"
+                  cy="620"
+                  r="2.4"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "0.7s" }}
+                />
+                <circle
+                  cx="1140"
+                  cy="170"
+                  r="2.2"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "1.8s" }}
+                />
+                <circle
+                  cx="1280"
+                  cy="330"
+                  r="2.6"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "2.9s" }}
+                />
+                <circle
+                  cx="1180"
+                  cy="590"
+                  r="2.2"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "0.4s" }}
+                />
+                <circle
+                  cx="1320"
+                  cy="760"
+                  r="2"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "3.4s" }}
+                />
+              </g>
+            </svg>
+
+            {/* Slow-moving golden micro-particles (CSS transform only, zero JS loop) */}
+            {AMBIENT_PARTICLES.map((p, idx) => (
+              <span
+                key={idx}
+                className={`absolute rounded-full bg-amber-300/75 shadow-[0_0_10px_rgba(212,175,55,0.6)] ${
+                  p.variant === "a" ? "auth-bg-particle-a" : "auth-bg-particle-b"
+                }`}
+                style={{
+                  left: p.left,
+                  top: p.top,
+                  width: `${p.size}px`,
+                  height: `${p.size}px`,
+                  animationDelay: p.delay,
+                }}
+              />
+            ))}
+          </>
+        )}
       </div>
 
-      {/* Top utility bar with language switch */}
-      <header className="relative z-20 mx-auto flex w-full max-w-7xl items-center justify-end px-5 pt-4 sm:px-8 sm:pt-6">
+      {/* Top utility bar with theme & language switch */}
+      <header className="relative z-20 mx-auto flex w-full max-w-7xl items-center justify-end gap-2 px-5 pt-4 sm:px-8 sm:pt-6">
+        <ThemeToggle showLabel />
         <button
           type="button"
           onClick={toggleLanguage}

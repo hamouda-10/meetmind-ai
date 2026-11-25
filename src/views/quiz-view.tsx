@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { useState, useEffect, useMemo } from "react";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BrainCircuit,
@@ -45,10 +45,20 @@ function parseTimestampToSeconds(ts?: string): number {
 
 export default function QuizView() {
   const queryClient = useQueryClient();
-  const { t, language } = useTranslation();
+  const navigate = useNavigate();
+  const { language } = useTranslation();
   const isArabic = language.toUpperCase() === "AR";
 
-  const [selectedQuizId, setSelectedQuizId] = useState<string>("");
+  const locationSearchStr = useRouterState({ select: (r) => r.location.searchStr });
+  const { urlQuizId, urlResourceId } = useMemo(() => {
+    const params = new URLSearchParams(locationSearchStr || "");
+    return {
+      urlQuizId: params.get("quizId")?.trim() || "",
+      urlResourceId: (params.get("lectureId") || params.get("id") || "").trim(),
+    };
+  }, [locationSearchStr]);
+
+  const [selectedQuizId, setSelectedQuizId] = useState<string>(() => urlQuizId);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<string, string | number>>({});
   const [historyOpen, setHistoryOpen] = useState(false);
   const [submittedResults, setSubmittedResults] = useState<{
@@ -72,7 +82,96 @@ export default function QuizView() {
     queryFn: () => api.getQuizzes(),
   });
 
-  const activeQuiz = quizzes.find((q) => q.id === selectedQuizId) || quizzes[0] || null;
+  const { data: lectures = [] } = useQuery({
+    queryKey: ["lectures"],
+    queryFn: () => api.getLectures(),
+  });
+
+  const { data: meetings = [] } = useQuery({
+    queryKey: ["meetings"],
+    queryFn: () => api.getMeetings(),
+  });
+
+  // Reactively align selectedQuizId whenever URL params (?quizId= or ?lectureId=/id=) change
+  useEffect(() => {
+    if (urlQuizId) {
+      setSelectedQuizId(urlQuizId);
+      return;
+    }
+    if (urlResourceId) {
+      const matched = quizzes.find(
+        (q) => q.lectureId === urlResourceId || q.meetingId === urlResourceId,
+      );
+      setSelectedQuizId(matched ? matched.id : "");
+    }
+  }, [urlQuizId, urlResourceId, quizzes]);
+
+  const requestedResource = useMemo(() => {
+    if (!urlResourceId) return null;
+    const lec = lectures.find((l) => l.id === urlResourceId);
+    if (lec) return { id: lec.id, title: lec.title, type: "lecture" as const };
+    const mtg = meetings.find((m) => m.id === urlResourceId);
+    if (mtg) return { id: mtg.id, title: mtg.title, type: "meeting" as const };
+    return null;
+  }, [urlResourceId, lectures, meetings]);
+
+  const matchedForRequestedResource = urlResourceId
+    ? quizzes.find((q) => q.lectureId === urlResourceId || q.meetingId === urlResourceId) || null
+    : null;
+
+  const missingRequestedResourceQuiz = Boolean(
+    urlResourceId && !isLoading && !matchedForRequestedResource && !selectedQuizId,
+  );
+
+  const activeQuiz = missingRequestedResourceQuiz
+    ? null
+    : quizzes.find((q) => q.id === selectedQuizId) ||
+      matchedForRequestedResource ||
+      (urlResourceId && isLoading ? null : quizzes[0] || null);
+
+  // Reset per-quiz local answers/results when switching quizzes
+  useEffect(() => {
+    setSelectedAnswers({});
+    setSubmittedResults(null);
+  }, [activeQuiz?.id]);
+
+  const handleSelectQuiz = (quiz: Quiz) => {
+    setSelectedQuizId(quiz.id);
+    setSelectedAnswers({});
+    setSubmittedResults(null);
+    void navigate({
+      to: "/quiz",
+      search: {
+        quizId: quiz.id,
+        lectureId: quiz.lectureId || quiz.meetingId,
+      },
+      replace: true,
+    });
+  };
+
+  const generateForRequestedMutation = useMutation({
+    mutationFn: async () => {
+      if (!urlResourceId) {
+        throw new Error(isArabic ? "لم يتم تحديد محاضرة" : "No lecture selected");
+      }
+      const resType = requestedResource?.type || "lecture";
+      const res = await api.generateQuiz(urlResourceId, resType, 5);
+      return res.quiz;
+    },
+    onSuccess: (newQuiz) => {
+      queryClient.invalidateQueries({ queryKey: ["quizzes"] });
+      setSelectedQuizId(newQuiz.id);
+      handleReset();
+      toast.success(
+        isArabic
+          ? "تم إنشاء الاختبار التقييمي لهذه المحاضرة بنجاح!"
+          : "Generated quiz for this lecture!",
+      );
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "تعذر توليد الاختبار");
+    },
+  });
 
   const { data: attempts = [] } = useQuery<QuizAttempt[]>({
     queryKey: ["quizAttempts", activeQuiz?.id],
@@ -229,6 +328,45 @@ export default function QuizView() {
         <div className="flex h-48 items-center justify-center">
           <Loader2 className="h-6 w-6 animate-spin text-primary" />
         </div>
+      ) : missingRequestedResourceQuiz ? (
+        <GlassCard className="p-10 text-center space-y-4">
+          <BrainCircuit className="h-10 w-10 text-primary mx-auto" />
+          <h3 className="font-display text-lg font-semibold">
+            {isArabic
+              ? `لا يوجد اختبار منشأ بعد لـ "${requestedResource?.title || "هذه المحاضرة"}"`
+              : `No quiz generated yet for "${requestedResource?.title || "this recording"}"`}
+          </h3>
+          <p className="text-xs text-muted-foreground max-w-md mx-auto">
+            {isArabic
+              ? "يمكنك توليد اختبار تقييمي مخصص وموثق من محتوى هذه المحاضرة الآن بضغطة واحدة."
+              : "Generate a grounded assessment quiz strictly from this lecture's transcript in one click."}
+          </p>
+          <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
+            <Button
+              onClick={() => generateForRequestedMutation.mutate()}
+              disabled={generateForRequestedMutation.isPending}
+              className="gradient-primary text-primary-foreground shadow-glow gap-2 cursor-pointer"
+            >
+              {generateForRequestedMutation.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Sparkles className="h-4 w-4" />
+              )}
+              <span>
+                {isArabic ? "توليد اختبار لهذه المحاضرة الآن" : "Generate Quiz for This Lecture"}
+              </span>
+            </Button>
+            {quizzes.length > 0 && (
+              <Button
+                variant="outline"
+                onClick={() => handleSelectQuiz(quizzes[0])}
+                className="cursor-pointer text-xs"
+              >
+                {isArabic ? "استعراض الاختبارات الأخرى" : "Browse Other Quizzes"}
+              </Button>
+            )}
+          </div>
+        </GlassCard>
       ) : quizzes.length === 0 ? (
         <EmptyState
           icon={BrainCircuit}
@@ -251,10 +389,7 @@ export default function QuizView() {
                 key={q.id}
                 variant={activeQuiz?.id === q.id ? "default" : "outline"}
                 size="sm"
-                onClick={() => {
-                  setSelectedQuizId(q.id);
-                  handleReset();
-                }}
+                onClick={() => handleSelectQuiz(q)}
                 className={`cursor-pointer ${
                   activeQuiz?.id === q.id
                     ? "gradient-primary text-primary-foreground shadow-glow"

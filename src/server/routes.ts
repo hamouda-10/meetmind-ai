@@ -33,12 +33,13 @@ import {
   runUnifiedPostTranscriptionPipeline,
   validateMediaFile,
 } from "./jobs";
+import { isGeminiConfigured, extractHttpStatus, isRetryableGeminiError } from "./gemini";
 import {
-  isGeminiConfigured,
-  extractHttpStatus,
-  isRetryableGeminiError,
-  GeminiPipelineError,
-} from "./gemini";
+  transcribeAudioWithLocalWhisper,
+  warmupWhisperModel,
+  getAsrEngineStatus,
+} from "./whisper-asr";
+import { warmupLocalLlm, getLocalLlmStatus } from "./local-llm";
 import {
   deleteStoredAvatarFile,
   getAvatarsDir,
@@ -433,14 +434,110 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     // ----------------------------------------------------
     if (pathname === "/api/v1/health" && method === "GET") {
       const mediaTools = await checkMediaToolsAvailable();
+      const asr = getAsrEngineStatus();
+      const llm = getLocalLlmStatus();
       return Response.json({
         status: "healthy",
         service: "meetmind-api",
         timestamp: new Date().toISOString(),
-        aiConfigured: isGeminiConfigured(),
+        aiConfigured: true,
+        aiEngine: isGeminiConfigured() ? "gemini+builtin" : "builtin",
+        asrState: asr.state,
+        llmState: llm.state,
         ffmpegAvailable: mediaTools.ffmpeg && mediaTools.ffprobe,
         storageWritable: isStorageWritable(),
       });
+    }
+
+    if (pathname === "/api/v1/ai/status" && method === "GET") {
+      const asr = getAsrEngineStatus();
+      const llm = getLocalLlmStatus();
+      const cloudGemini = isGeminiConfigured();
+      const warming = asr.state === "loading" || llm.state === "loading";
+      const hasError = asr.state === "error" || llm.state === "error";
+      const ready =
+        !warming &&
+        !hasError &&
+        (asr.state === "ready" || asr.cachedOnDisk) &&
+        (llm.state === "ready" || llm.cachedOnDisk || cloudGemini);
+
+      return Response.json(
+        {
+          ready,
+          warming,
+          asr,
+          llm,
+          cloudGemini,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+
+    if (pathname === "/api/v1/ai/warmup" && method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const target = typeof body?.target === "string" ? body.target : "all";
+      const skipWarmup = Boolean(
+        (process.env.VERCEL || process.env.NODE_ENV === "test") && body?.force !== true,
+      );
+      let started = false;
+      if (!skipWarmup) {
+        started = true;
+        if (target === "all") {
+          void warmupWhisperModel()
+            .catch((err: unknown) => {
+              console.warn(
+                "[AI Warmup] Whisper warmup notice:",
+                err instanceof Error ? err.message : err,
+              );
+            })
+            .finally(() => {
+              void warmupLocalLlm().catch((err: unknown) => {
+                console.warn(
+                  "[AI Warmup] Local LLM warmup notice:",
+                  err instanceof Error ? err.message : err,
+                );
+              });
+            });
+        } else if (target === "asr") {
+          void warmupWhisperModel().catch((err: unknown) => {
+            console.warn(
+              "[AI Warmup] Whisper warmup notice:",
+              err instanceof Error ? err.message : err,
+            );
+          });
+        } else if (target === "llm") {
+          void warmupLocalLlm().catch((err: unknown) => {
+            console.warn(
+              "[AI Warmup] Local LLM warmup notice:",
+              err instanceof Error ? err.message : err,
+            );
+          });
+        }
+      }
+
+      const asr = getAsrEngineStatus();
+      const llm = getLocalLlmStatus();
+      const cloudGemini = isGeminiConfigured();
+      const warming = asr.state === "loading" || llm.state === "loading";
+      const hasError = asr.state === "error" || llm.state === "error";
+      const ready =
+        !warming &&
+        !hasError &&
+        (asr.state === "ready" || asr.cachedOnDisk) &&
+        (llm.state === "ready" || llm.cachedOnDisk || cloudGemini);
+
+      return Response.json(
+        {
+          ok: true,
+          started,
+          ready,
+          warming,
+          asr,
+          llm,
+          cloudGemini,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
     }
 
     if (pathname === "/api/v1/auth/config" && method === "GET") {
@@ -2315,7 +2412,15 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
         .get("lectures")
         .find((l) => l.id === id && (isUserAdmin(user) || l.instructorId === user?.id));
       const item = meeting || lecture;
-      if (!item || !item.recordingPath || !fs.existsSync(item.recordingPath)) {
+      const fallbackAudio = item ? findRecordingFile(id) : null;
+      const resolvedAudioPath =
+        item?.recordingPath && fs.existsSync(item.recordingPath)
+          ? item.recordingPath
+          : fallbackAudio?.filePath && fs.existsSync(fallbackAudio.filePath)
+            ? fallbackAudio.filePath
+            : "";
+
+      if (!item || !resolvedAudioPath) {
         return Response.json(
           { error: "Original recording audio file not found on disk." },
           { status: 404 },
@@ -2323,14 +2428,54 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       }
 
       const rType = meeting ? "meeting" : "lecture";
+      const rawAppLang = req.headers.get("x-app-language");
+      const appLanguage: "en" | "ar" =
+        rawAppLang === "ar"
+          ? "ar"
+          : rawAppLang === "en"
+            ? "en"
+            : item.appLanguage || (item.language?.startsWith("en") ? "en" : "ar");
+
+      const nowIso = new Date().toISOString();
+      if (meeting) {
+        db.update("meetings", (list) =>
+          list.map((m) =>
+            m.id === id
+              ? {
+                  ...m,
+                  recordingPath: resolvedAudioPath,
+                  status: "Processing",
+                  transcriptionStatus: "Processing",
+                  updatedAt: nowIso,
+                }
+              : m,
+          ),
+        );
+      } else {
+        db.update("lectures", (list) =>
+          list.map((l) =>
+            l.id === id
+              ? {
+                  ...l,
+                  recordingPath: resolvedAudioPath,
+                  status: "Processing",
+                  transcriptionStatus: "Processing",
+                  updatedAt: nowIso,
+                }
+              : l,
+          ),
+        );
+      }
+
       const job = createJob(
         rType,
         id,
-        item.recordingFileName || path.basename(item.recordingPath),
-        item.recordingPath,
+        item.recordingFileName || path.basename(resolvedAudioPath),
+        resolvedAudioPath,
         item.language || "auto",
         {
           userId: user?.id || "usr_admin",
+          appLanguage,
         },
       );
 
@@ -2339,7 +2484,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
           job.id,
           rType,
           id,
-          item.recordingPath!,
+          resolvedAudioPath,
           item.recordingFileName || item.title,
           item.language || "auto",
         );
@@ -2493,7 +2638,25 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
         .get("jobs")
         .find((j) => j.id === id && (isUserAdmin(user) || !j.userId || j.userId === user?.id));
       if (!job) return Response.json({ error: "Job not found" }, { status: 404 });
-      return Response.json(job);
+
+      const linkedResource =
+        job.resourceType === "lecture"
+          ? db.get("lectures").find((l) => l.id === job.resourceId)
+          : db.get("meetings").find((m) => m.id === job.resourceId);
+      const resourceSegments = linkedResource?.segments || [];
+      const latestSegments = resourceSegments.slice(-4);
+      const latestTextPreview = latestSegments
+        .map((s) => s.text)
+        .join(" ")
+        .trim()
+        .slice(-280);
+
+      return Response.json({
+        ...job,
+        partialSegmentsCount: resourceSegments.length,
+        latestTextPreview,
+        latestSegments,
+      });
     }
 
     // ----------------------------------------------------
@@ -3782,14 +3945,113 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     // ----------------------------------------------------
-    // AI RETRY ANALYSIS ENDPOINT
-    // Allows retrying failed or unavailable (503/429) AI analysis without re-recording audio
+    // SHARED TRANSCRIPT RESOLUTION HELPER FOR ALL AI ROUTES
     // ----------------------------------------------------
-    if (pathname === "/api/v1/ai/retry-analysis" && method === "POST") {
+    const ensureRealSegments = async (
+      target: MeetingRecord | LectureRecord,
+      resType: "meeting" | "lecture",
+    ): Promise<TranscriptSegment[]> => {
+      const existing = target.segments || [];
+      const isPlaceholderFallback =
+        existing.length > 0 &&
+        existing.every(
+          (s) =>
+            s.text.includes("has been verified and saved") ||
+            s.text.includes("تم استقبال وحفظ التسجيل الصوتي") ||
+            (s.text.includes("Detected ") && s.text.includes("active audio windows")),
+        );
+
+      if (existing.length === 0 || isPlaceholderFallback) {
+        const candidatePath =
+          target.recordingPath && fs.existsSync(target.recordingPath)
+            ? target.recordingPath
+            : target.recordingPath &&
+                fs.existsSync(path.resolve(process.cwd(), target.recordingPath))
+              ? path.resolve(process.cwd(), target.recordingPath)
+              : findRecordingFile(target.id)?.filePath;
+
+        if (candidatePath && fs.existsSync(candidatePath)) {
+          try {
+            const whisperRes = await transcribeAudioWithLocalWhisper({
+              filePath: candidatePath,
+              resourceType: resType,
+              language: target.language || "auto",
+              jobId: `retrans_${target.id}`,
+            });
+            if (whisperRes.segments.length > 0) {
+              const fullText = whisperRes.segments.map((s) => s.text).join(" ");
+              if (resType === "meeting") {
+                db.update("meetings", (list) =>
+                  list.map((m) =>
+                    m.id === target.id
+                      ? {
+                          ...m,
+                          segments: whisperRes.segments,
+                          fullText,
+                          transcriptionStatus: "Completed",
+                          updatedAt: new Date().toISOString(),
+                        }
+                      : m,
+                  ),
+                );
+              } else {
+                db.update("lectures", (list) =>
+                  list.map((l) =>
+                    l.id === target.id
+                      ? {
+                          ...l,
+                          segments: whisperRes.segments,
+                          fullText,
+                          transcriptionStatus: "Completed",
+                          updatedAt: new Date().toISOString(),
+                        }
+                      : l,
+                  ),
+                );
+              }
+              return whisperRes.segments;
+            }
+          } catch {
+            // continue to fullText or existing segments
+          }
+        }
+
+        if (existing.length === 0 && target.fullText && target.fullText.trim()) {
+          return [
+            {
+              id: `seg_ft_${target.id}_1`,
+              speaker: resType === "lecture" ? "المحاضر" : "المتحدث 1",
+              startTime: 0,
+              endTime: Math.max(10, target.durationSeconds || 60),
+              text: target.fullText.trim(),
+            },
+          ];
+        }
+      }
+      return existing;
+    };
+
+    // ----------------------------------------------------
+    // AI RETRY ANALYSIS ENDPOINT (supports both /api/v1/ai/retry-analysis and /api/v1/recordings/:id/retry-analysis)
+    // Allows retrying AI analysis without re-recording audio
+    // ----------------------------------------------------
+    const isRecordingRetryAnalysis =
+      pathname.startsWith("/api/v1/recordings/") &&
+      pathname.endsWith("/retry-analysis") &&
+      method === "POST";
+
+    if (
+      (pathname === "/api/v1/ai/retry-analysis" && method === "POST") ||
+      isRecordingRetryAnalysis
+    ) {
       const user = getAuthUser(req);
       const admin = isUserAdmin(user);
-      const body = await req.json();
-      const { resourceId, resourceType } = body;
+      const body = await req.json().catch(() => ({}));
+      const pathResourceId = isRecordingRetryAnalysis
+        ? pathname.replace("/api/v1/recordings/", "").replace("/retry-analysis", "").trim()
+        : "";
+      const resourceId = String(pathResourceId || body.resourceId || "").trim();
+      const resourceType = body.resourceType;
       if (!resourceId) {
         return Response.json({ error: "resourceId is required" }, { status: 400 });
       }
@@ -3813,7 +4075,8 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         return Response.json({ error: "Forbidden" }, { status: 403 });
       }
 
-      if (!target.segments || target.segments.length === 0) {
+      const activeSegments = await ensureRealSegments(target, effectiveType);
+      if (!activeSegments || activeSegments.length === 0) {
         return Response.json(
           { error: "لا توجد مقاطع نصية مفرغة في هذا التسجيل لإجراء التحليل الذكي عليها." },
           { status: 400 },
@@ -3853,7 +4116,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         language: target.language || "auto",
         appLanguage,
         durationSeconds: target.durationSeconds || 1,
-        segments: target.segments,
+        segments: activeSegments,
         userId: ownerId || user?.id || "usr_admin",
         recordingPath: target.recordingPath,
         recordingFileName: target.recordingFileName,
@@ -3874,8 +4137,11 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     // AI OPERATIONS & GROUNDED Q&A
     // ----------------------------------------------------
     if (pathname === "/api/v1/ai/generate-summary" && method === "POST") {
-      const body = await req.json();
+      const body = await req.json().catch(() => ({}));
       const { resourceId, type = "meeting" } = body;
+      if (!resourceId) {
+        return Response.json({ error: "resourceId is required" }, { status: 400 });
+      }
       const meeting = db.get("meetings").find((m) => m.id === resourceId);
       const lecture = db.get("lectures").find((l) => l.id === resourceId);
       const target = meeting || lecture;
@@ -3893,18 +4159,50 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             : target.appLanguage || (target.language?.startsWith("en") ? "en" : "ar");
 
       const courseCode = lecture?.courseCode || "GEN 101";
+      const effectiveType: "meeting" | "lecture" = meeting
+        ? "meeting"
+        : lecture
+          ? "lecture"
+          : type === "lecture"
+            ? "lecture"
+            : "meeting";
 
       try {
-        const summaryResult = await generateAiSummary(
-          target.title,
-          target.segments || [],
-          type === "lecture" ? "lecture" : "meeting",
-          courseCode,
-          appLanguage,
-        );
+        const activeSegments = await ensureRealSegments(target, effectiveType);
+        let summaryText = "";
+        let executiveSummary = "";
+        let detailedSummary = "";
+        let keyPoints: string[] = [];
+        let decisions: string[] = [];
 
-        const summaryText = summaryResult.summary;
+        try {
+          const summaryResult = await generateAiSummary(
+            target.title,
+            activeSegments,
+            effectiveType,
+            courseCode,
+            appLanguage,
+          );
+          summaryText = summaryResult.summary || summaryResult.detailedSummary || "";
+          executiveSummary = summaryResult.executiveSummary || summaryText;
+          detailedSummary = summaryResult.detailedSummary || summaryText;
+          keyPoints = summaryResult.keyPoints || [];
+          decisions = summaryResult.decisions || [];
+        } catch {
+          const fallback = generateAnalysisFromTranscript(
+            target.title,
+            activeSegments,
+            effectiveType,
+            courseCode,
+          );
+          summaryText = fallback.lectureNotes || fallback.summary;
+          executiveSummary = fallback.summary;
+          detailedSummary = summaryText;
+          keyPoints = fallback.keyPoints || [];
+          decisions = fallback.decisions || [];
+        }
 
+        const nowIso = new Date().toISOString();
         if (meeting) {
           db.update("meetings", (meetings) =>
             meetings.map((m) =>
@@ -3912,11 +4210,15 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
                 ? {
                     ...m,
                     summary: summaryText,
-                    keyPoints: summaryResult.keyPoints,
+                    executiveSummary,
+                    detailedSummary,
+                    keyPoints,
+                    decisions: decisions.length > 0 ? decisions : m.decisions,
                     analysisStatus: "Completed",
                     analysisError: undefined,
                     analysisRetryable: false,
-                    analyzedAt: new Date().toISOString(),
+                    analyzedAt: nowIso,
+                    updatedAt: nowIso,
                   }
                 : m,
             ),
@@ -3929,30 +4231,36 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
                     ...l,
                     studyNotes: summaryText,
                     summary: summaryText,
-                    keyConcepts: summaryResult.keyPoints.map((kp) => ({
-                      term: "نقطة محورية",
+                    executiveSummary,
+                    detailedSummary,
+                    keyConcepts: keyPoints.map((kp) => ({
+                      term: appLanguage === "ar" ? "نقطة محورية" : "Key Point",
                       definition: kp,
                     })),
                     analysisStatus: "Completed",
                     analysisError: undefined,
                     analysisRetryable: false,
-                    analyzedAt: new Date().toISOString(),
+                    analyzedAt: nowIso,
+                    updatedAt: nowIso,
                   }
                 : l,
             ),
           );
         }
 
-        return Response.json({ success: true, summary: summaryText, resourceId });
+        notifySync({ type: "SUMMARY_GENERATED", id: resourceId, userId: currentUser.id });
+        return Response.json({
+          success: true,
+          summary: summaryText,
+          executiveSummary,
+          keyPoints,
+          decisions,
+          resourceId,
+        });
       } catch (err) {
-        const status = extractHttpStatus(err) || 503;
+        const status = extractHttpStatus(err) || 500;
         const retryable = isRetryableGeminiError(err);
-        const errMsg =
-          status === 503
-            ? "التحليل الذكي غير متاح مؤقتاً بسبب الضغط العالي على خوادم الذكاء الاصطناعي (HTTP 503 UNAVAILABLE). يمكنك إعادة المحاولة بعد قليل."
-            : err instanceof Error
-              ? err.message
-              : String(err);
+        const errMsg = err instanceof Error ? err.message : String(err);
         return Response.json(
           { success: false, error: errMsg, retryable, status },
           { status: retryable ? 503 : 400 },
@@ -3961,8 +4269,11 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     if (pathname === "/api/v1/ai/generate-quiz" && method === "POST") {
-      const body = await req.json();
+      const body = await req.json().catch(() => ({}));
       const { resourceId, type = "lecture" } = body;
+      if (!resourceId) {
+        return Response.json({ error: "resourceId is required" }, { status: 400 });
+      }
       const meeting = db.get("meetings").find((m) => m.id === resourceId);
       const lecture = db.get("lectures").find((l) => l.id === resourceId);
       const target = meeting || lecture;
@@ -3979,31 +4290,73 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             ? "en"
             : target.appLanguage || (target.language?.startsWith("en") ? "en" : "ar");
 
-      const summaryText = meeting?.summary || lecture?.studyNotes || "";
+      const rawNum = Number(body.numQuestions ?? body.questionCount);
+      const numQuestions =
+        Number.isFinite(rawNum) && rawNum > 0
+          ? Math.max(1, Math.min(20, Math.round(rawNum)))
+          : undefined;
+      const variant =
+        typeof body.variant === "number" && Number.isFinite(body.variant)
+          ? body.variant
+          : undefined;
+      const avoidQuestionTitles = Array.isArray(body.avoidQuestionTitles)
+        ? body.avoidQuestionTitles.map((x: unknown) => String(x))
+        : undefined;
+
+      const summaryText = meeting?.summary || lecture?.studyNotes || lecture?.summary || "";
       const courseCode = lecture?.courseCode || "GEN 101";
+      const effectiveType: "meeting" | "lecture" = meeting
+        ? "meeting"
+        : lecture
+          ? "lecture"
+          : type === "meeting"
+            ? "meeting"
+            : "lecture";
 
       try {
+        const activeSegments = await ensureRealSegments(target, effectiveType);
         const quizResult = await generateAiQuiz(
           target.title,
-          target.segments || [],
+          activeSegments,
           summaryText,
           courseCode,
-          { appLanguage },
+          {
+            appLanguage,
+            numQuestions,
+            variant,
+            avoidQuestionTitles,
+          },
         );
+
+        const rawQuestions = Array.isArray(quizResult.questions) ? quizResult.questions : [];
+        const slicedQuestions = numQuestions ? rawQuestions.slice(0, numQuestions) : rawQuestions;
 
         const quizId = `quiz_${resourceId}_${Date.now()}`;
         const newQuiz = {
           id: quizId,
-          lectureId: resourceId,
-          meetingId: type === "meeting" ? resourceId : undefined,
-          title: quizResult.title || `اختبار تقييمي شامل: ${target.title}`,
+          lectureId: effectiveType === "lecture" ? resourceId : resourceId,
+          meetingId: effectiveType === "meeting" ? resourceId : undefined,
+          title:
+            quizResult.title ||
+            (appLanguage === "ar"
+              ? `اختبار تقييمي شامل: ${target.title}`
+              : `Assessment Quiz: ${target.title}`),
           courseCode,
-          questions: quizResult.questions.map((q, idx) => ({
+          questions: slicedQuestions.map((q, idx) => ({
             id: q.id || `q_${resourceId}_${idx + 1}`,
             question: q.question,
+            type: q.type || "multiple_choice",
             options: q.options,
             correctOptionIndex: q.correctOptionIndex,
+            correctAnswerText: q.correctAnswerText ?? q.options[q.correctOptionIndex],
+            acceptableAnswers: q.acceptableAnswers ?? [q.options[q.correctOptionIndex]],
             explanation: q.explanation,
+            difficulty: q.difficulty || "medium",
+            sectionRef: q.sectionRef,
+            timestampRef: q.timestampRef,
+            sourceReference: q.sourceReference,
+            sourceTranscriptSegment: q.sourceTranscriptSegment,
+            groundingVerified: q.groundingVerified ?? true,
           })),
           attemptsCount: 0,
           createdAt: new Date().toISOString(),
@@ -4014,16 +4367,12 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
           ...quizzes.filter((q) => q.lectureId !== resourceId && q.meetingId !== resourceId),
         ]);
 
+        notifySync({ type: "QUIZ_GENERATED", id: quizId, userId: currentUser.id });
         return Response.json({ success: true, quiz: newQuiz });
       } catch (err) {
-        const status = extractHttpStatus(err) || 503;
+        const status = extractHttpStatus(err) || 500;
         const retryable = isRetryableGeminiError(err);
-        const errMsg =
-          status === 503
-            ? "توليد الكويز غير متاح مؤقتاً بسبب الضغط على خوادم الذكاء الاصطناعي (HTTP 503 UNAVAILABLE). يمكنك إعادة المحاولة بعد قليل."
-            : err instanceof Error
-              ? err.message
-              : String(err);
+        const errMsg = err instanceof Error ? err.message : String(err);
         return Response.json(
           { success: false, error: errMsg, retryable, status },
           { status: retryable ? 503 : 400 },
@@ -4032,8 +4381,11 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     if (pathname === "/api/v1/ai/generate-analysis" && method === "POST") {
-      const body = await req.json();
+      const body = await req.json().catch(() => ({}));
       const { resourceId, type = "lecture" } = body;
+      if (!resourceId) {
+        return Response.json({ error: "resourceId is required" }, { status: 400 });
+      }
       const meeting = db.get("meetings").find((m) => m.id === resourceId);
       const lecture = db.get("lectures").find((l) => l.id === resourceId);
       const target = meeting || lecture;
@@ -4051,36 +4403,78 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             : target.appLanguage || (target.language?.startsWith("en") ? "en" : "ar");
 
       const courseCode = lecture?.courseCode || "GEN 101";
+      const effectiveType: "meeting" | "lecture" = meeting
+        ? "meeting"
+        : lecture
+          ? "lecture"
+          : type === "lecture"
+            ? "lecture"
+            : "meeting";
 
       try {
+        const activeSegments = await ensureRealSegments(target, effectiveType);
         const analysis = await generateAiLectureAnalysis(
           target.title,
-          target.segments || [],
-          type === "lecture" ? "lecture" : "meeting",
+          activeSegments,
+          effectiveType,
           courseCode,
           appLanguage,
         );
+        const extractedKeywords = extractKeywordsWithFrequency(activeSegments);
+        const extractedHighlights = extractHighlightsFromSegments(activeSegments);
+        const nowIso = new Date().toISOString();
 
         if (meeting) {
           db.update("meetings", (meetings) =>
-            meetings.map((m) => (m.id === resourceId ? { ...m, analysis } : m)),
+            meetings.map((m) =>
+              m.id === resourceId
+                ? {
+                    ...m,
+                    analysis,
+                    topics: analysis.topics?.length ? analysis.topics : m.topics,
+                    keywords: extractedKeywords.length > 0 ? extractedKeywords : m.keywords,
+                    highlights: extractedHighlights.length > 0 ? extractedHighlights : m.highlights,
+                    analysisStatus: "Completed",
+                    analysisError: undefined,
+                    analysisRetryable: false,
+                    analyzedAt: nowIso,
+                    updatedAt: nowIso,
+                  }
+                : m,
+            ),
           );
         } else if (lecture) {
           db.update("lectures", (lectures) =>
-            lectures.map((l) => (l.id === resourceId ? { ...l, analysis } : l)),
+            lectures.map((l) =>
+              l.id === resourceId
+                ? {
+                    ...l,
+                    analysis,
+                    topics: analysis.topics?.length ? analysis.topics : l.topics,
+                    keywords: extractedKeywords.length > 0 ? extractedKeywords : l.keywords,
+                    highlights: extractedHighlights.length > 0 ? extractedHighlights : l.highlights,
+                    analysisStatus: "Completed",
+                    analysisError: undefined,
+                    analysisRetryable: false,
+                    analyzedAt: nowIso,
+                    updatedAt: nowIso,
+                  }
+                : l,
+            ),
           );
         }
 
-        return Response.json({ success: true, analysis });
+        notifySync({ type: "ANALYSIS_GENERATED", id: resourceId, userId: currentUser.id });
+        return Response.json({
+          success: true,
+          analysis,
+          keywords: extractedKeywords,
+          highlights: extractedHighlights,
+        });
       } catch (err) {
-        const status = extractHttpStatus(err) || 503;
+        const status = extractHttpStatus(err) || 500;
         const retryable = isRetryableGeminiError(err);
-        const errMsg =
-          status === 503
-            ? "تحليل المحاضرة غير متاح مؤقتاً بسبب الضغط على خوادم الذكاء الاصطناعي (HTTP 503 UNAVAILABLE). يمكنك إعادة المحاولة بعد قليل."
-            : err instanceof Error
-              ? err.message
-              : String(err);
+        const errMsg = err instanceof Error ? err.message : String(err);
         return Response.json(
           { success: false, error: errMsg, retryable, status },
           { status: retryable ? 503 : 400 },
@@ -4091,7 +4485,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     if (pathname === "/api/v1/ai/ask" && method === "POST") {
       const user = getAuthUser(req);
       const admin = isUserAdmin(user);
-      const body = await req.json();
+      const body = await req.json().catch(() => ({}));
       const { question, resourceId, recordingId, history } = body;
 
       if (!question || typeof question !== "string" || !question.trim()) {
@@ -4102,23 +4496,45 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       const appLanguage: "en" | "ar" | undefined =
         rawAppLang === "ar" ? "ar" : rawAppLang === "en" ? "en" : undefined;
 
-      const result = await askMeetMindAI({
-        question: question.trim(),
-        resourceId: resourceId || recordingId,
-        history: Array.isArray(history) ? history : [],
-        userId: user?.id || "usr_admin",
-        isAdmin: admin,
-        appLanguage,
-      });
+      try {
+        const result = await askMeetMindAI({
+          question: question.trim(),
+          resourceId: resourceId || recordingId,
+          history: Array.isArray(history) ? history : [],
+          userId: user?.id || "usr_admin",
+          isAdmin: admin,
+          appLanguage,
+        });
 
-      if (result.forbidden) {
-        return Response.json(
-          { error: "You do not have permission to query this recording." },
-          { status: 403 },
-        );
+        if (result.forbidden) {
+          return Response.json(
+            { error: "You do not have permission to query this recording." },
+            { status: 403 },
+          );
+        }
+
+        return Response.json(result);
+      } catch (err) {
+        console.warn("[AI Ask Fallback]:", err instanceof Error ? err.message : err);
+        const targetId = resourceId || recordingId;
+        const target = targetId
+          ? db.get("meetings").find((m) => m.id === targetId) ||
+            db.get("lectures").find((l) => l.id === targetId)
+          : undefined;
+        if (target && target.segments?.length) {
+          return Response.json(
+            answerGroundedQuestion(target.title, target.segments, question.trim()),
+          );
+        }
+        return Response.json({
+          answer:
+            appLanguage === "ar" || /[\u0600-\u06FF]/.test(question)
+              ? "تعذر إتمام الإجابة حالياً. يرجى إعادة صياغة السؤال أو المحاولة مرة أخرى بعد لحظات."
+              : "Unable to complete the response right now. Please try rephrasing or ask again shortly.",
+          evidenceFound: false,
+          citations: [],
+        });
       }
-
-      return Response.json(result);
     }
 
     if (pathname === "/api/v1/ai/chat-history" && method === "GET") {
@@ -4242,44 +4658,83 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     if (pathname === "/api/v1/quizzes/generate" && method === "POST") {
-      const body = await req.json();
-      const { lectureId, avoidQuestionTitles = [], variant = 2 } = body;
+      const body = await req.json().catch(() => ({}));
+      const { lectureId, meetingId, resourceId, avoidQuestionTitles = [], variant = 2 } = body;
+      const targetId = lectureId || meetingId || resourceId;
 
-      const lecture = db
-        .get("lectures")
-        .find((l) => l.id === lectureId && (currentIsAdmin || l.instructorId === currentUser.id));
-      if (!lecture) {
-        return Response.json({ error: "Lecture not found" }, { status: 404 });
+      const ownedLectures = currentIsAdmin
+        ? db.get("lectures")
+        : db.get("lectures").filter((l) => l.instructorId === currentUser.id);
+      const ownedMeetings = currentIsAdmin
+        ? db.get("meetings")
+        : db.get("meetings").filter((m) => m.hostId === currentUser.id);
+
+      const lecture = targetId ? ownedLectures.find((l) => l.id === targetId) : ownedLectures[0];
+      const meeting = targetId
+        ? ownedMeetings.find((m) => m.id === targetId)
+        : !lecture
+          ? ownedMeetings[0]
+          : undefined;
+      const resource = lecture || meeting;
+
+      if (!resource) {
+        return Response.json({ error: "Lecture or recording not found" }, { status: 404 });
       }
 
+      const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
+      const appLanguage: "en" | "ar" =
+        rawAppLang === "ar"
+          ? "ar"
+          : rawAppLang === "en"
+            ? "en"
+            : resource.appLanguage || (resource.language?.startsWith("en") ? "en" : "ar");
+
+      const rawNum = Number(body.numQuestions ?? body.questionCount);
+      const numQuestions =
+        Number.isFinite(rawNum) && rawNum > 0
+          ? Math.max(1, Math.min(20, Math.round(rawNum)))
+          : undefined;
+
+      const resType: "meeting" | "lecture" = lecture ? "lecture" : "meeting";
+      const activeSegments = await ensureRealSegments(resource, resType);
+      const summaryContext =
+        resource.summary || ("studyNotes" in resource ? resource.studyNotes : undefined);
+
       const generated = await generateAiQuiz(
-        lecture.title,
-        lecture.segments,
-        lecture.summary || lecture.studyNotes,
-        lecture.courseCode,
+        resource.title,
+        activeSegments,
+        summaryContext,
+        "courseCode" in resource ? resource.courseCode : undefined,
         {
-          avoidQuestionTitles,
+          avoidQuestionTitles: Array.isArray(avoidQuestionTitles) ? avoidQuestionTitles : [],
           variant,
+          appLanguage,
+          numQuestions,
         },
       );
+
+      const finalQuestions = numQuestions
+        ? generated.questions.slice(0, numQuestions)
+        : generated.questions;
 
       const newQuizId = `quiz_${Date.now()}`;
       const newQuiz = {
         id: newQuizId,
-        lectureId,
+        lectureId: lecture ? resource.id : undefined,
+        meetingId: !lecture ? resource.id : undefined,
         title: generated.title,
         courseCode: generated.courseCode,
-        questions: generated.questions,
+        questions: finalQuestions,
         attemptsCount: 0,
         createdAt: new Date().toISOString(),
       };
 
       db.update("quizzes", (quizzes) => [
         newQuiz,
-        ...quizzes.filter((q) => q.lectureId !== lectureId),
+        ...quizzes.filter((q) => q.lectureId !== resource.id && q.meetingId !== resource.id),
       ]);
 
-      notifySync({ type: "QUIZ_GENERATED", id: newQuizId });
+      notifySync({ type: "QUIZ_GENERATED", id: newQuizId, userId: currentUser.id });
       return Response.json(newQuiz, { status: 201 });
     }
 
@@ -4457,9 +4912,9 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     if (pathname === "/api/v1/flashcards/generate" && method === "POST") {
-      const body = await req.json();
-      const { lectureId, meetingId } = body;
-      const targetId = lectureId || meetingId;
+      const body = await req.json().catch(() => ({}));
+      const { lectureId, meetingId, resourceId } = body;
+      const targetId = lectureId || meetingId || resourceId;
       const ownedLectures = currentIsAdmin
         ? db.get("lectures")
         : db.get("lectures").filter((l) => l.instructorId === currentUser.id);
@@ -4467,7 +4922,11 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         ? db.get("meetings")
         : db.get("meetings").filter((m) => m.hostId === currentUser.id);
       const lecture = targetId ? ownedLectures.find((l) => l.id === targetId) : ownedLectures[0];
-      const meeting = targetId ? ownedMeetings.find((m) => m.id === targetId) : undefined;
+      const meeting = targetId
+        ? ownedMeetings.find((m) => m.id === targetId)
+        : !lecture
+          ? ownedMeetings[0]
+          : undefined;
       const resource = lecture || meeting;
 
       if (!resource) {
@@ -4477,37 +4936,53 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         );
       }
 
-      const generated = await generateAiFlashcards(
-        resource.title,
-        resource.segments,
-        resource.summary,
-        "courseCode" in resource ? resource.courseCode : undefined,
-      );
+      const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
+      const appLanguage: "en" | "ar" =
+        rawAppLang === "ar"
+          ? "ar"
+          : rawAppLang === "en"
+            ? "en"
+            : resource.appLanguage || (resource.language?.startsWith("en") ? "en" : "ar");
 
-      const now = new Date().toISOString();
-      const newCards = generated.map((c, idx) => ({
-        id: `fc_${Date.now()}_${idx + 1}`,
-        deckId: `deck_${resource.id}`,
-        deckTitle:
-          resource.title.length > 35 ? resource.title.slice(0, 35) + "..." : resource.title,
-        lectureId: "courseCode" in resource ? resource.id : undefined,
-        meetingId: !("courseCode" in resource) ? resource.id : undefined,
-        front: c.front,
-        back: c.back,
-        sourceReference: c.sourceReference,
-        topic: c.topic,
-        difficulty: c.difficulty,
-        mastered: false,
-        reviewCount: 0,
-        createdAt: now,
-      }));
+      try {
+        const resType: "meeting" | "lecture" = "courseCode" in resource ? "lecture" : "meeting";
+        const activeSegments = await ensureRealSegments(resource, resType);
+        const generated = await generateAiFlashcards(
+          resource.title,
+          activeSegments,
+          resource.summary || ("studyNotes" in resource ? resource.studyNotes : undefined),
+          "courseCode" in resource ? resource.courseCode : undefined,
+          appLanguage,
+        );
 
-      db.update("flashcards", (cards) => [
-        ...newCards,
-        ...cards.filter((c) => c.deckId !== `deck_${resource.id}`),
-      ]);
+        const now = new Date().toISOString();
+        const newCards = generated.map((c, idx) => ({
+          id: `fc_${Date.now()}_${idx + 1}`,
+          deckId: `deck_${resource.id}`,
+          deckTitle:
+            resource.title.length > 35 ? resource.title.slice(0, 35) + "..." : resource.title,
+          lectureId: "courseCode" in resource ? resource.id : undefined,
+          meetingId: !("courseCode" in resource) ? resource.id : undefined,
+          front: c.front,
+          back: c.back,
+          sourceReference: c.sourceReference,
+          topic: c.topic,
+          difficulty: c.difficulty,
+          mastered: false,
+          reviewCount: 0,
+          createdAt: now,
+        }));
 
-      return Response.json(newCards, { status: 201 });
+        db.update("flashcards", (cards) => [
+          ...newCards,
+          ...cards.filter((c) => c.deckId !== `deck_${resource.id}`),
+        ]);
+
+        return Response.json(newCards, { status: 201 });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return Response.json({ error: errMsg }, { status: 400 });
+      }
     }
 
     // ----------------------------------------------------
@@ -4522,9 +4997,9 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     if (pathname === "/api/v1/mindmaps/generate" && method === "POST") {
-      const body = await req.json();
-      const { lectureId, meetingId } = body;
-      const targetId = lectureId || meetingId;
+      const body = await req.json().catch(() => ({}));
+      const { lectureId, meetingId, resourceId } = body;
+      const targetId = lectureId || meetingId || resourceId;
       const ownedLectures = currentIsAdmin
         ? db.get("lectures")
         : db.get("lectures").filter((l) => l.instructorId === currentUser.id);
@@ -4532,7 +5007,11 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         ? db.get("meetings")
         : db.get("meetings").filter((m) => m.hostId === currentUser.id);
       const lecture = targetId ? ownedLectures.find((l) => l.id === targetId) : ownedLectures[0];
-      const meeting = targetId ? ownedMeetings.find((m) => m.id === targetId) : undefined;
+      const meeting = targetId
+        ? ownedMeetings.find((m) => m.id === targetId)
+        : !lecture
+          ? ownedMeetings[0]
+          : undefined;
       const resource = lecture || meeting;
 
       if (!resource) {
@@ -4542,31 +5021,47 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         );
       }
 
-      const rootNode = await generateAiMindMap(
-        resource.title,
-        resource.segments,
-        resource.summary,
-        "courseCode" in resource ? resource.courseCode : undefined,
-      );
+      const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
+      const appLanguage: "en" | "ar" =
+        rawAppLang === "ar"
+          ? "ar"
+          : rawAppLang === "en"
+            ? "en"
+            : resource.appLanguage || (resource.language?.startsWith("en") ? "en" : "ar");
 
-      const now = new Date().toISOString();
-      const newMap = {
-        id: `mm_${Date.now()}`,
-        title: resource.title,
-        lectureId: "courseCode" in resource ? resource.id : undefined,
-        meetingId: !("courseCode" in resource) ? resource.id : undefined,
-        rootNode,
-        createdAt: now,
-      };
+      try {
+        const resType: "meeting" | "lecture" = "courseCode" in resource ? "lecture" : "meeting";
+        const activeSegments = await ensureRealSegments(resource, resType);
+        const rootNode = await generateAiMindMap(
+          resource.title,
+          activeSegments,
+          resource.summary || ("studyNotes" in resource ? resource.studyNotes : undefined),
+          "courseCode" in resource ? resource.courseCode : undefined,
+          appLanguage,
+        );
 
-      db.update("mindMaps", (maps) => [
-        newMap,
-        ...maps.filter((m) =>
-          "courseCode" in resource ? m.lectureId !== resource.id : m.meetingId !== resource.id,
-        ),
-      ]);
+        const now = new Date().toISOString();
+        const newMap = {
+          id: `mm_${Date.now()}`,
+          title: resource.title,
+          lectureId: "courseCode" in resource ? resource.id : undefined,
+          meetingId: !("courseCode" in resource) ? resource.id : undefined,
+          rootNode,
+          createdAt: now,
+        };
 
-      return Response.json(newMap, { status: 201 });
+        db.update("mindMaps", (maps) => [
+          newMap,
+          ...maps.filter((m) =>
+            "courseCode" in resource ? m.lectureId !== resource.id : m.meetingId !== resource.id,
+          ),
+        ]);
+
+        return Response.json(newMap, { status: 201 });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return Response.json({ error: errMsg }, { status: 400 });
+      }
     }
 
     // ----------------------------------------------------

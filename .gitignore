@@ -47,6 +47,8 @@ data/avatars/*
 !data/avatars/.gitkeep
 data/chunks/*
 !data/chunks/.gitkeep
+data/whisper-models/
+data/llm-models/
 services/ai_service/packages/
 services/ai_service/models/
 

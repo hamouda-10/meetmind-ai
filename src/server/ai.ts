@@ -17,7 +17,23 @@ import {
   logGeminiStructured,
   extractGeminiTranscriptText,
   getGeminiClient,
+  suspendCloudGeminiTemporarily,
 } from "./gemini";
+import {
+  answerBuiltInChat,
+  buildBuiltInSummary,
+  buildBuiltInLectureAnalysis,
+  buildBuiltInFlashcards,
+  buildBuiltInMindMap,
+  buildBuiltInQuiz,
+  detectIsArabic,
+  normalizeText,
+  retrieveRelevantSegmentsBM25,
+  selectHighSignalSegments,
+  tryAnswerIdentityQuery,
+  trySolveMathQuery,
+} from "./builtin-ai";
+import { generateLocalLlmJson, generateLocalLlmText, getLocalLlmModelId } from "./local-llm";
 
 const execFileAsync = promisify(execFile);
 const geminiConfig = getGeminiConfig();
@@ -26,7 +42,21 @@ const FALLBACK_TEXT_MODEL = geminiConfig.fallbackTextModel;
 const ASR_MODEL = geminiConfig.asrModel;
 const FALLBACK_ASR_MODEL = geminiConfig.fallbackAsrModel;
 
-const PROMPT_VERSION = 1;
+const PROMPT_VERSION = 4;
+
+function suspendGeminiIfUnavailableError(err: unknown): void {
+  const status = extractHttpStatus(err);
+  const msg = err instanceof Error ? err.message : String(err || "");
+  if (
+    isBillingExhaustionError(err) ||
+    status === 401 ||
+    status === 402 ||
+    status === 403 ||
+    /fetch failed|enotfound|econnrefused|econnreset|etimedout|network|api key/i.test(msg)
+  ) {
+    suspendCloudGeminiTemporarily(10 * 60 * 1000);
+  }
+}
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 interface CacheEntry<T> {
@@ -641,8 +671,7 @@ export async function transcribeAndTranslateAudioChunk(params: {
       arabicText: "",
       text: "",
       detectedLanguage: language || "auto",
-      error: "GEMINI_API_KEY is not configured for real-time speech transcription.",
-      retryable: false,
+      isSilence: true,
     };
   }
 
@@ -771,20 +800,82 @@ Strict rules:
       finalFailureReason: msg,
     });
 
+    // Gracefully yield to client built-in Web Speech API when cloud ASR key is missing/depleted
+    if (isBillingDepleted || isAuthOrConfig) {
+      return {
+        arabicText: "",
+        text: "",
+        detectedLanguage: language || "auto",
+        isSilence: true,
+      };
+    }
+
     return {
       arabicText: "",
       text: "",
       detectedLanguage: language || "auto",
-      error: isBillingDepleted
-        ? "رصيد واجهة Gemini API منتهٍ في المشروع الحالي (HTTP 402). يرجى شحن الرصيد في AI Studio ثم إعادة المحاولة."
-        : isAuthOrConfig
-          ? "مفتاح Gemini API غير صالح أو غير مصرح به. يرجى التحقق من GEMINI_API_KEY في الإعدادات."
-          : status === 503
-            ? "خوادم تفريغ الصوت تشهد ضغطاً مؤقتاً عالياً (HTTP 503 UNAVAILABLE). سيتم إعادة إرسال المقطع تلقائياً."
-            : `تعذر التفريغ الصوتي مؤقتاً: ${msg.slice(0, 180)}`,
+      isSilence: true,
       retryable: retryable && !isAuthOrConfig && !isBillingDepleted,
     };
   }
+}
+
+// ============================================================================
+// LOCAL EMBEDDED LLM SHARED HELPERS (COMPACT RAG + GROUNDING + NORMALIZATION)
+// ============================================================================
+function formatCompactTranscriptForLocalLlm(
+  segments: TranscriptSegment[],
+  maxChars = 2200,
+): string {
+  const picked = selectHighSignalSegments(segments, maxChars);
+  return picked
+    .map((s) => `[${formatMmSs(s.startTime)}] ${s.speaker}: ${s.text.trim()}`)
+    .join("\n")
+    .slice(0, maxChars);
+}
+
+function hasTranscriptOverlap(candidateText: string, segments: TranscriptSegment[]): boolean {
+  const candTokens = normalizeText(candidateText)
+    .split(" ")
+    .filter((t) => t.length >= 3 || /\d/.test(t));
+  if (candTokens.length === 0) return false;
+  const transcriptNorm = normalizeText(segments.map((s) => s.text).join(" "));
+  const transcriptSet = new Set(transcriptNorm.split(" ").filter(Boolean));
+  let hits = 0;
+  for (const tok of Array.from(new Set(candTokens))) {
+    if (transcriptSet.has(tok) || (tok.length >= 4 && transcriptNorm.includes(tok))) {
+      hits++;
+    }
+  }
+  return hits >= 2 || (candTokens.length <= 4 && hits >= 1);
+}
+
+function normalizeMindMapTree(
+  raw: unknown,
+  fallbackTitle: string,
+  depth = 0,
+  prefix = "node",
+): MindMapNode | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const label = String(obj.label || obj.title || obj.name || "").trim();
+  if (!label && depth > 0) return null;
+
+  const rawChildren = Array.isArray(obj.children) ? obj.children : [];
+  const children: MindMapNode[] = [];
+  if (depth < 3) {
+    rawChildren.slice(0, 5).forEach((child, idx) => {
+      const normalized = normalizeMindMapTree(child, "", depth + 1, `${prefix}_${idx + 1}`);
+      if (normalized) children.push(normalized);
+    });
+  }
+
+  return {
+    id: typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : depth === 0 ? "root" : prefix,
+    label: (label || fallbackTitle).slice(0, 70),
+    description: typeof obj.description === "string" ? obj.description.trim().slice(0, 180) : "",
+    ...(children.length > 0 ? { children } : {}),
+  };
 }
 
 // Generate Structured Summary + Decisions + Action Items strictly grounded in the transcript
@@ -930,7 +1021,13 @@ ${preparedTranscript}
             },
           });
         },
-        { primaryModel: config.textModel, fallbackModel: config.fallbackTextModel },
+        {
+          primaryModel: config.textModel,
+          fallbackModel: config.fallbackTextModel,
+          maxRetries: 0,
+          baseDelayMs: 100,
+          maxDelayMs: 150,
+        },
       );
 
       const rawText = (response.text || "")
@@ -1007,23 +1104,102 @@ ${preparedTranscript}
       setCachedAiAnalysis(cacheHash, "summary", config.textModel, finalResult);
       return finalResult;
     } catch (err) {
+      suspendGeminiIfUnavailableError(err);
       logGeminiStructured({
-        level: "error",
-        event: "gemini_summary_failed",
+        level: "warn",
+        event: "gemini_summary_fallback_builtin",
         operation: "generateAiSummary",
         model: getGeminiConfig().textModel,
         status: extractHttpStatus(err),
         finalFailureReason: err instanceof Error ? err.message : String(err),
       });
-      throw err;
     }
   }
 
-  throw new GeminiPipelineError("GEMINI_API_KEY is not configured for AI summary generation.", {
-    model: getGeminiConfig().textModel,
-    retryable: false,
-    operation: "generateAiSummary",
-  });
+  // Tier 2: Hybrid Fast Local LLM Summary — crisp plain-text abstractive executive overview
+  // from Gemma 3 1B (~7-10s, zero JSON syntax overhead) combined with instant grounded facts/actions.
+  const builtInRef = buildBuiltInSummary(title, segments, type, courseCode, appLanguage);
+  const localTranscript = formatCompactTranscriptForLocalLlm(segments, 1800);
+  if (localTranscript) {
+    const factsHint =
+      builtInRef.keyPoints.length > 0
+        ? `\n[Extracted Facts]\n${builtInRef.keyPoints
+            .slice(0, 6)
+            .map((p) => `- ${p}`)
+            .join("\n")}`
+        : "";
+    const localSummarySystem = isEnglish
+      ? "You are MeetMind AI. Write a sharp 2-sentence executive summary grounded strictly in the transcript. Preserve exact names, locations, and figures. No headings, no intro filler."
+      : "أنت مساعد MeetMind AI. اكتب ملخصاً تنفيذياً دقيقاً من جملتين فقط باللغة العربية الفصحى مستنداً حصراً إلى النص المفرغ مع الحفاظ على الأسماء والأماكن والأرقام بدقة، بدون مقدمات أو عناوين.";
+    const localSummaryUser = isEnglish
+      ? `Summarize "${title}"${courseCode ? ` (${courseCode})` : ""} in 2 concise sentences:\n"""\n${localTranscript}${factsHint}\n"""`
+      : `لخّص تسجيل «${title}»${courseCode ? ` (${courseCode})` : ""} في جملتين واضحتين ودقيقتين:\n"""\n${localTranscript}${factsHint}\n"""`;
+
+    const abstractiveExec = await generateLocalLlmText({
+      systemPrompt: localSummarySystem,
+      userPrompt: localSummaryUser,
+      maxNewTokens: 95,
+      temperature: 0,
+      timeoutMs: 25000,
+    });
+
+    const cleanedExec = (abstractiveExec || "")
+      .replace(/^#+\s*/gm, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (cleanedExec.length >= 20 && hasTranscriptOverlap(cleanedExec, segments)) {
+      const keyPoints = builtInRef.keyPoints;
+      const decisions = builtInRef.decisions;
+      const actionItems = builtInRef.actionItems;
+
+      const markdownBlocks: string[] = [];
+      if (isEnglish) {
+        markdownBlocks.push(`# Executive Summary\n${cleanedExec}`);
+        if (keyPoints.length > 0) {
+          markdownBlocks.push(`## Key Points\n${keyPoints.map((p) => `- ${p}`).join("\n")}`);
+        }
+        if (decisions.length > 0) {
+          markdownBlocks.push(`## Decisions\n${decisions.map((d) => `- ${d}`).join("\n")}`);
+        }
+        if (actionItems.length > 0) {
+          markdownBlocks.push(
+            `## Action Items\n${actionItems.map((a) => `- ${a.title}${a.ownerName ? ` (${a.ownerName})` : ""}`).join("\n")}`,
+          );
+        }
+      } else {
+        markdownBlocks.push(`# الملخص التنفيذي\n${cleanedExec}`);
+        if (keyPoints.length > 0) {
+          markdownBlocks.push(
+            `## أبرز النقاط المستخلصة\n${keyPoints.map((p) => `- ${p}`).join("\n")}`,
+          );
+        }
+        if (decisions.length > 0) {
+          markdownBlocks.push(`## القرارات\n${decisions.map((d) => `- ${d}`).join("\n")}`);
+        }
+        if (actionItems.length > 0) {
+          markdownBlocks.push(
+            `## المهام والتوصيات\n${actionItems.map((a) => `- ${a.title}${a.ownerName ? ` (${a.ownerName})` : ""}`).join("\n")}`,
+          );
+        }
+      }
+
+      const detailed = markdownBlocks.join("\n\n");
+      const localResult = {
+        summary: detailed,
+        executiveSummary: cleanedExec,
+        detailedSummary: detailed,
+        keyPoints,
+        decisions,
+        actionItems,
+      };
+      setCachedAiAnalysis(cacheHash, "summary", getLocalLlmModelId(), localResult);
+      return localResult;
+    }
+  }
+
+  // Tier 3: Upgraded Deep Bilingual Analytical Engine (returned without poisoning 7-day LLM cache)
+  return builtInRef;
 }
 
 /**
@@ -1145,6 +1321,7 @@ export async function generateAiQuiz(
     variant?: number;
     difficulty?: "all" | "easy" | "medium" | "hard";
     appLanguage?: "en" | "ar";
+    numQuestions?: number;
   },
 ): Promise<{
   title: string;
@@ -1171,12 +1348,24 @@ export async function generateAiQuiz(
   const isEnglish = targetLang === "en";
   const ai = getGeminiClient();
   const variant = options?.variant || 1;
+  const totalWords = segments
+    .map((s) => s.text)
+    .join(" ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const defaultQuestionCount =
+    totalWords < 50 ? 4 : totalWords < 150 ? 6 : totalWords < 300 ? 8 : 10;
+  const requestedCount =
+    typeof options?.numQuestions === "number" && Number.isFinite(options.numQuestions)
+      ? Math.min(20, Math.max(1, Math.round(options.numQuestions)))
+      : defaultQuestionCount;
 
   const cacheHash = computeTranscriptHash(
     "quiz",
     title,
     segments,
-    `${courseCode || ""}:${options?.appLanguage || ""}`,
+    `${courseCode || ""}:${options?.appLanguage || ""}:${requestedCount}:${options?.difficulty || "all"}`,
   );
   const canUseCache =
     (!options?.avoidQuestionTitles || options.avoidQuestionTitles.length === 0) && variant === 1;
@@ -1212,21 +1401,15 @@ export async function generateAiQuiz(
         detectedLang === "en"
           ? "Generate ALL questions, options, and explanations in clear English matching the transcript."
           : "أنشئ الأسئلة والخيارات والشروحات باللغة العربية مع الحفاظ على المصطلحات التقنية كما وردت.";
-      const totalWords = segments
-        .map((s) => s.text)
-        .join(" ")
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean).length;
-      const targetMaxQuestions = Math.min(20, Math.max(3, Math.floor(totalWords / 20)));
-      const targetQuestionRange =
-        totalWords < 50
+      const targetQuestionRange = options?.numQuestions
+        ? `exactly ${requestedCount}`
+        : totalWords < 50
           ? "3 to 5"
           : totalWords < 150
             ? "6 to 10"
             : totalWords < 300
               ? "10 to 15"
-              : `up to ${targetMaxQuestions}`;
+              : `up to ${Math.min(20, Math.max(3, Math.floor(totalWords / 20)))}`;
 
       const prompt = isEnglish
         ? `You are an elite academic assessment designer and test examiner at MeetMind AI.
@@ -1322,7 +1505,13 @@ ${summaryText || ""}
             },
           });
         },
-        { primaryModel: config.textModel, fallbackModel: config.fallbackTextModel },
+        {
+          primaryModel: config.textModel,
+          fallbackModel: config.fallbackTextModel,
+          maxRetries: 0,
+          baseDelayMs: 100,
+          maxDelayMs: 150,
+        },
       );
 
       const jsonStr = (response.text || "")
@@ -1414,168 +1603,271 @@ ${summaryText || ""}
         }
       }
     } catch (e) {
+      suspendGeminiIfUnavailableError(e);
       console.warn("Gemini quiz generation error, using grounded generator:", e);
     }
   }
 
-  // Deterministic Grounded Generator covering up to 20 real segments without hallucination
-  const formatTimeStr = (sec: number) => {
-    const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
-    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-  };
+  // Hybrid Fast-Path: when the transcript has dense structured specs/entities/definitions/cloze
+  // facts that already satisfy requestedCount with zero raw-clause fallbacks, return instantaneously (<10ms).
+  const builtInQuizCandidate = buildBuiltInQuiz(title, segments, {
+    courseCode,
+    appLanguage: isEnglish ? "en" : "ar",
+    numQuestions: requestedCount,
+    variant,
+    avoidQuestionTitles: options?.avoidQuestionTitles,
+    difficulty: options?.difficulty,
+  });
+  const highSignalBuiltInCount = builtInQuizCandidate.questions.filter(
+    (q) => !q.id.startsWith("q_tf_cl_"),
+  ).length;
+  if (
+    highSignalBuiltInCount >= requestedCount &&
+    builtInQuizCandidate.questions.length >= requestedCount
+  ) {
+    if (canUseCache) {
+      setCachedAiAnalysis(cacheHash, "quiz", "meetmind-grounded-hybrid", builtInQuizCandidate);
+    }
+    return builtInQuizCandidate;
+  }
 
-  const validSegs = segments.filter((s) => s.text && s.text.trim().length > 12);
-  const pool = validSegs.length > 0 ? validSegs : segments;
+  // Tier 2: Real Embedded Local LLM Quiz Generator (for prose/conceptual transcripts lacking structured specs)
+  const localTranscript = formatCompactTranscriptForLocalLlm(segments, 1500);
+  if (localTranscript && segments.length > 0) {
+    const llmQuestionCount = Math.min(requestedCount, 2);
+    const localQuizSystem = isEnglish
+      ? "You are an exam designer for MeetMind AI. Write concise factual MCQ questions strictly from the transcript. Copy exact figures and terms from the transcript for correctAnswer."
+      : "أنت مصمم اختبارات في MeetMind AI. اكتب أسئلة اختيار من متعدد دقيقة مبنية حصراً على النص المفرغ. انسخ القيمة أو المصطلح الحقيقي من النص تماماً في حقل correctAnswer بدون أي تغيير أو اختلاق.";
 
-  const sampledIndices: number[] = [];
-  if (pool.length <= 20) {
-    for (let i = 0; i < pool.length; i++) sampledIndices.push(i);
-  } else {
-    const step = pool.length / 20;
-    for (let i = 0; i < 20; i++) {
-      const idx = Math.min(pool.length - 1, Math.floor(i * step));
-      if (!sampledIndices.includes(idx)) sampledIndices.push(idx);
+    const localQuizUser = isEnglish
+      ? `Create ${llmQuestionCount} MCQ questions strictly from "${title}":\n"""\n${localTranscript}\n"""\n\nReturn ONLY a JSON array where each object has: question (string), correctAnswer (exact short fact/value from transcript), distractors (array of 3 plausible WRONG strings distinct from correctAnswer), explanation (1 short sentence).`
+      : `أنشئ ${llmQuestionCount} أسئلة اختيار من متعدد باللغة العربية مبنية حصراً على الحقائق والأرقام في النص التالي لتسجيل «${title}»:\n"""\n${localTranscript}\n"""\n\nأخرج مصفوفة JSON فقط، كل عنصر به الحقول: question (سؤال واضح)، correctAnswer (الإجابة الصحيحة القصيرة والمطابقة تماماً للنص)، distractors (مصفوفة من 3 خيارات خاطئة ومختلفة تماماً)، explanation (جملة قصيرة).`;
+
+    const parsedLocalQuiz = await generateLocalLlmJson<unknown>({
+      systemPrompt: localQuizSystem,
+      userPrompt: localQuizUser,
+      maxNewTokens: 165,
+      timeoutMs: 30000,
+    });
+
+    const rawList = Array.isArray(parsedLocalQuiz)
+      ? parsedLocalQuiz
+      : parsedLocalQuiz &&
+          typeof parsedLocalQuiz === "object" &&
+          Array.isArray((parsedLocalQuiz as { questions?: unknown[] }).questions)
+        ? (parsedLocalQuiz as { questions: unknown[] }).questions
+        : [];
+
+    if (rawList.length > 0) {
+      const seenQuestions = new Set<string>(
+        (options?.avoidQuestionTitles || []).map((q) => normalizeArabicAndLatin(q)),
+      );
+      const transcriptNorm = normalizeText(segments.map((s) => s.text).join(" "));
+      const transcriptTokenSet = new Set(transcriptNorm.split(" ").filter(Boolean));
+
+      const isAnswerGroundedInTranscript = (ans: string): boolean => {
+        const normAns = normalizeText(ans);
+        if (!normAns) return false;
+        if (transcriptNorm.includes(normAns)) return true;
+        const toks = normAns.split(" ").filter((t) => t.length >= 2 || /\d/.test(t));
+        if (toks.length === 0) return false;
+        // Every numeric token in the correct answer MUST appear in the transcript (blocks hallucinated 800000 vs 7)
+        const numToks = toks.filter((t) => /\d/.test(t));
+        if (numToks.some((nt) => !transcriptTokenSet.has(nt) && !transcriptNorm.includes(nt))) {
+          return false;
+        }
+        const matched = toks.filter(
+          (t) => transcriptTokenSet.has(t) || (t.length >= 4 && transcriptNorm.includes(t)),
+        );
+        return matched.length / toks.length >= 0.5;
+      };
+
+      const verifiedLocal = rawList
+        .map((item, idx) => {
+          if (!item || typeof item !== "object") return null;
+          const q = item as Record<string, unknown>;
+          const rawQ = String(q.question || "").trim();
+          if (rawQ.length < 10) return null;
+          const normQ = normalizeArabicAndLatin(rawQ);
+          if (seenQuestions.has(normQ)) return null;
+          seenQuestions.add(normQ);
+
+          const qType: "multiple_choice" | "true_false" =
+            q.type === "true_false" ? "true_false" : "multiple_choice";
+
+          let qOptions: string[] = [];
+          let correctOptionIndex = 0;
+
+          if (qType === "multiple_choice") {
+            const explicitCorrect =
+              typeof q.correctAnswer === "string" ? q.correctAnswer.trim() : "";
+            const explicitDistractors = Array.isArray(q.distractors)
+              ? q.distractors.map((d: unknown) => String(d || "").trim()).filter(Boolean)
+              : [];
+
+            if (explicitCorrect && explicitDistractors.length >= 3) {
+              if (!isAnswerGroundedInTranscript(explicitCorrect)) return null;
+              const seenOptNorms = new Set<string>([normalizeArabicAndLatin(explicitCorrect)]);
+              const cleanDistractors: string[] = [];
+              for (const d of explicitDistractors) {
+                const dn = normalizeArabicAndLatin(d);
+                if (dn && !seenOptNorms.has(dn)) {
+                  seenOptNorms.add(dn);
+                  cleanDistractors.push(d);
+                }
+              }
+              if (cleanDistractors.length < 3) return null;
+              // Deterministically rotate correct option slot so correct answer isn't always index 0
+              const slot = (idx + variant) % 4;
+              const ordered = [explicitCorrect, ...cleanDistractors.slice(0, 3)];
+              const tmp = ordered[0];
+              ordered[0] = ordered[slot];
+              ordered[slot] = tmp;
+              qOptions = ordered;
+              correctOptionIndex = slot;
+            } else {
+              const rawOpts = Array.isArray(q.options)
+                ? q.options.map((o: unknown) => String(o || "").trim()).filter(Boolean)
+                : [];
+              const seenOptNorms = new Set<string>();
+              const uniqueOpts: string[] = [];
+              for (const o of rawOpts) {
+                const on = normalizeArabicAndLatin(o);
+                if (on && !seenOptNorms.has(on)) {
+                  seenOptNorms.add(on);
+                  uniqueOpts.push(o);
+                }
+              }
+              if (uniqueOpts.length < 4) return null;
+              qOptions = uniqueOpts.slice(0, 4);
+              correctOptionIndex =
+                typeof q.correctOptionIndex === "number" &&
+                Number.isInteger(q.correctOptionIndex) &&
+                q.correctOptionIndex >= 0 &&
+                q.correctOptionIndex < 4
+                  ? q.correctOptionIndex
+                  : 0;
+              // If the chosen index isn't grounded but another option IS grounded (off-by-one LLM bug), reject or fix only when unambiguous
+              if (!isAnswerGroundedInTranscript(qOptions[correctOptionIndex])) {
+                const groundedIdx = qOptions.findIndex((opt) => isAnswerGroundedInTranscript(opt));
+                if (groundedIdx === -1) return null;
+                correctOptionIndex = groundedIdx;
+              }
+            }
+          } else {
+            qOptions = isEnglish ? ["True", "False"] : ["صح (صواب)", "خطأ"];
+            correctOptionIndex = q.correctOptionIndex === 1 ? 1 : 0;
+          }
+
+          const verification = verifyQuizQuestionGrounding(
+            {
+              question: rawQ,
+              type: qType,
+              options: qOptions,
+              correctOptionIndex,
+              correctAnswerText: qOptions[correctOptionIndex],
+              explanation: typeof q.explanation === "string" ? q.explanation : undefined,
+              sourceTranscriptSegment:
+                typeof q.sourceTranscriptSegment === "string"
+                  ? q.sourceTranscriptSegment
+                  : undefined,
+            },
+            segments,
+          );
+          if (!verification.grounded) return null;
+
+          const resolvedTs =
+            (typeof q.timestampRef === "string" && q.timestampRef.trim()) ||
+            verification.matchedTimestamp ||
+            "00:00";
+          const resolvedQuote =
+            (typeof q.sourceTranscriptSegment === "string" && q.sourceTranscriptSegment.trim()) ||
+            verification.matchedSegmentText ||
+            "";
+
+          return {
+            id: `q_llm_${Date.now()}_${idx + 1}`,
+            question: rawQ,
+            type: qType,
+            options: qOptions,
+            correctOptionIndex,
+            correctAnswerText: qOptions[correctOptionIndex],
+            acceptableAnswers: [qOptions[correctOptionIndex]],
+            explanation:
+              (typeof q.explanation === "string" && q.explanation.trim()) ||
+              (isEnglish
+                ? `Verified directly in transcript at [${resolvedTs}].`
+                : `موثق مباشرةً في النص المفرغ عند [${resolvedTs}].`),
+            difficulty: (["easy", "medium", "hard"].includes(String(q.difficulty || ""))
+              ? String(q.difficulty)
+              : "medium") as "easy" | "medium" | "hard",
+            sectionRef:
+              (typeof q.sectionRef === "string" && q.sectionRef.trim()) ||
+              (isEnglish ? "Transcript Concept" : "محاور الجلسة"),
+            timestampRef: resolvedTs,
+            sourceReference: `${isEnglish ? "Transcript" : "النص المفرغ"} [${resolvedTs}]`,
+            sourceTranscriptSegment: resolvedQuote,
+            groundingVerified: true,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item));
+
+      if (verifiedLocal.length > 0) {
+        let finalQuestions: Array<{
+          id: string;
+          question: string;
+          type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
+          options: string[];
+          correctOptionIndex: number;
+          correctAnswerText?: string;
+          acceptableAnswers?: string[];
+          explanation: string;
+          difficulty: "easy" | "medium" | "hard";
+          sectionRef: string;
+          timestampRef?: string;
+          sourceReference?: string;
+          sourceTranscriptSegment?: string;
+          groundingVerified?: boolean;
+        }> = verifiedLocal.slice(0, requestedCount);
+        if (finalQuestions.length < requestedCount) {
+          const topUp = buildBuiltInQuiz(title, segments, {
+            courseCode,
+            appLanguage: isEnglish ? "en" : "ar",
+            numQuestions: requestedCount - finalQuestions.length,
+            variant,
+            avoidQuestionTitles: [
+              ...(options?.avoidQuestionTitles || []),
+              ...finalQuestions.map((q) => q.question),
+            ],
+            difficulty: options?.difficulty,
+          });
+          finalQuestions = [...finalQuestions, ...topUp.questions].slice(0, requestedCount);
+        }
+
+        const localQuizResult = {
+          title: isEnglish
+            ? `Comprehension Quiz (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`
+            : `اختبار الفهم الشامل (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`,
+          courseCode,
+          questions: finalQuestions,
+        };
+        if (canUseCache) {
+          setCachedAiAnalysis(cacheHash, "quiz", getLocalLlmModelId(), localQuizResult);
+        }
+        return localQuizResult;
+      }
     }
   }
 
-  const questions = sampledIndices.map((segIdx, qIndex) => {
-    const seg = pool[segIdx] || { text: title, startTime: 0, speaker: "Speaker" };
-    const tsStr = formatTimeStr(seg.startTime);
-    const speaker = seg.speaker || (detectedLang === "en" ? "Speaker" : "المتحدث");
-    const isMcq = qIndex % 2 === 0;
-
-    if (detectedLang === "en") {
-      if (isMcq) {
-        const otherSegs = pool.filter((_, idx) => idx !== segIdx);
-        const distractor1 = otherSegs[0]
-          ? `Discussion focused only on preliminary setup without covering: "${otherSegs[0].text.slice(0, 50)}..."`
-          : "The session concluded before discussing any substantive topics.";
-        const distractor2 = otherSegs[1]
-          ? `All participants agreed to postpone work on: "${otherSegs[1].text.slice(0, 50)}..."`
-          : "No specific outcomes or instructions were recorded.";
-        const distractor3 = "None of the recorded statements apply to this segment.";
-
-        const correctText = seg.text.length > 100 ? seg.text.slice(0, 100) + "..." : seg.text;
-        const rawOptions = [correctText, distractor1, distractor2, distractor3];
-        const correctSlot = (qIndex + variant) % 4;
-        const options = [...rawOptions];
-        const temp = options[0];
-        options[0] = options[correctSlot];
-        options[correctSlot] = temp;
-
-        return {
-          id: `q_mcq_${qIndex + 1}`,
-          question: `According to ${speaker} at [${tsStr}] in "${title}", which key point was stated?`,
-          type: "multiple_choice" as const,
-          options,
-          correctOptionIndex: correctSlot,
-          correctAnswerText: correctText,
-          acceptableAnswers: [correctText],
-          explanation: `Directly verified at [${tsStr}]: "${seg.text}".`,
-          difficulty: (qIndex % 3 === 0 ? "easy" : qIndex % 3 === 1 ? "medium" : "hard") as
-            "easy" | "medium" | "hard",
-          sectionRef: `Segment [${tsStr}]`,
-          timestampRef: tsStr,
-          sourceReference: `Segment [${tsStr}]`,
-          sourceTranscriptSegment: seg.text,
-          groundingVerified: true,
-        };
-      } else {
-        const isTrue = (qIndex + variant) % 2 === 0;
-        const statementText = seg.text.length > 90 ? seg.text.slice(0, 90) + "..." : seg.text;
-        const questionText = isTrue
-          ? `True or False: Around [${tsStr}], ${speaker} stated: "${statementText}".`
-          : `True or False: Around [${tsStr}], ${speaker} stated that all goals in "${title}" were completely cancelled.`;
-
-        return {
-          id: `q_tf_${qIndex + 1}`,
-          question: questionText,
-          type: "true_false" as const,
-          options: ["True", "False"],
-          correctOptionIndex: isTrue ? 0 : 1,
-          correctAnswerText: isTrue ? "True" : "False",
-          acceptableAnswers: [isTrue ? "True" : "False"],
-          explanation: `Verified at [${tsStr}]: "${seg.text}".`,
-          difficulty: "easy" as const,
-          sectionRef: `Segment [${tsStr}]`,
-          timestampRef: tsStr,
-          sourceReference: `Segment [${tsStr}]`,
-          sourceTranscriptSegment: seg.text,
-          groundingVerified: true,
-        };
-      }
-    } else {
-      if (isMcq) {
-        const otherSegs = pool.filter((_, idx) => idx !== segIdx);
-        const distractor1 = otherSegs[0]
-          ? `اقتصر الحديث على البدايات التمهيدية دون التطرق إلى: "${otherSegs[0].text.slice(0, 50)}..."`
-          : "تم إنهاء الجلسة قبل مناقشة أي محاور عملية أو تعليمية.";
-        const distractor2 = otherSegs[1]
-          ? `تم الاتفاق على تأجيل النظر في موضوع: "${otherSegs[1].text.slice(0, 50)}..."`
-          : "لم يتم تسجيل أي توجيهات أو قرارات محددة في هذا الجزء.";
-        const distractor3 = "جميع ما ذُكر غير مطابق لما ورد في نص التسجيل المفرغ.";
-
-        const correctText = seg.text.length > 100 ? seg.text.slice(0, 100) + "..." : seg.text;
-        const rawOptions = [correctText, distractor1, distractor2, distractor3];
-        const correctSlot = (qIndex + variant) % 4;
-        const options = [...rawOptions];
-        const temp = options[0];
-        options[0] = options[correctSlot];
-        options[correctSlot] = temp;
-
-        return {
-          id: `q_mcq_${qIndex + 1}`,
-          question: `وفقاً لما أوضحه ${speaker} عند التوقيت [${tsStr}] في تسجيل "${title}"، ما هو الطرح الصحيح؟`,
-          type: "multiple_choice" as const,
-          options,
-          correctOptionIndex: correctSlot,
-          correctAnswerText: correctText,
-          acceptableAnswers: [correctText],
-          explanation: `موثق صراحة عند التوقيت [${tsStr}]: "${seg.text}".`,
-          difficulty: (qIndex % 3 === 0 ? "easy" : qIndex % 3 === 1 ? "medium" : "hard") as
-            "easy" | "medium" | "hard",
-          sectionRef: `المقطع [${tsStr}]`,
-          timestampRef: tsStr,
-          sourceReference: `المقطع [${tsStr}]`,
-          sourceTranscriptSegment: seg.text,
-          groundingVerified: true,
-        };
-      } else {
-        const isTrue = (qIndex + variant) % 2 === 0;
-        const statementText = seg.text.length > 90 ? seg.text.slice(0, 90) + "..." : seg.text;
-        const questionText = isTrue
-          ? `صح أم خطأ: في التوقيت [${tsStr}]، ذكر ${speaker} ما نصه: "${statementText}".`
-          : `صح أم خطأ: في التوقيت [${tsStr}]، أعلن ${speaker} إلغاء وتجاهل جميع محاور ومخرجات "${title}".`;
-
-        return {
-          id: `q_tf_${qIndex + 1}`,
-          question: questionText,
-          type: "true_false" as const,
-          options: ["صح (صواب)", "خطأ"],
-          correctOptionIndex: isTrue ? 0 : 1,
-          correctAnswerText: isTrue ? "صح (صواب)" : "خطأ",
-          acceptableAnswers: [isTrue ? "صح (صواب)" : "خطأ"],
-          explanation: `موثق صراحة عند التوقيت [${tsStr}]: "${seg.text}".`,
-          difficulty: "easy" as const,
-          sectionRef: `المقطع [${tsStr}]`,
-          timestampRef: tsStr,
-          sourceReference: `المقطع [${tsStr}]`,
-          sourceTranscriptSegment: seg.text,
-          groundingVerified: true,
-        };
-      }
-    }
-  });
-
-  return {
-    title:
-      detectedLang === "en"
-        ? `Comprehensive Assessment Quiz (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`
-        : `اختبار الفهم الشامل والتقييم (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`,
+  // Tier 3: Upgraded Grounded Concept & Specification Quiz Engine (no cache poison)
+  return buildBuiltInQuiz(title, segments, {
     courseCode,
-    questions,
-  };
+    appLanguage: isEnglish ? "en" : "ar",
+    numQuestions: requestedCount,
+    variant,
+    avoidQuestionTitles: options?.avoidQuestionTitles,
+    difficulty: options?.difficulty,
+  });
 }
 
 // Generate Detailed Lecture/Meeting Analysis in Arabic
@@ -1586,6 +1878,7 @@ export async function generateAiLectureAnalysis(
   courseCode?: string,
   appLanguage?: "en" | "ar",
 ): Promise<{
+  overview: string;
   topics: string[];
   keywords: string[];
   definitions: Array<{ term: string; definition: string; timestamp?: string }>;
@@ -1607,6 +1900,7 @@ export async function generateAiLectureAnalysis(
     `${type}:${courseCode || ""}:${appLanguage || ""}`,
   );
   const cached = getCachedAiAnalysis<{
+    overview: string;
     topics: string[];
     keywords: string[];
     definitions: Array<{ term: string; definition: string; timestamp?: string }>;
@@ -1685,11 +1979,28 @@ ${preparedTranscript}
             },
           });
         },
-        { primaryModel: config.textModel, fallbackModel: config.fallbackTextModel },
+        {
+          primaryModel: config.textModel,
+          fallbackModel: config.fallbackTextModel,
+          maxRetries: 0,
+          baseDelayMs: 100,
+          maxDelayMs: 150,
+        },
       );
 
       const parsed = JSON.parse(response.text || "{}");
+      const refOverview = buildBuiltInSummary(
+        title,
+        segments,
+        type,
+        courseCode,
+        appLanguage,
+      ).executiveSummary;
       const finalResult = {
+        overview:
+          typeof parsed.overview === "string" && parsed.overview.trim().length >= 12
+            ? parsed.overview.trim()
+            : refOverview,
         topics: parsed.topics || [title],
         keywords: parsed.keywords || [],
         definitions: parsed.definitions || [],
@@ -1702,23 +2013,29 @@ ${preparedTranscript}
       setCachedAiAnalysis(cacheHash, "deep_analysis", config.textModel, finalResult);
       return finalResult;
     } catch (e) {
+      suspendGeminiIfUnavailableError(e);
       logGeminiStructured({
         level: "warn",
-        event: "gemini_lecture_analysis_failed",
+        event: "gemini_lecture_analysis_fallback_builtin",
         operation: "generateAiLectureAnalysis",
         model: getGeminiConfig().textModel,
         status: extractHttpStatus(e),
         finalFailureReason: e instanceof Error ? e.message : String(e),
       });
-      throw e;
     }
   }
 
-  throw new GeminiPipelineError("GEMINI_API_KEY is not configured for AI lecture analysis.", {
-    model: getGeminiConfig().textModel,
-    retryable: false,
-    operation: "generateAiLectureAnalysis",
-  });
+  // Hybrid Fast-Path: sub-second structured analytical engine (accurate timestamps, rich overview,
+  // definitions, keywords, entities, highlights, and review areas with zero hallucination).
+  const builtInAnalysis = buildBuiltInLectureAnalysis(
+    title,
+    segments,
+    type,
+    courseCode,
+    appLanguage,
+  );
+  setCachedAiAnalysis(cacheHash, "deep_analysis", "meetmind-analytical-hybrid", builtInAnalysis);
+  return builtInAnalysis;
 }
 
 export function generateAnalysisFromTranscript(
@@ -1776,87 +2093,13 @@ export function answerGroundedQuestion(
   evidenceFound: boolean;
   citations: { speaker: string; timestamp: string; quote: string }[];
 } {
-  const stopWords = new Set([
-    "the",
-    "and",
-    "for",
-    "are",
-    "but",
-    "not",
-    "you",
-    "all",
-    "can",
-    "her",
-    "was",
-    "one",
-    "our",
-    "out",
-    "has",
-    "had",
-    "how",
-    "why",
-    "who",
-    "its",
-    "with",
-    "that",
-    "this",
-    "from",
-    "they",
-    "will",
-    "have",
-    "been",
-    "were",
-    "said",
-    "what",
-    "when",
-    "where",
-    "which",
-    "about",
-    "does",
-    "did",
-    "في",
-    "من",
-    "إلى",
-    "على",
-    "هذا",
-    "هذه",
-    "ذلك",
-    "التي",
-    "الذي",
-    "مع",
-    "كان",
-    "ليس",
-    "ماذا",
-    "كيف",
-    "متى",
-    "أين",
-    "هل",
-    "عن",
-  ]);
-  const queryLower = question.toLowerCase();
-  const queryWords = queryLower
-    .split(/[\s؟?!.,،:;()"']+/)
-    .map((w) => w.trim())
-    .filter((w) => w.length > 2 && !stopWords.has(w));
+  const topMatches = retrieveRelevantSegmentsBM25(
+    question,
+    segments.map((seg) => ({ seg })),
+    { topK: 3, minScore: 0.4 },
+  );
 
-  const scoredSegments = segments
-    .map((seg) => {
-      let score = 0;
-      const textLower = seg.text.toLowerCase();
-      const textTokens = new Set(textLower.split(/[\s؟?!.,،:;()"']+/).filter(Boolean));
-      for (const word of queryWords) {
-        if (textTokens.has(word)) {
-          score += 3;
-        } else if (word.length >= 4 && textLower.includes(word)) {
-          score += 1;
-        }
-      }
-      return { seg, score };
-    })
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score);
-
-  if (scoredSegments.length === 0) {
+  if (topMatches.length === 0) {
     return {
       answer: "Not mentioned in this recording.",
       evidenceFound: false,
@@ -1864,17 +2107,11 @@ export function answerGroundedQuestion(
     };
   }
 
-  const topMatches = scoredSegments.slice(0, 3);
-  const citations = topMatches.map((m) => {
-    const mins = Math.floor(m.seg.startTime / 60);
-    const secs = Math.floor(m.seg.startTime % 60);
-    const timeFormatted = `${mins}:${secs < 10 ? "0" : ""}${secs}`;
-    return {
-      speaker: m.seg.speaker,
-      timestamp: timeFormatted,
-      quote: m.seg.text,
-    };
-  });
+  const citations = topMatches.map((m) => ({
+    speaker: m.seg.speaker,
+    timestamp: formatMmSs(m.seg.startTime),
+    quote: m.seg.text,
+  }));
 
   const quotesText = topMatches.map((m) => `"${m.seg.text}"`).join(" | ");
 
@@ -1969,6 +2206,29 @@ export async function askMeetMindAI({
         forbidden: true,
       };
     }
+  }
+
+  // Mandatory AI Identity fast-path (<5ms, consistent across Arabic & English, never bypassed)
+  const identityHit = tryAnswerIdentityQuery(question, appLanguage);
+  if (identityHit) {
+    const identityRes = {
+      answer: identityHit.answer,
+      evidenceFound: true,
+      citations: [],
+      suggestedFollowUps: identityHit.isAr
+        ? [
+            "لخص لي آخر تسجيل أو محاضرة",
+            "اشرح لي الفرق بين TCP و UDP باختصار",
+            "اعمل لي 5 أسئلة اختبار مع الإجابات",
+          ]
+        : [
+            "Summarize my latest recording or lecture",
+            "Explain how RAG works in 3 bullet points",
+            "Create 5 quiz questions with answers",
+          ],
+    };
+    persistChatTurn(identityRes);
+    return identityRes;
   }
 
   const targetMeeting = resourceId ? meetings.find((m) => m.id === resourceId) : undefined;
@@ -2151,14 +2411,18 @@ export async function askMeetMindAI({
   if (ai) {
     try {
       const hasWorkspaceContext = contextDetails.trim().length > 0;
+      const identityRule =
+        'Mandatory Identity Rule: You are MeetMind AI, programmed by a team of Software Engineers from the Computer Science Department at Modern Academy. In Arabic ALWAYS say "مبرمجني مجموعة من مهندسين برمجة قسم علوم حاسب مودرن أكاديمي". NEVER claim Google, Gemma, Gemini, or OpenAI created or trained you.';
       const systemInstruction = targetItem
         ? `You are MeetMind AI, a helpful intelligent assistant for meetings, lectures, and learning.
+${identityRule}
 The user currently has a specific recording selected: "${targetItem.title}".
 Rules:
 1. If the user asks what was said, decided, assigned, or covered in this recording, answer accurately using ONLY the provided transcript and extracted records, citing speaker names and timestamps [MM:SS]. If that specific detail was NOT mentioned in the recording, state clearly: "Not mentioned in this recording." (or in Arabic: "غير مذكور في هذا التسجيل.").
 2. If the user asks a general, conceptual, academic, coding, or study question (e.g., explaining a concept, giving examples, solving a problem, writing code, or preparing for an exam), answer it thoroughly and helpfully in the user's language (Arabic, Egyptian Arabic, or English).
 3. Never fabricate quotes or claim something was spoken in the recording if it is not in the transcript.`
         : `You are MeetMind AI, a super-intelligent, helpful AI assistant capable of answering ANY question across all subjects (science, programming, math, engineering, languages, study tips, exam prep, writing, everyday questions, and more), in addition to analyzing the user's uploaded meetings and lectures.
+${identityRule}
 Rules:
 1. Answer ANY question the user asks clearly, accurately, and naturally in the same language/dialect they used (Standard Arabic, Egyptian Arabic, English, etc.).
 2. If the user asks about their meetings, lectures, recordings, summaries, tasks, quizzes, or flashcards, ground your answer strictly in the provided workspace context below and cite speaker names and timestamps [MM:SS]. Never invent recording content.
@@ -2196,7 +2460,13 @@ Rules:
             },
           });
         },
-        { primaryModel: config.textModel, fallbackModel: config.fallbackTextModel },
+        {
+          primaryModel: config.textModel,
+          fallbackModel: config.fallbackTextModel,
+          maxRetries: 0,
+          baseDelayMs: 100,
+          maxDelayMs: 150,
+        },
       );
 
       const replyText = (response.text || "").trim();
@@ -2236,75 +2506,296 @@ Rules:
         return finalAnswer;
       }
     } catch (err) {
+      suspendGeminiIfUnavailableError(err);
       const errMsg = err instanceof Error ? err.message : String(err);
       const errStatus = extractHttpStatus(err);
       logGeminiStructured({
         level: "warn",
-        event: "gemini_query_error",
+        event: "gemini_query_fallback_builtin",
         operation: "askMeetMindAI",
         model: getGeminiConfig().textModel,
         status: errStatus,
         finalFailureReason: errMsg,
       });
-
-      if (errStatus === 503 || isRetryableGeminiError(err)) {
-        const busyAnswer = {
-          answer: isArabicQuestion
-            ? "خوادم الذكاء الاصطناعي تشهد ضغطاً مؤقتاً حالياً (HTTP 503 UNAVAILABLE). يمكنك طرح السؤال مرة أخرى بعد قليل."
-            : "The AI service is experiencing temporary high demand (HTTP 503 UNAVAILABLE). Please ask your question again in a moment.",
-          evidenceFound: false,
-          citations: [],
-        };
-        persistChatTurn(busyAnswer);
-        return busyAnswer;
-      }
-
-      if (
-        !targetItem &&
-        /API_KEY_INVALID|API key not valid|PERMISSION_DENIED|403|401/i.test(errMsg)
-      ) {
-        const cfgAnswer = {
-          answer: isArabicQuestion
-            ? "تعذر الاتصال بمحرك الذكاء الاصطناعي لأن مفتاح GEMINI_API_KEY غير مضبوط أو غير صالح. يرجى التأكد من تفعيل مفتاح Gemini API الصحيح من لوحة Settings > Secrets."
-            : "Unable to reach the AI engine because GEMINI_API_KEY is missing or invalid. Please check your Gemini API key in Settings > Secrets.",
-          evidenceFound: false,
-          citations: [],
-        };
-        persistChatTurn(cfgAnswer);
-        return cfgAnswer;
-      }
     }
   }
 
-  // Deterministic grounded transcript search when querying a recording or when offline/key unconfigured
-  if (targetItem) {
-    const res = answerGroundedQuestion(question, targetSegments, targetItem.title);
-    persistChatTurn(res);
-    return res;
+  // Tier 2: Real Embedded Local LLM with BM25 RAG (Arabic + Egyptian Arabic + English)
+  const questionIsAr = detectIsArabic(question, appLanguage);
+  const directMath = trySolveMathQuery(question, questionIsAr);
+  if (directMath) {
+    const mathRes = {
+      answer: directMath,
+      evidenceFound: true,
+      citations: [],
+      suggestedFollowUps: questionIsAr
+        ? ["احسب 25% من 840", "اشرح لي الفرق بين TCP و UDP باختصار", "لخص لي آخر تسجيل"]
+        : [
+            "Calculate 25% of 840",
+            "Explain how RAG works in 3 bullet points",
+            "Summarize my latest recording",
+          ],
+    };
+    persistChatTurn(mathRes);
+    return mathRes;
   }
 
-  const allActive = [...(latestLecture?.segments || []), ...(latestMeeting?.segments || [])];
-  if (allActive.length > 0) {
-    const res = answerGroundedQuestion(
+  // Build crisp BM25-retrieved transcript evidence ONLY when relevant to the question or scoped recording
+  const workspaceIntent =
+    /(التسجيل|تسجيلات|المحاضر[ةه]|محاضرات|الاجتماع|اجتماعات|ملخص|لخص|المهام|تكليف|قرارات|التفريغ|my recording|this recording|the recording|transcript|my lecture|this lecture|my meeting|this meeting|summarize my|action items|what did .* say)/i.test(
       question,
-      allActive,
-      latestLecture?.title || latestMeeting?.title || "Recordings",
     );
-    if (res.evidenceFound) {
-      persistChatTurn(res);
-      return res;
+
+  const bm25Pool: Array<{ seg: TranscriptSegment; title: string }> = [];
+  if (targetItem) {
+    for (const seg of targetSegments) bm25Pool.push({ seg, title: targetItem.title });
+  } else {
+    for (const l of lectures.slice(0, 5)) {
+      for (const seg of l.segments || []) bm25Pool.push({ seg, title: l.title });
+    }
+    for (const m of meetings.slice(0, 5)) {
+      for (const seg of m.segments || []) bm25Pool.push({ seg, title: m.title });
     }
   }
 
-  const unconfiguredMsg = {
-    answer: isArabicQuestion
-      ? "محرك الذكاء الاصطناعي للإجابة على الأسئلة العامة يحتاج إلى مفتاح GEMINI_API_KEY صالح في لوحة Settings > Secrets. بمجرد تفعيل المفتاح، سأتمكن من الإجابة على أي سؤال تطرحه في أي مجال بالإضافة لتحليل تسجيلاتك."
-      : "The general AI assistant requires a valid GEMINI_API_KEY configured in Settings > Secrets. Once configured, I can answer any question across any topic as well as analyze your recordings.",
-    evidenceFound: false,
-    citations: [],
-  };
-  persistChatTurn(unconfiguredMsg);
-  return unconfiguredMsg;
+  // Require high-confidence domain-token coverage for unscoped workspace search so general questions stay clean
+  const rawBm25Matches =
+    bm25Pool.length > 0
+      ? retrieveRelevantSegmentsBM25(question, bm25Pool, {
+          topK: targetItem ? 6 : 4,
+          minScore: targetItem ? 0.35 : workspaceIntent ? 1.5 : 3.5,
+        })
+      : [];
+
+  const framingStopWords = new Set([
+    "الفرق",
+    "فرق",
+    "باختصار",
+    "مختصر",
+    "اشرح",
+    "اشرحلي",
+    "شرح",
+    "قارن",
+    "مقارنه",
+    "مثال",
+    "امثله",
+    "نقاط",
+    "نقطه",
+    "ببساطه",
+    "وضوح",
+    "توضيح",
+    "ماهو",
+    "ماهي",
+    "كيف",
+    "يعمل",
+    "تعمل",
+    "بين",
+    "عن",
+    "علي",
+    "الي",
+    "difference",
+    "compare",
+    "comparison",
+    "brief",
+    "briefly",
+    "short",
+    "points",
+    "bullet",
+    "bullets",
+    "explain",
+    "works",
+    "work",
+    "example",
+    "examples",
+    "simply",
+    "simple",
+    "summary",
+    "summarize",
+  ]);
+  const stripArAl = (w: string) => (w.startsWith("ال") && w.length >= 5 ? w.slice(2) : w);
+  const contentTokens = normalizeText(question)
+    .split(" ")
+    .filter((w) => (w.length >= 3 || /\d/.test(w)) && !framingStopWords.has(w))
+    .map(stripArAl);
+
+  const bm25Matches = targetItem
+    ? rawBm25Matches
+    : rawBm25Matches.filter((m) => {
+        if (workspaceIntent) return true;
+        if (contentTokens.length === 0) return false;
+        const segNorm = normalizeText(`${m.title} ${m.seg.text}`);
+        const segWordSet = new Set(segNorm.split(" ").filter(Boolean).map(stripArAl));
+        const matchedCount = contentTokens.filter(
+          (t) => segWordSet.has(t) || (t.length >= 4 && segNorm.includes(t)),
+        ).length;
+        const requiredMatches =
+          contentTokens.length <= 2
+            ? contentTokens.length
+            : Math.min(3, Math.max(2, Math.ceil(contentTokens.length * 0.45)));
+        return matchedCount >= requiredMatches;
+      });
+
+  let localRagBlock = "";
+  let ragCitations: { speaker: string; timestamp: string; quote: string }[] = [];
+
+  if (targetItem && targetSegments.length > 0) {
+    const totalTargetChars = targetSegments.reduce((acc, s) => acc + (s.text?.length || 0) + 22, 0);
+    let pickedForTarget: TranscriptSegment[];
+
+    if (targetSegments.length <= 14 || totalTargetChars <= 2500) {
+      // Compact scoped recording: pass ALL chronological segments so multi-segment facts never split apart
+      pickedForTarget = targetSegments;
+    } else if (bm25Matches.length > 0) {
+      // Long scoped recording: expand each BM25 hit with +-1 chronological neighbors
+      const idToIndex = new Map<string, number>();
+      targetSegments.forEach((s, i) => idToIndex.set(s.id, i));
+      const expanded = new Set<number>();
+      for (const m of bm25Matches) {
+        const idx = idToIndex.get(m.seg.id);
+        if (typeof idx === "number") {
+          if (idx > 0) expanded.add(idx - 1);
+          expanded.add(idx);
+          if (idx + 1 < targetSegments.length) expanded.add(idx + 1);
+        }
+      }
+      pickedForTarget = Array.from(expanded)
+        .sort((a, b) => a - b)
+        .map((i) => targetSegments[i]);
+    } else {
+      pickedForTarget = selectHighSignalSegments(targetSegments, 2200);
+    }
+
+    ragCitations = (
+      bm25Matches.length >= 2
+        ? bm25Matches.slice(0, 3)
+        : pickedForTarget.slice(0, 3).map((seg) => ({ seg }))
+    ).map((entry) => ({
+      speaker: entry.seg.speaker,
+      timestamp: formatMmSs(entry.seg.startTime),
+      quote: entry.seg.text,
+    }));
+
+    const structuredHints =
+      targetSegments.length <= 14 || totalTargetChars <= 2500
+        ? buildBuiltInSummary(
+            targetItem.title,
+            targetSegments,
+            "courseCode" in targetItem ? "lecture" : "meeting",
+            "courseCode" in targetItem ? targetItem.courseCode : undefined,
+            questionIsAr ? "ar" : "en",
+          ).keyPoints.slice(0, 9)
+        : [];
+
+    const chronologicalText = pickedForTarget
+      .map((s) => `[${formatMmSs(s.startTime)}] ${s.speaker}: ${s.text.trim()}`)
+      .join("\n")
+      .slice(0, 2100);
+    const factsHeader =
+      structuredHints.length > 0
+        ? `[Verified Extracted Facts]\n${structuredHints
+            .map((pt) => `- ${pt.replace(/\s*\[\d{2}:\d{2}\]\s*$/, "").trim()}`)
+            .join("\n")}\n\n`
+        : "";
+    localRagBlock =
+      `[Recording: "${targetItem.title}"]\n${factsHeader}[Transcript]\n${chronologicalText}`.slice(
+        0,
+        2800,
+      );
+  } else if (bm25Matches.length > 0 || (workspaceIntent && bm25Pool.length > 0)) {
+    const chosenHits =
+      bm25Matches.length > 0
+        ? bm25Matches
+        : selectHighSignalSegments((latestLecture || latestMeeting)?.segments || [], 1600).map(
+            (seg) => ({
+              seg,
+              title: (latestLecture || latestMeeting)?.title || "Recording",
+              score: 1,
+            }),
+          );
+
+    ragCitations = chosenHits.slice(0, 3).map((m) => ({
+      speaker: m.seg.speaker,
+      timestamp: formatMmSs(m.seg.startTime),
+      quote: m.seg.text,
+    }));
+    localRagBlock = chosenHits
+      .map(
+        (m) =>
+          `[${m.title} | ${formatMmSs(m.seg.startTime)}] ${m.seg.speaker}: ${m.seg.text.trim()}`,
+      )
+      .join("\n")
+      .slice(0, 1900);
+  }
+
+  const localHistoryBlock = history
+    .slice(-4)
+    .filter((h) => h.text && h.text.trim())
+    .map((h) => `${h.role === "user" ? "User" : "Assistant"}: ${h.text.trim().slice(0, 220)}`)
+    .join("\n");
+
+  const localSystemPrompt = localRagBlock
+    ? questionIsAr
+      ? `أنت مساعد MeetMind AI الذكي. أجب مباشرة وبإيجاز بالعربية الفصحى الواضحة دون مقدمات مطولة أو أسئلة ختامية. اعتمد أولاً على قسم [Verified Extracted Facts] ثم [Transcript] المرفق؛ انقل كل حقل بقيمته الدقيقة كما هي (المنطقة/الموقع، المساحة بالمتر، الميزانية/السعر بالجنيه، عدد الغرف، عدد الحمامات، الإطلالة، والتشطيب) ولا تخلط رقم الهاتف مع المساحة ولا تبدّل بين الحقول إطلاقاً.`
+      : `You are MeetMind AI. Answer directly and concisely without filler intros or closing questions. Rely first on [Verified Extracted Facts] and then [Transcript]; copy each field's exact value (location/zone, area in meters, budget/price, room/bath counts, view, finishing) and never mix phone digits with area or swap fields.`
+    : questionIsAr
+      ? `أنت مساعد MeetMind AI الذكي. أجب مباشرة وبإيجاز باللغة العربية الفصحى السليمة وبمعلومات علمية وتقنية دقيقة ومنظمة في نقاط عند الحاجة، بدون مقدمات مطولة أو أسئلة ختامية.`
+      : `You are MeetMind AI, an accurate and concise technical assistant. Answer directly in clear English using structured markdown bullets when helpful, without filler intros or closing follow-up questions.`;
+
+  const localUserParts: string[] = [];
+  if (localRagBlock) {
+    localUserParts.push(`Transcript Context:\n"""\n${localRagBlock}\n"""`);
+  }
+  if (localHistoryBlock) {
+    localUserParts.push(`Recent Conversation:\n${localHistoryBlock}`);
+  }
+  localUserParts.push(localRagBlock || localHistoryBlock ? `Question: ${question}` : question);
+
+  const localReply = await generateLocalLlmText({
+    systemPrompt: localSystemPrompt,
+    userPrompt: localUserParts.join("\n\n"),
+    maxNewTokens: 265,
+    temperature: 0,
+    timeoutMs: 40000,
+  });
+
+  if (localReply && localReply.length >= 4) {
+    const notMentioned =
+      Boolean(targetItem) &&
+      /(not mentioned in this recording|غير مذكور في هذا التسجيل)/i.test(localReply);
+
+    const localChatResult = {
+      answer: localReply,
+      evidenceFound: !notMentioned && (ragCitations.length > 0 || !targetItem),
+      citations: notMentioned ? [] : ragCitations,
+      suggestedFollowUps: questionIsAr
+        ? [
+            "اشرح هذه النقطة بمثال عملي",
+            "لخص الإجابة في 3 نقاط سريعة",
+            "اعمل لي أسئلة اختبار على الموضوع ده",
+          ]
+        : [
+            "Explain this with a practical example",
+            "Summarize this into 3 quick bullets",
+            "Create practice quiz questions on this topic",
+          ],
+    };
+    persistChatTurn(localChatResult);
+    return localChatResult;
+  }
+
+  // Tier 3: Always-On Built-In Bilingual Analytical Assistant Fallback
+  const builtInAnswer = answerBuiltInChat({
+    question,
+    appLanguage,
+    targetItem,
+    meetings,
+    lectures,
+    tasks,
+    quizzes,
+    flashcards,
+  });
+  persistChatTurn(builtInAnswer);
+  return builtInAnswer;
 }
 
 // Generate Spaced Repetition Flashcards Grounded in Transcript
@@ -2421,7 +2912,13 @@ ${summaryText || ""}
             },
           });
         },
-        { primaryModel: config.textModel, fallbackModel: config.fallbackTextModel },
+        {
+          primaryModel: config.textModel,
+          fallbackModel: config.fallbackTextModel,
+          maxRetries: 0,
+          baseDelayMs: 100,
+          maxDelayMs: 150,
+        },
       );
 
       const parsed = JSON.parse(response.text || "[]");
@@ -2444,23 +2941,24 @@ ${summaryText || ""}
       }
       return [];
     } catch (err) {
+      suspendGeminiIfUnavailableError(err);
       logGeminiStructured({
         level: "warn",
-        event: "gemini_flashcards_failed",
+        event: "gemini_flashcards_fallback_builtin",
         operation: "generateAiFlashcards",
         model: getGeminiConfig().textModel,
         status: extractHttpStatus(err),
         finalFailureReason: err instanceof Error ? err.message : String(err),
       });
-      throw err;
     }
   }
 
-  throw new GeminiPipelineError("GEMINI_API_KEY is not configured for flashcards generation.", {
-    model: getGeminiConfig().textModel,
-    retryable: false,
-    operation: "generateAiFlashcards",
-  });
+  // Hybrid Fast-Path: sub-second grounded concept flashcards engine (definitions, specs, key clauses)
+  const builtInCards = buildBuiltInFlashcards(title, segments, courseCode, appLanguage);
+  if (builtInCards.length > 0) {
+    setCachedAiAnalysis(cacheHash, "flashcards", "meetmind-analytical-hybrid", builtInCards);
+  }
+  return builtInCards;
 }
 
 // Generate Hierarchical Knowledge Graph (Mind Map) Grounded in Transcript
@@ -2542,14 +3040,24 @@ ${summaryText || ""}
             },
           });
         },
-        { primaryModel: config.textModel, fallbackModel: config.fallbackTextModel },
+        {
+          primaryModel: config.textModel,
+          fallbackModel: config.fallbackTextModel,
+          maxRetries: 0,
+          baseDelayMs: 100,
+          maxDelayMs: 150,
+        },
       );
 
       const parsed = JSON.parse(response.text || "{}");
-      if (parsed.label && Array.isArray(parsed.children) && parsed.children.length > 0) {
-        const finalResult = parsed as MindMapNode;
-        setCachedAiAnalysis(cacheHash, "mindmap", config.textModel, finalResult);
-        return finalResult;
+      const normalizedCloud = normalizeMindMapTree(parsed, title);
+      if (
+        normalizedCloud &&
+        Array.isArray(normalizedCloud.children) &&
+        normalizedCloud.children.length > 0
+      ) {
+        setCachedAiAnalysis(cacheHash, "mindmap", config.textModel, normalizedCloud);
+        return normalizedCloud;
       }
       throw new GeminiPipelineError("AI mind map did not return a valid tree structure.", {
         model: config.textModel,
@@ -2557,21 +3065,20 @@ ${summaryText || ""}
         operation: "generateAiMindMap",
       });
     } catch (err) {
+      suspendGeminiIfUnavailableError(err);
       logGeminiStructured({
         level: "warn",
-        event: "gemini_mind_map_failed",
+        event: "gemini_mind_map_fallback_builtin",
         operation: "generateAiMindMap",
         model: getGeminiConfig().textModel,
         status: extractHttpStatus(err),
         finalFailureReason: err instanceof Error ? err.message : String(err),
       });
-      throw err;
     }
   }
 
-  throw new GeminiPipelineError("GEMINI_API_KEY is not configured for mind map generation.", {
-    model: getGeminiConfig().textModel,
-    retryable: false,
-    operation: "generateAiMindMap",
-  });
+  // Hybrid Fast-Path: sub-second hierarchical mind map engine grounded in extracted facts & themes
+  const builtInMap = buildBuiltInMindMap(title, segments, courseCode, appLanguage);
+  setCachedAiAnalysis(cacheHash, "mindmap", "meetmind-analytical-hybrid", builtInMap);
+  return builtInMap;
 }

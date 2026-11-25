@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { useState, useEffect, useMemo } from "react";
+import { useRouterState } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Layers,
@@ -26,9 +26,24 @@ export default function FlashcardsView() {
   const queryClient = useQueryClient();
   const { t, language } = useTranslation();
   const isArabic = language.toUpperCase() === "AR";
-  const [selectedDeckId, setSelectedDeckId] = useState<string>("ALL");
+  const locationSearchStr = useRouterState({ select: (r) => r.location.searchStr });
+  const urlResourceId = useMemo(() => {
+    const params = new URLSearchParams(locationSearchStr || "");
+    return (params.get("lectureId") || params.get("id") || "").trim();
+  }, [locationSearchStr]);
+  const [selectedDeckId, setSelectedDeckId] = useState<string>(() =>
+    urlResourceId ? `deck_${urlResourceId}` : "ALL",
+  );
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
+
+  useEffect(() => {
+    if (urlResourceId) {
+      setSelectedDeckId(`deck_${urlResourceId}`);
+      setCurrentIndex(0);
+      setIsFlipped(false);
+    }
+  }, [urlResourceId]);
 
   const { data: flashcards = [], isLoading } = useQuery<Flashcard[]>({
     queryKey: ["flashcards"],
@@ -114,7 +129,10 @@ export default function FlashcardsView() {
           <div className="flex items-center gap-2">
             <Button
               onClick={() => {
-                const targetLec = lectures[0]?.id;
+                const targetLec =
+                  selectedDeckId !== "ALL"
+                    ? selectedDeckId.replace(/^deck_/, "")
+                    : urlResourceId || lectures[0]?.id;
                 generateMutation.mutate(targetLec);
               }}
               disabled={generateMutation.isPending}

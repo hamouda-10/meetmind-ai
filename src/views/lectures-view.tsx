@@ -66,7 +66,7 @@ export default function LecturesView() {
   const [currentPage, setCurrentPage] = useState(1);
 
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
-  const [selectedLecture, setSelectedLecture] = useState<Lecture | null>(null);
+  const [selectedLectureId, setSelectedLectureId] = useState<string | null>(null);
   const [lectureToDelete, setLectureToDelete] = useState<Lecture | null>(null);
   const [deleteAllDialogOpen, setDeleteAllDialogOpen] = useState(false);
 
@@ -74,6 +74,11 @@ export default function LecturesView() {
     queryKey: ["lectures"],
     queryFn: () => api.getLectures(),
   });
+
+  const selectedLecture = useMemo(
+    () => (selectedLectureId ? (lectures.find((l) => l.id === selectedLectureId) ?? null) : null),
+    [lectures, selectedLectureId],
+  );
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.deleteLecture(id),
@@ -139,10 +144,16 @@ export default function LecturesView() {
       return matchesSearch && matchesCourse;
     });
 
+    const getSortTs = (l: Lecture) => {
+      const idMatch = l.id.match(/_(\d{10,})/);
+      if (idMatch) return Number(idMatch[1]);
+      return new Date(l.date).getTime() || 0;
+    };
+
     result = [...result].sort((a, b) => {
       if (sortBy === "duration") return (b.durationSeconds || 0) - (a.durationSeconds || 0);
-      if (sortBy === "oldest") return new Date(a.date).getTime() - new Date(b.date).getTime();
-      return new Date(b.date).getTime() - new Date(a.date).getTime();
+      if (sortBy === "oldest") return getSortTs(a) - getSortTs(b);
+      return getSortTs(b) - getSortTs(a);
     });
 
     return result;
@@ -295,9 +306,13 @@ export default function LecturesView() {
                     )}
                   </div>
 
-                  <h3 className="mt-3 font-display text-base font-semibold tracking-tight text-foreground line-clamp-2">
+                  <Link
+                    to="/transcript"
+                    search={{ id: l.id }}
+                    className="mt-3 block font-display text-base font-semibold tracking-tight text-foreground line-clamp-2 hover:text-primary transition-colors"
+                  >
                     {l.title}
-                  </h3>
+                  </Link>
 
                   <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                     <span>{l.instructorName || "المحاضر"}</span>
@@ -336,28 +351,31 @@ export default function LecturesView() {
                       size="sm"
                       variant="outline"
                       className="flex-1 text-xs cursor-pointer"
-                      onClick={() => setSelectedLecture(l)}
+                      onClick={() => setSelectedLectureId(l.id)}
                     >
-                      <BookOpen className="h-3.5 w-3.5 ml-1" /> ملاحظات المذاكرة
+                      <BookOpen className="h-3.5 w-3.5 ml-1" />{" "}
+                      {isArabic ? "ملاحظات المذاكرة" : "Study Notes"}
                     </Button>
-                    <Link to="/quiz" className="flex-1">
+                    <Link to="/quiz" search={{ lectureId: l.id }} className="flex-1">
                       <Button
                         size="sm"
                         variant="secondary"
                         className="w-full text-xs cursor-pointer"
                       >
-                        <BrainCircuit className="h-3.5 w-3.5 ml-1" /> الاختبار
+                        <BrainCircuit className="h-3.5 w-3.5 ml-1" />{" "}
+                        {isArabic ? "الاختبار" : "Quiz"}
                       </Button>
                     </Link>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Link to="/transcript" className="flex-1">
+                    <Link to="/transcript" search={{ id: l.id }} className="flex-1">
                       <Button
                         size="sm"
                         variant="ghost"
                         className="w-full justify-start text-xs text-muted-foreground hover:text-foreground cursor-pointer"
                       >
-                        <Layers className="h-3.5 w-3.5 ml-1" /> عرض التفريغ الكامل
+                        <Layers className="h-3.5 w-3.5 ml-1" />{" "}
+                        {isArabic ? "عرض التفريغ الكامل والتحليل" : "Full Transcript & Analysis"}
                       </Button>
                     </Link>
                     <Button
@@ -410,7 +428,7 @@ export default function LecturesView() {
       )}
 
       {/* Lecture Study Notes Dialog */}
-      <Dialog open={!!selectedLecture} onOpenChange={(open) => !open && setSelectedLecture(null)}>
+      <Dialog open={!!selectedLecture} onOpenChange={(open) => !open && setSelectedLectureId(null)}>
         {selectedLecture && (
           <DialogContent
             className="max-w-2xl max-h-[85vh] overflow-y-auto"
@@ -478,6 +496,42 @@ export default function LecturesView() {
                   </ul>
                 </div>
               )}
+
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-3 border-t border-border/50">
+                <Link
+                  to="/transcript"
+                  search={{ id: selectedLecture.id, tab: "analysis" }}
+                  onClick={() => setSelectedLectureId(null)}
+                >
+                  <Button size="sm" variant="outline" className="text-xs cursor-pointer gap-1.5">
+                    <Sparkles className="h-3.5 w-3.5 text-primary" />
+                    {isArabic ? "فتح التحليل المتعمق" : "Open Deep Analysis"}
+                  </Button>
+                </Link>
+                <Link
+                  to="/quiz"
+                  search={{ lectureId: selectedLecture.id }}
+                  onClick={() => setSelectedLectureId(null)}
+                >
+                  <Button size="sm" variant="secondary" className="text-xs cursor-pointer gap-1.5">
+                    <BrainCircuit className="h-3.5 w-3.5" />
+                    {isArabic ? "اختبار هذه المحاضرة" : "Lecture Quiz"}
+                  </Button>
+                </Link>
+                <Link
+                  to="/transcript"
+                  search={{ id: selectedLecture.id }}
+                  onClick={() => setSelectedLectureId(null)}
+                >
+                  <Button
+                    size="sm"
+                    className="gradient-primary text-primary-foreground shadow-glow text-xs cursor-pointer gap-1.5"
+                  >
+                    <Layers className="h-3.5 w-3.5" />
+                    {isArabic ? "التفريغ الكامل" : "Full Transcript"}
+                  </Button>
+                </Link>
+              </div>
             </div>
           </DialogContent>
         )}

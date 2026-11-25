@@ -51,7 +51,7 @@ function NotFoundComponent() {
   );
 }
 
-const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem("${THEME_STORAGE_KEY}");var d=t==="dark"||(t!=="light"&&window.matchMedia("(prefers-color-scheme: dark)").matches);document.documentElement.classList.toggle("dark",d);var l=localStorage.getItem("meetmind-lang");if(l==="AR"){document.documentElement.dir="rtl";document.documentElement.lang="ar";}}catch(e){document.documentElement.classList.add("dark");}})();`;
+const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem("${THEME_STORAGE_KEY}");var isLight=t==="light";document.documentElement.classList.toggle("dark",!isLight);document.documentElement.classList.toggle("light",isLight);document.documentElement.dataset.theme=isLight?"light":"dark";var l=localStorage.getItem("meetmind-lang");if(l==="AR"){document.documentElement.dir="rtl";document.documentElement.lang="ar";}}catch(e){document.documentElement.classList.add("dark");document.documentElement.classList.remove("light");}})();`;
 
 function ErrorComponent({ error: rawError, reset }: { error: unknown; reset: () => void }) {
   const router = useRouter();

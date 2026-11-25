@@ -970,10 +970,6 @@ function ProfilePage() {
             ) : (
               <div className="divide-y divide-border/50">
                 {filteredRecordings.map((item: ProfileRecordingItem) => {
-                  const detailPath =
-                    item.type === "meeting"
-                      ? (`/meetings/${item.id}` as const)
-                      : (`/lectures/${item.id}` as const);
                   return (
                     <div
                       key={`${item.type}-${item.id}`}
@@ -995,7 +991,8 @@ function ProfilePage() {
                             </span>
                           )}
                           <Link
-                            to={detailPath as never}
+                            to="/transcript"
+                            search={{ id: item.id }}
                             className="font-medium text-sm text-foreground hover:text-amber-300 transition truncate"
                           >
                             {item.title}
@@ -1037,7 +1034,7 @@ function ProfilePage() {
                           </span>
                         )}
                         <Button asChild size="sm" variant="outline" className="h-7 text-xs">
-                          <Link to={detailPath as never}>
+                          <Link to="/transcript" search={{ id: item.id }}>
                             Open <ExternalLink className="h-3 w-3 ml-1" />
                           </Link>
                         </Button>

@@ -164,15 +164,16 @@ export default function SearchView() {
                     </div>
                     <p className="text-sm italic text-foreground/90">&quot;{t.quote}&quot;</p>
                     <div className="pt-1 flex justify-end">
-                      <a
-                        href={`/transcript?id=${encodeURIComponent(t.id)}&time=${encodeURIComponent(t.time)}`}
+                      <Link
+                        to="/transcript"
+                        search={{ id: t.id, time: String(t.time) }}
                         className="inline-flex items-center gap-1 text-xs text-primary hover:underline font-medium"
                       >
                         <span>
                           {isRtl ? "عرض في السياق والاستماع" : "Seek in transcript & listen"}
                         </span>
                         <ArrowIcon className="h-3.5 w-3.5" />
-                      </a>
+                      </Link>
                     </div>
                   </GlassCard>
                 ))}
@@ -204,8 +205,12 @@ export default function SearchView() {
                       <p className="mt-2 text-xs text-muted-foreground line-clamp-2">{m.summary}</p>
                     )}
                     <div className="mt-3">
-                      <Link to="/meetings">
-                        <Button size="sm" variant="outline" className="w-full text-xs">
+                      <Link to="/transcript" search={{ id: m.id }}>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="w-full text-xs cursor-pointer"
+                        >
                           {isRtl ? "فتح تفاصيل الاجتماع" : "Open Meeting"}
                         </Button>
                       </Link>
@@ -244,8 +249,12 @@ export default function SearchView() {
                       </p>
                     )}
                     <div className="mt-3">
-                      <Link to="/lectures">
-                        <Button size="sm" variant="outline" className="w-full text-xs">
+                      <Link to="/transcript" search={{ id: l.id }}>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="w-full text-xs cursor-pointer"
+                        >
                           {isRtl ? "فتح ملاحظات المحاضرة" : "Open Lecture Notes"}
                         </Button>
                       </Link>

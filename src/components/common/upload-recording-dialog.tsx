@@ -81,7 +81,7 @@ const STAGE_LABELS_AR: Record<string, string> = {
   Validating: "جاري التحقق من سلامة الملف عبر FFprobe...",
   Queued: "في قائمة انتظار المعالجة الذكية...",
   ExtractingAudio: "جاري استخراج وتجهيز الصوت بتردد 16kHz...",
-  Transcribing: "جاري استخراج النص الكامل من الصوت بالذكاء الاصطناعي...",
+  Transcribing: "جاري التفريغ الصوتي الدقيق عبر نموذج Whisper AI المدمج...",
   Translating: "جاري تنسيق النص المستخرج والمصطلحات...",
   Merging: "جاري تجميع ودمج النص المفرغ المستمر...",
   Analyzing: "جاري التحليل الذكي واستخراج المحاور والمهام...",
@@ -97,7 +97,7 @@ const STAGE_LABELS_EN: Record<string, string> = {
   Validating: "Validating media streams via FFprobe...",
   Queued: "Queued for processing...",
   ExtractingAudio: "Extracting 16kHz PCM audio stream...",
-  Transcribing: "Extracting full speech transcript via AI...",
+  Transcribing: "Transcribing speech with built-in Whisper AI...",
   Translating: "Formatting transcript & terminology...",
   Merging: "Merging continuous flowing transcript...",
   Analyzing: "Analyzing content & extracting action items...",
@@ -140,6 +140,8 @@ export function UploadRecordingDialog({
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<string>("Queued");
   const [progressPercent, setProgressPercent] = useState<number>(0);
+  const [livePartialCount, setLivePartialCount] = useState<number>(0);
+  const [livePartialPreview, setLivePartialPreview] = useState<string>("");
   const [jobError, setJobError] = useState<string | null>(null);
   const [isRetrying, setIsRetrying] = useState(false);
 
@@ -393,6 +395,13 @@ export function UploadRecordingDialog({
         const pct = job.progressPercent || 15;
         setProgressPercent(pct);
 
+        if (typeof job.partialSegmentsCount === "number" && job.partialSegmentsCount > 0) {
+          setLivePartialCount(job.partialSegmentsCount);
+        }
+        if (typeof job.latestTextPreview === "string" && job.latestTextPreview.trim()) {
+          setLivePartialPreview(job.latestTextPreview.trim());
+        }
+
         const mappedMode = mapJobStatusToSystemMode(job.status);
         useUIStore.getState().setAudioSystemState(mappedMode, pct);
 
@@ -487,9 +496,10 @@ export function UploadRecordingDialog({
     }, 1000);
   };
 
-  // Recover any active background upload job across modal close or reload
+  // Proactively warm built-in AI models & recover any active background upload job on open
   useEffect(() => {
     if (!open) return;
+    void api.warmupAi().catch(() => {});
     const saved = getSavedActiveUploadJob();
     if (saved && !isUploading && !completedTranscript) {
       setActiveJobId(saved.jobId);
@@ -498,6 +508,8 @@ export function UploadRecordingDialog({
       setIsUploading(true);
       setJobStatus("Queued");
       setProgressPercent(15);
+      setLivePartialCount(0);
+      setLivePartialPreview("");
       startPolling(saved.jobId);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -527,6 +539,8 @@ export function UploadRecordingDialog({
       setIsRetrying(true);
       setJobError(null);
       setCompletedTranscript(null);
+      setLivePartialCount(0);
+      setLivePartialPreview("");
       setIsUploading(true);
       setJobStatus("Queued");
       setProgressPercent(15);
@@ -559,6 +573,8 @@ export function UploadRecordingDialog({
       setIsUploading(true);
       setJobError(null);
       setCompletedTranscript(null);
+      setLivePartialCount(0);
+      setLivePartialPreview("");
       setJobStatus("Uploading");
       setProgressPercent(0);
       useUIStore.getState().setAudioSystemState("Uploading", 0);
@@ -709,9 +725,31 @@ export function UploadRecordingDialog({
 
               <p className="text-xs text-muted-foreground leading-relaxed px-4">
                 {isArabic
-                  ? "يجري الآن استخراج كل كلمة من الملف الصوتي بدقة فائقة وتحليل المحاور بالذكاء الاصطناعي..."
-                  : "Extracting full speech verbatim and running AI intelligence pipeline..."}
+                  ? "يجري الآن تفريغ الكلام الفعلي عبر نموذج Whisper AI المدمج وتحليل المحاور بالذكاء الاصطناعي..."
+                  : "Transcribing actual speech with built-in Whisper AI and running local analysis..."}
               </p>
+
+              {livePartialCount > 0 && (
+                <div className="mx-auto max-w-sm rounded-xl border border-primary/30 bg-secondary/40 p-3 text-start space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] font-semibold text-primary">
+                    <span className="flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      {isArabic ? "المقاطع المستخرجة حتى الآن" : "Live Extracted Transcript"}
+                    </span>
+                    <span className="font-mono">
+                      {livePartialCount} {isArabic ? "مقطع" : "segments"}
+                    </span>
+                  </div>
+                  {livePartialPreview && (
+                    <p
+                      dir={/[\u0600-\u06FF]/.test(livePartialPreview) ? "rtl" : "ltr"}
+                      className="text-xs text-foreground/90 leading-relaxed line-clamp-3"
+                    >
+                      {livePartialPreview}
+                    </p>
+                  )}
+                </div>
+              )}
 
               <div className="flex items-center justify-center gap-2 pt-2">
                 <Button
@@ -859,7 +897,7 @@ export function UploadRecordingDialog({
                       onOpenChange(false);
                       navigate({
                         to: "/transcript",
-                        search: { id: targetId } as unknown as Record<string, never>,
+                        search: { id: targetId },
                       });
                     }}
                     className="gradient-primary text-primary-foreground shadow-glow gap-1.5 text-xs cursor-pointer"
@@ -884,18 +922,9 @@ export function UploadRecordingDialog({
                 </div>
                 <p className="text-xs text-muted-foreground leading-relaxed">{jobError}</p>
                 <div className="text-[11px] text-amber-400/90 bg-amber-500/10 p-2.5 rounded-lg border border-amber-500/20">
-                  {jobError.includes("Secrets") ||
-                  jobError.includes("API_KEY") ||
-                  jobError.includes("API key") ||
-                  jobError.includes("quota") ||
-                  jobError.includes("429") ||
-                  jobError.includes("403")
-                    ? isArabic
-                      ? "مفتاح Gemini API غير صالح أو منتهي الصلاحية. افتح Settings > Secrets في منصة AI Studio واختر أو أضف مفتاح Gemini API صحيحاً ثم أعد المحاولة."
-                      : "Your GEMINI_API_KEY is missing, invalid, or over quota. Open Settings > Secrets in AI Studio to configure a valid API key, then click Retry Pipeline."
-                    : isArabic
-                      ? "تأكد من أن الملف الصوتي أو الفيديو يحتوي على كلام بشري واضح وليس صمتاً، واختر اللغة المطابقة أو الكشف التلقائي."
-                      : "Ensure the uploaded audio/video file contains audible speech (not silence) and try matching the spoken language or Auto-Detect."}
+                  {isArabic
+                    ? "تأكد من أن الملف الصوتي أو الفيديو يحتوي على كلام بشري واضح وليس صمتاً، واختر اللغة المطابقة أو الكشف التلقائي ثم اضغط إعادة المحاولة."
+                    : "Ensure the uploaded audio/video file contains audible speech (not silence) and try matching the spoken language or Auto-Detect, then click Retry Pipeline."}
                 </div>
               </div>
 
@@ -971,7 +1000,7 @@ export function UploadRecordingDialog({
                     variant="outline"
                     className="text-[10px] font-mono border-primary/30 text-primary"
                   >
-                    Gemini + Whisper ASR
+                    {isArabic ? "Whisper AI المدمج" : "Built-in Whisper AI"}
                   </Badge>
                 </Label>
                 <Select value={selectedLanguage} onValueChange={(v) => setSelectedLanguage(v)}>

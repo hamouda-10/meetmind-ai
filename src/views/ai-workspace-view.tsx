@@ -1,4 +1,5 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Sparkles,
@@ -36,9 +37,15 @@ import { AudioOrb3D } from "@/components/3d/audio-orb-3d";
 
 export default function AIWorkspaceView() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { t, isRtl } = useTranslation();
   const questionInputRef = useRef<HTMLInputElement | null>(null);
-  const [selectedResourceId, setSelectedResourceId] = useState<string>("");
+  const locationSearchStr = useRouterState({ select: (r) => r.location.searchStr });
+  const urlId = useMemo(
+    () => new URLSearchParams(locationSearchStr || "").get("id")?.trim() || "",
+    [locationSearchStr],
+  );
+  const [selectedResourceId, setSelectedResourceId] = useState<string>(() => urlId);
   const [question, setQuestion] = useState("");
   const [runningOp, setRunningOp] = useState<string | null>(null);
   const [chatLog, setChatLog] = useState<
@@ -55,32 +62,58 @@ export default function AIWorkspaceView() {
     content: string | object;
   } | null>(null);
 
-  const { data: meetings = [] } = useQuery<Meeting[]>({
+  useEffect(() => {
+    if (urlId) {
+      setSelectedResourceId(urlId);
+    }
+  }, [urlId]);
+
+  const { data: meetings = [], isLoading: loadingMeetings } = useQuery<Meeting[]>({
     queryKey: ["meetings"],
     queryFn: () => api.getMeetings(),
   });
 
-  const { data: lectures = [] } = useQuery<Lecture[]>({
+  const { data: lectures = [], isLoading: loadingLectures } = useQuery<Lecture[]>({
     queryKey: ["lectures"],
     queryFn: () => api.getLectures(),
   });
 
-  const allResources = [
-    ...meetings.map((m) => ({
-      id: m.id,
-      title: isRtl ? `[اجتماع] ${m.title}` : `[Meeting] ${m.title}`,
-      type: "meeting" as const,
-    })),
-    ...lectures.map((l) => ({
-      id: l.id,
-      title: isRtl
-        ? `[محاضرة] ${l.courseCode}: ${l.title}`
-        : `[Lecture] ${l.courseCode}: ${l.title}`,
-      type: "lecture" as const,
-    })),
-  ];
+  const allResources = useMemo(
+    () => [
+      ...meetings.map((m) => ({
+        id: m.id,
+        title: isRtl ? `[اجتماع] ${m.title}` : `[Meeting] ${m.title}`,
+        type: "meeting" as const,
+      })),
+      ...lectures.map((l) => ({
+        id: l.id,
+        title: isRtl
+          ? `[محاضرة] ${l.courseCode}: ${l.title}`
+          : `[Lecture] ${l.courseCode}: ${l.title}`,
+        type: "lecture" as const,
+      })),
+    ],
+    [meetings, lectures, isRtl],
+  );
 
-  const currentResource = allResources.find((r) => r.id === selectedResourceId) || allResources[0];
+  const requestedId = selectedResourceId || urlId;
+  const matchedResource = requestedId
+    ? allResources.find((r) => r.id === requestedId) || null
+    : null;
+  const currentResource =
+    matchedResource ||
+    (requestedId && (loadingMeetings || loadingLectures) ? undefined : allResources[0]);
+
+  const handleSelectResource = (nextId: string) => {
+    setSelectedResourceId(nextId);
+    setActiveAnalysis(null);
+    setChatLog([]);
+    void navigate({
+      to: "/ai-workspace",
+      search: { id: nextId },
+      replace: true,
+    });
+  };
 
   const askMutation = useMutation({
     mutationFn: (q: string) => api.askQuestion(q, currentResource?.id),
@@ -253,10 +286,7 @@ export default function AIWorkspaceView() {
         </div>
 
         <div className="w-full sm:w-72">
-          <Select
-            value={selectedResourceId || (allResources[0]?.id ?? "")}
-            onValueChange={setSelectedResourceId}
-          >
+          <Select value={currentResource?.id ?? ""} onValueChange={handleSelectResource}>
             <SelectTrigger className="bg-background/50">
               <SelectValue placeholder={t("selectSessionPlaceholder")} />
             </SelectTrigger>

@@ -12,6 +12,8 @@ import {
   AlertTriangle,
   Download,
   RotateCcw,
+  Moon,
+  Sun,
 } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
 import { GlassCard } from "@/components/common/glass-card";
@@ -38,6 +40,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { api } from "@/lib/api-client";
 import { useAuthStore } from "@/stores/auth-store";
+import { useUIStore } from "@/stores/ui-store";
 import { useTranslation } from "@/lib/i18n";
 import { toast } from "sonner";
 
@@ -46,6 +49,8 @@ export default function SettingsView() {
   const { isRtl } = useTranslation();
   const authUser = useAuthStore((s) => s.user);
   const setAuthUser = useAuthStore((s) => s.setUser);
+  const resolvedTheme = useUIStore((s) => s.resolvedTheme);
+  const setTheme = useUIStore((s) => s.setTheme);
   const isGuest = Boolean(authUser?.isGuest);
 
   const [activeTab, setActiveTab] = useState("appearance");
@@ -224,6 +229,56 @@ export default function SettingsView() {
                 {isRtl ? "المظهر والتخطيط" : "Appearance & Layout"}
               </div>
               <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label>{isRtl ? "وضع المظهر (الليلي / النهاري)" : "Color Theme"}</Label>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => setTheme("dark")}
+                      className={`flex items-center gap-3 rounded-xl border p-3.5 text-start transition cursor-pointer ${
+                        resolvedTheme === "dark"
+                          ? "border-primary bg-primary/10 ring-1 ring-primary"
+                          : "border-border hover:bg-secondary/60"
+                      }`}
+                    >
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#09090d] border border-amber-500/40 text-amber-400">
+                        <Moon className="h-5 w-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold">
+                          {isRtl ? "الوضع الليلي" : "Dark Mode"}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {isRtl ? "داكن فاخر بالذهبي (الحالي)" : "Matte dark obsidian & gold"}
+                        </div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setTheme("light")}
+                      className={`flex items-center gap-3 rounded-xl border p-3.5 text-start transition cursor-pointer ${
+                        resolvedTheme === "light"
+                          ? "border-primary bg-primary/10 ring-1 ring-primary"
+                          : "border-border hover:bg-secondary/60"
+                      }`}
+                    >
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white border border-zinc-300 text-zinc-950">
+                        <Sun className="h-5 w-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold">
+                          {isRtl ? "الوضع النهاري (أبيض وأسود)" : "Light Mode (White & Black)"}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {isRtl
+                            ? "أبيض ناصع وأسود عالي الوضوح"
+                            : "Pure crisp monochrome white & black"}
+                        </div>
+                      </div>
+                    </button>
+                  </div>
+                </div>
                 <div className="flex items-center justify-between gap-4">
                   <div>
                     <Label>{isRtl ? "تقليل الحركة" : "Reduced motion"}</Label>

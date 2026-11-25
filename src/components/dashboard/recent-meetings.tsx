@@ -76,7 +76,13 @@ export function RecentMeetings() {
                     <Video className="h-4 w-4" />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium">{m.title}</div>
+                    <Link
+                      to="/transcript"
+                      search={{ id: m.id }}
+                      className="block truncate text-sm font-medium text-foreground hover:text-primary transition-colors"
+                    >
+                      {m.title}
+                    </Link>
                     <div className="mt-0.5 flex items-center gap-3 text-[11px] text-muted-foreground">
                       <span>{m.hostName}</span>
                       <span>·</span>
@@ -101,22 +107,31 @@ export function RecentMeetings() {
                   <div className="hidden text-xs text-muted-foreground md:block">
                     {Math.max(1, Math.round(m.durationSeconds / 60))}m
                   </div>
-                  {fullTranscript && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => setExpandedId(isExpanded ? "__NONE__" : m.id)}
-                      className="h-7 px-2 text-[11px] gap-1 border-[#D4AF37]/35 text-[#F5D77F] hover:bg-[#D4AF37]/15 cursor-pointer"
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <Link
+                      to="/transcript"
+                      search={{ id: m.id }}
+                      className="inline-flex h-7 items-center rounded-md border border-primary/35 bg-primary/10 px-2 text-[11px] font-semibold text-primary hover:bg-primary/20 transition-colors"
                     >
-                      <FileText className="h-3 w-3 text-[#D4AF37]" />
-                      <span>{isArabic ? "النص المستخرج" : "Transcript"}</span>
-                      {isExpanded ? (
-                        <ChevronUp className="h-3 w-3" />
-                      ) : (
-                        <ChevronDown className="h-3 w-3" />
-                      )}
-                    </Button>
-                  )}
+                      {isArabic ? "فتح" : "Open"}
+                    </Link>
+                    {fullTranscript && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setExpandedId(isExpanded ? "__NONE__" : m.id)}
+                        className="h-7 px-2 text-[11px] gap-1 border-[#D4AF37]/35 text-[#F5D77F] hover:bg-[#D4AF37]/15 cursor-pointer"
+                      >
+                        <FileText className="h-3 w-3 text-[#D4AF37]" />
+                        <span>{isArabic ? "النص المستخرج" : "Transcript"}</span>
+                        {isExpanded ? (
+                          <ChevronUp className="h-3 w-3" />
+                        ) : (
+                          <ChevronDown className="h-3 w-3" />
+                        )}
+                      </Button>
+                    )}
+                  </div>
                 </div>
 
                 {fullTranscript && isExpanded && (
@@ -143,7 +158,7 @@ export function RecentMeetings() {
                         </button>
                         <Link
                           to="/transcript"
-                          search={{ id: m.id } as unknown as Record<string, never>}
+                          search={{ id: m.id }}
                           className="inline-flex items-center gap-1 rounded-md border border-[#D4AF37]/40 bg-[#D4AF37]/15 px-2 py-0.5 text-[10.5px] font-semibold text-[#FFF3B0] hover:bg-[#D4AF37]/25"
                         >
                           <span>{isArabic ? "صفحة التفريغ الكامل" : "Full Page"}</span>

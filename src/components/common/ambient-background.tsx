@@ -1,22 +1,75 @@
 import { memo, useState } from "react";
+import { useUIStore } from "@/stores/ui-store";
 
 /**
  * AmbientBackground
- * Features:
- * - Uses the uploaded official MeetMind AI cinematic background image
- * - Optimized WebP format (104KB) with fallback to original PNG (1.8MB)
- * - Layered structure:
- *     Base Matte Black (#070709)
- *     -> Uploaded AI Background Image (Cover, object-cover)
- *     -> Subtle Pure CSS/SVG AI Waveform Layer
- *     -> Dark / Gold Vignette Overlay (Guarantees 100% Text & Card Readability)
- *     -> UI Content (Sidebar, Cards, Buttons, Data)
- * - Zero blocking: loads progressively, dashboard shell renders in 0ms
- * - Pointer-events-none: completely non-interfering with clicks, scrolling, or controls
+ * - Dark Mode: Cinematic Matte Dark (#070709) + Official Gold Waveform Background
+ * - Light Mode: Crisp Pure White (#ffffff) + Architectural Black & Gray Monochrome Grid & Waveform
  */
 export const AmbientBackground = memo(function AmbientBackground() {
+  const resolvedTheme = useUIStore((s) => s.resolvedTheme);
   const [imageLoaded, setImageLoaded] = useState(true);
   const [hasError, setHasError] = useState(false);
+
+  if (resolvedTheme === "light") {
+    return (
+      <div
+        className="pointer-events-none fixed inset-0 z-0 overflow-hidden select-none bg-white transform-gpu"
+        aria-hidden="true"
+      >
+        <div className="absolute inset-0 bg-white" />
+        <svg
+          className="absolute inset-0 h-full w-full opacity-55 pointer-events-none transform-gpu"
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 1440 900"
+          preserveAspectRatio="xMidYMid slice"
+        >
+          <defs>
+            <linearGradient id="bgMonoWave1" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="#09090b" stopOpacity="0" />
+              <stop offset="30%" stopColor="#09090b" stopOpacity="0.09" />
+              <stop offset="70%" stopColor="#52525b" stopOpacity="0.07" />
+              <stop offset="100%" stopColor="#09090b" stopOpacity="0" />
+            </linearGradient>
+            <linearGradient id="bgMonoWave2" x1="100%" y1="0%" x2="0%" y2="0%">
+              <stop offset="0%" stopColor="#18181b" stopOpacity="0" />
+              <stop offset="45%" stopColor="#18181b" stopOpacity="0.07" />
+              <stop offset="100%" stopColor="#18181b" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <path
+            d="M0 320 Q 180 230, 360 320 T 720 320 T 1080 320 T 1440 320"
+            fill="none"
+            stroke="url(#bgMonoWave1)"
+            strokeWidth="2"
+            className="waveform-wave-1"
+          />
+          <path
+            d="M0 350 Q 200 420, 400 350 T 800 350 T 1200 350 T 1440 350"
+            fill="none"
+            stroke="url(#bgMonoWave2)"
+            strokeWidth="1.5"
+            className="waveform-wave-2"
+          />
+        </svg>
+        <div
+          className="absolute inset-0 opacity-[0.035] pointer-events-none"
+          style={{
+            backgroundImage:
+              "linear-gradient(to right, #09090b 1px, transparent 1px), linear-gradient(to bottom, #09090b 1px, transparent 1px)",
+            backgroundSize: "64px 64px",
+          }}
+        />
+        <div
+          className="absolute inset-0 pointer-events-none"
+          style={{
+            background:
+              "radial-gradient(ellipse 1200px 700px at 50% 0%, rgba(9, 9, 11, 0.03) 0%, transparent 70%)",
+          }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div

@@ -62,12 +62,44 @@ function isH3SwallowedErrorBody(body: string): boolean {
 
 import { handleApiRequest } from "./server/routes";
 import { recoverInterruptedJobs } from "./server/jobs";
+import { warmupWhisperModel } from "./server/whisper-asr";
+import { warmupLocalLlm } from "./server/local-llm";
 
 // Safely attempt job recovery on server startup without crashing cold starts
 try {
   recoverInterruptedJobs();
 } catch (err) {
   console.warn("[Jobs] Background recovery skipped during server startup:", err);
+}
+
+// Proactively warm embedded local AI models in background for local dev/runtime
+// Skipped on Vercel serverless cold starts and during automated test runs
+let startupWarmupScheduled = false;
+if (
+  !startupWarmupScheduled &&
+  !process.env.VERCEL &&
+  process.env.NODE_ENV !== "test" &&
+  process.env.MEETMIND_SKIP_AI_WARMUP !== "1"
+) {
+  startupWarmupScheduled = true;
+  const warmupTimer = setTimeout(() => {
+    void warmupWhisperModel()
+      .catch((err: unknown) => {
+        console.warn(
+          "[AI Warmup] Background Whisper ASR warmup notice:",
+          err instanceof Error ? err.message : err,
+        );
+      })
+      .finally(() => {
+        void warmupLocalLlm().catch((err: unknown) => {
+          console.warn(
+            "[AI Warmup] Background Local LLM warmup notice:",
+            err instanceof Error ? err.message : err,
+          );
+        });
+      });
+  }, 2000);
+  warmupTimer.unref?.();
 }
 
 export default {

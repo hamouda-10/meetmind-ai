@@ -5,6 +5,11 @@ import { GoogleGenAI } from "@google/genai";
 let aiInstance: GoogleGenAI | null = null;
 let cachedApiKey: string | null = null;
 let envLoaded = false;
+let cloudKeySuspendedUntil = 0;
+
+export function suspendCloudGeminiTemporarily(durationMs = 5 * 60 * 1000): void {
+  cloudKeySuspendedUntil = Date.now() + durationMs;
+}
 
 function loadEnvFileDirectly(): void {
   if (envLoaded) return;
@@ -56,12 +61,16 @@ export function isGeminiConfigured(): boolean {
 }
 
 export function getGeminiClient(): GoogleGenAI | null {
+  if (cloudKeySuspendedUntil > Date.now()) {
+    return null;
+  }
   const apiKey = getResolvedGeminiApiKey();
   if (!apiKey) {
     return null;
   }
   if (!aiInstance || cachedApiKey !== apiKey) {
     cachedApiKey = apiKey;
+    cloudKeySuspendedUntil = 0;
     aiInstance = new GoogleGenAI({
       apiKey,
       httpOptions: {
@@ -283,8 +292,14 @@ export async function executeWithRetryAndFallback<T>(
         const billing = isBillingExhaustionError(err);
         const errMessage = err instanceof Error ? err.message : String(err);
 
-        // Immediate fail on non-retryable client error (like 400 or 402 billing)
-        if (billing || status === 400 || status === 401 || status === 403) {
+        const isNetworkUnreachable =
+          /fetch failed|enotfound|econnrefused|eai_again|networkerror/i.test(errMessage);
+
+        // Immediate fail & circuit-break on non-retryable client error (400/401/402/403) or unreachable network
+        if (billing || isNetworkUnreachable || status === 400 || status === 401 || status === 403) {
+          if (billing || isNetworkUnreachable || status === 401 || status === 403) {
+            suspendCloudGeminiTemporarily(10 * 60 * 1000);
+          }
           logGeminiStructured({
             level: "error",
             event: "gemini_call_non_retryable_failure",
@@ -358,6 +373,7 @@ export async function executeWithRetryAndFallback<T>(
   }
 
   // If we reach here, all attempts across all models failed
+  suspendCloudGeminiTemporarily(2 * 60 * 1000);
   const finalStatus = extractHttpStatus(lastError);
   const finalMessage =
     lastError instanceof Error ? lastError.message : String(lastError || "Unknown Gemini error");

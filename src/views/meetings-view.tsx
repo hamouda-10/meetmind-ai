@@ -65,7 +65,7 @@ export default function MeetingsView() {
   const [currentPage, setCurrentPage] = useState(1);
 
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
-  const [selectedMeeting, setSelectedMeeting] = useState<Meeting | null>(null);
+  const [selectedMeetingId, setSelectedMeetingId] = useState<string | null>(null);
   const [meetingToDelete, setMeetingToDelete] = useState<Meeting | null>(null);
   const [deleteAllDialogOpen, setDeleteAllDialogOpen] = useState(false);
 
@@ -73,6 +73,11 @@ export default function MeetingsView() {
     queryKey: ["meetings"],
     queryFn: () => api.getMeetings(),
   });
+
+  const selectedMeeting = useMemo(
+    () => (selectedMeetingId ? (meetings.find((m) => m.id === selectedMeetingId) ?? null) : null),
+    [meetings, selectedMeetingId],
+  );
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.deleteMeeting(id),
@@ -128,10 +133,16 @@ export default function MeetingsView() {
       return matchesSearch && matchesStatus;
     });
 
+    const getSortTs = (m: Meeting) => {
+      const idMatch = m.id.match(/_(\d{10,})/);
+      if (idMatch) return Number(idMatch[1]);
+      return new Date(m.date).getTime() || 0;
+    };
+
     result = [...result].sort((a, b) => {
       if (sortBy === "duration") return (b.durationSeconds || 0) - (a.durationSeconds || 0);
-      if (sortBy === "oldest") return new Date(a.date).getTime() - new Date(b.date).getTime();
-      return new Date(b.date).getTime() - new Date(a.date).getTime();
+      if (sortBy === "oldest") return getSortTs(a) - getSortTs(b);
+      return getSortTs(b) - getSortTs(a);
     });
 
     return result;
@@ -279,9 +290,13 @@ export default function MeetingsView() {
                     </Badge>
                   </div>
 
-                  <h3 className="mt-3 font-display text-base font-semibold tracking-tight text-foreground line-clamp-2">
+                  <Link
+                    to="/transcript"
+                    search={{ id: m.id }}
+                    className="mt-3 block font-display text-base font-semibold tracking-tight text-foreground line-clamp-2 hover:text-primary transition-colors"
+                  >
                     {m.title}
-                  </h3>
+                  </Link>
 
                   <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                     <span>{m.hostName || "المضيف"}</span>
@@ -324,13 +339,14 @@ export default function MeetingsView() {
                     size="sm"
                     variant="outline"
                     className="flex-1 text-xs cursor-pointer"
-                    onClick={() => setSelectedMeeting(m)}
+                    onClick={() => setSelectedMeetingId(m.id)}
                   >
-                    <FileText className="h-3.5 w-3.5 ml-1" /> الملخص التنفيذي
+                    <FileText className="h-3.5 w-3.5 ml-1" />{" "}
+                    {isArabic ? "الملخص التنفيذي" : "Summary"}
                   </Button>
-                  <Link to="/transcript" className="flex-1">
+                  <Link to="/transcript" search={{ id: m.id }} className="flex-1">
                     <Button size="sm" variant="secondary" className="w-full text-xs cursor-pointer">
-                      التفريغ الصوتي
+                      {isArabic ? "التفريغ الصوتي" : "Transcript"}
                     </Button>
                   </Link>
                   <Button
@@ -382,7 +398,7 @@ export default function MeetingsView() {
       )}
 
       {/* Meeting Summary Dialog */}
-      <Dialog open={!!selectedMeeting} onOpenChange={(open) => !open && setSelectedMeeting(null)}>
+      <Dialog open={!!selectedMeeting} onOpenChange={(open) => !open && setSelectedMeetingId(null)}>
         {selectedMeeting && (
           <DialogContent
             className="max-w-2xl max-h-[85vh] overflow-y-auto"
@@ -439,6 +455,32 @@ export default function MeetingsView() {
                   </ul>
                 </div>
               )}
+
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-3 border-t border-border/50">
+                <Link
+                  to="/transcript"
+                  search={{ id: selectedMeeting.id, tab: "analysis" }}
+                  onClick={() => setSelectedMeetingId(null)}
+                >
+                  <Button size="sm" variant="outline" className="text-xs cursor-pointer gap-1.5">
+                    <Sparkles className="h-3.5 w-3.5 text-primary" />
+                    {isArabic ? "فتح التحليل المتعمق" : "Open Deep Analysis"}
+                  </Button>
+                </Link>
+                <Link
+                  to="/transcript"
+                  search={{ id: selectedMeeting.id }}
+                  onClick={() => setSelectedMeetingId(null)}
+                >
+                  <Button
+                    size="sm"
+                    className="gradient-primary text-primary-foreground shadow-glow text-xs cursor-pointer gap-1.5"
+                  >
+                    <FileText className="h-3.5 w-3.5" />
+                    {isArabic ? "التفريغ الكامل" : "Full Transcript"}
+                  </Button>
+                </Link>
+              </div>
             </div>
           </DialogContent>
         )}

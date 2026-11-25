@@ -69,13 +69,14 @@ export const THEME_STORAGE_KEY = "meetmind-theme";
 
 function resolve(t: Theme): "light" | "dark" {
   if (t !== "system") return t;
-  if (typeof window === "undefined") return "dark";
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return "dark";
 }
 
 function applyTheme(resolved: "light" | "dark") {
   if (typeof document === "undefined") return;
   document.documentElement.classList.toggle("dark", resolved === "dark");
+  document.documentElement.classList.toggle("light", resolved === "light");
+  document.documentElement.dataset.theme = resolved;
 }
 
 export const useUIStore = create<UIState>((set) => ({
@@ -84,10 +85,10 @@ export const useUIStore = create<UIState>((set) => ({
   commandOpen: false,
   notificationsOpen: false,
   aiDockOpen: false,
-  theme: "system",
+  theme: "dark",
   resolvedTheme: "dark",
   hydrateTheme: () => {
-    let stored: Theme = "system";
+    let stored: Theme = "dark";
     try {
       const v = localStorage.getItem(THEME_STORAGE_KEY);
       if (v === "light" || v === "dark") stored = v;

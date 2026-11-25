@@ -67,6 +67,11 @@ export function CommandPalette() {
     navigate({ to: to as never });
   };
 
+  const goToRecording = (id: string) => {
+    setOpen(false);
+    navigate({ to: "/transcript", search: { id } });
+  };
+
   return (
     <CommandDialog open={open} onOpenChange={setOpen}>
       <CommandInput placeholder="Type a command, meeting, lecture or search…" />
@@ -105,7 +110,7 @@ export function CommandPalette() {
             <CommandSeparator />
             <CommandGroup heading="Meetings">
               {meetings.slice(0, 5).map((m) => (
-                <CommandItem key={m.id} onSelect={() => go("/meetings")}>
+                <CommandItem key={m.id} onSelect={() => goToRecording(m.id)}>
                   <Video className="h-4 w-4" /> {m.title}
                   <span className="ml-auto text-xs text-muted-foreground">{m.date}</span>
                 </CommandItem>
@@ -119,7 +124,7 @@ export function CommandPalette() {
             <CommandSeparator />
             <CommandGroup heading="Lectures">
               {lectures.slice(0, 5).map((l) => (
-                <CommandItem key={l.id} onSelect={() => go("/lectures")}>
+                <CommandItem key={l.id} onSelect={() => goToRecording(l.id)}>
                   <GraduationCap className="h-4 w-4" /> {l.title}
                   <span className="ml-auto text-xs text-muted-foreground">{l.courseCode}</span>
                 </CommandItem>

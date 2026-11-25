@@ -4,7 +4,14 @@ import { RouteSkeleton } from "@/components/common/route-skeleton";
 
 const AIWorkspaceView = lazy(() => import("@/views/ai-workspace-view"));
 
+export interface AiWorkspaceSearch {
+  id?: string;
+}
+
 export const Route = createFileRoute("/ai-workspace")({
+  validateSearch: (search: Record<string, unknown>): AiWorkspaceSearch => ({
+    id: typeof search.id === "string" && search.id.trim() ? search.id.trim() : undefined,
+  }),
   head: () => ({ meta: [{ title: "مساحة العمل الذكية · MeetMind AI" }] }),
   component: AIWorkspaceRouteComponent,
 });

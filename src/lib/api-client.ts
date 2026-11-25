@@ -240,6 +240,36 @@ export interface Job {
   resourceType: string;
   resourceId: string;
   errorMessage?: string;
+  stage?: string;
+  partialSegmentsCount?: number;
+  latestTextPreview?: string;
+  latestSegments?: TranscriptSegmentItem[];
+}
+
+export interface AiEngineStatus {
+  engine: string;
+  model: string;
+  state: "idle" | "loading" | "ready" | "error";
+  cachedOnDisk: boolean;
+  error?: string;
+}
+
+export interface AiStatusResponse {
+  ready: boolean;
+  warming?: boolean;
+  asr: AiEngineStatus;
+  llm: AiEngineStatus;
+  cloudGemini: boolean;
+}
+
+export interface AiWarmupResponse {
+  ok: boolean;
+  started: boolean;
+  ready: boolean;
+  warming: boolean;
+  asr: AiEngineStatus;
+  llm: AiEngineStatus;
+  cloudGemini: boolean;
 }
 
 export interface DashboardTrends {
@@ -1288,6 +1318,25 @@ class ApiClient {
     });
   }
 
+  // AI Engine Status & Proactive Warmup
+  async getAiStatus(): Promise<AiStatusResponse> {
+    return this.request<AiStatusResponse>("/api/v1/ai/status", {
+      retries: 0,
+      skipAuthRefresh: true,
+      timeoutMs: 10000,
+    });
+  }
+
+  async warmupAi(target: "all" | "asr" | "llm" = "all"): Promise<AiWarmupResponse> {
+    return this.request<AiWarmupResponse>("/api/v1/ai/warmup", {
+      method: "POST",
+      body: JSON.stringify({ target }),
+      retries: 0,
+      skipAuthRefresh: true,
+      timeoutMs: 10000,
+    });
+  }
+
   // AI & Q&A
   async askQuestion(
     question: string,
@@ -1297,6 +1346,7 @@ class ApiClient {
     return this.request<GroundedAnswer>("/api/v1/ai/ask", {
       method: "POST",
       body: JSON.stringify({ question, resourceId, history }),
+      timeoutMs: 120000,
     });
   }
 
@@ -1518,6 +1568,7 @@ class ApiClient {
     return this.request<{ success: boolean; summary: string }>("/api/v1/ai/generate-summary", {
       method: "POST",
       body: JSON.stringify({ resourceId, type }),
+      timeoutMs: 120000,
     });
   }
 
@@ -1529,6 +1580,7 @@ class ApiClient {
     return this.request<{ success: boolean; quiz: Quiz }>("/api/v1/ai/generate-quiz", {
       method: "POST",
       body: JSON.stringify({ resourceId, type, numQuestions }),
+      timeoutMs: 120000,
     });
   }
 
@@ -1541,6 +1593,7 @@ class ApiClient {
       {
         method: "POST",
         body: JSON.stringify({ resourceId, type }),
+        timeoutMs: 120000,
       },
     );
   }

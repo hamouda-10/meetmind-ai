@@ -110,6 +110,339 @@
   --shadow-elegant: 0 16px 40px -20px rgba(0, 0, 0, 0.8);
 }
 
+/* ==========================================================================
+   Pure Crisp Black & White Light Theme (الوضع النهاري أبيض وأسود فقط 100%)
+   ========================================================================== */
+html.light {
+  color-scheme: light;
+  --radius: 0.75rem;
+  --background: #ffffff;
+  --foreground: #09090b;
+  --card: #ffffff;
+  --card-foreground: #09090b;
+  --popover: #ffffff;
+  --popover-foreground: #09090b;
+  --primary: #09090b;
+  --primary-foreground: #ffffff;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #09090b;
+  --muted: #f4f4f5;
+  --muted-foreground: #52525b;
+  --accent: #f4f4f5;
+  --accent-foreground: #09090b;
+  --destructive: #09090b;
+  --destructive-foreground: #ffffff;
+  --border: #e4e4e7;
+  --input: #d4d4d8;
+  --ring: #09090b;
+  --brand: #09090b;
+  --brand-foreground: #ffffff;
+  --accent-cyan: #09090b;
+  --accent-violet: #09090b;
+  --accent-pink: #27272a;
+  --success: #09090b;
+  --warning: #27272a;
+  --chart-1: #09090b;
+  --chart-2: #52525b;
+  --chart-3: #a1a1aa;
+  --chart-4: #27272a;
+  --chart-5: #71717a;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #09090b;
+  --sidebar-primary: #09090b;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f4f4f5;
+  --sidebar-accent-foreground: #09090b;
+  --sidebar-border: #e4e4e7;
+  --sidebar-ring: #09090b;
+  --glass: #ffffff;
+  --glass-border: #e4e4e7;
+  --gradient-primary: linear-gradient(135deg, #09090b, #18181b);
+  --gradient-mesh: none;
+  --shadow-glow: 0 4px 14px -4px rgba(0, 0, 0, 0.14);
+  --shadow-elegant: 0 4px 18px -8px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+/* 1. Force ALL dark surfaces & dark background gradients to pure crisp White / Light Gray */
+html.light .bg-zinc-950,
+html.light [class*="bg-zinc-950/"],
+html.light [class*="from-zinc-950"],
+html.light [class*="from-zinc-900"],
+html.light [class*="bg-[#0"],
+html.light [class*="from-[#0"],
+html.light [class*="from-[#1"],
+html.light [class*="bg-slate-950"],
+html.light [class*="bg-neutral-950"] {
+  background-color: #ffffff !important;
+  background-image: none !important;
+  color: #09090b !important;
+}
+
+html.light .bg-zinc-900,
+html.light [class*="bg-zinc-900/"],
+html.light .bg-zinc-800,
+html.light [class*="bg-zinc-800/"] {
+  background-color: #f4f4f5 !important;
+  background-image: none !important;
+  color: #09090b !important;
+}
+
+html.light .hover\:bg-zinc-900:hover,
+html.light .hover\:bg-zinc-800\/80:hover,
+html.light [class*="hover:bg-zinc-800"]:hover,
+html.light [class*="hover:bg-zinc-900"]:hover,
+html.light [class*="hover:bg-[#D4AF37]"]:hover,
+html.light [class*="hover:bg-amber-"]:hover {
+  background-color: #e4e4e7 !important;
+  color: #09090b !important;
+}
+
+/* 2. Force ALL tinted/colored badge & card backgrounds to pure neutral light gray / white */
+html.light [class*="bg-amber-"],
+html.light [class*="bg-yellow-"],
+html.light [class*="bg-emerald-"],
+html.light [class*="bg-green-"],
+html.light [class*="bg-cyan-"],
+html.light [class*="bg-sky-"],
+html.light [class*="bg-blue-"],
+html.light [class*="bg-indigo-"],
+html.light [class*="bg-violet-"],
+html.light [class*="bg-purple-"],
+html.light [class*="bg-pink-"],
+html.light [class*="bg-orange-"],
+html.light [class*="bg-red-"],
+html.light [class*="bg-rose-"],
+html.light [class*="bg-[#D4AF37]"],
+html.light [class*="bg-[#F5D77F]"],
+html.light [class*="bg-[#FFF"],
+html.light [class*="bg-[#FFE"],
+html.light [class*="bg-success/"],
+html.light [class*="bg-warning/"],
+html.light [class*="bg-destructive/"],
+html.light [class*="from-amber-"],
+html.light [class*="from-emerald-"],
+html.light [class*="from-cyan-"],
+html.light [class*="from-purple-"],
+html.light [class*="from-blue-"],
+html.light [class*="from-red-"],
+html.light [class*="bg-[radial-gradient"] {
+  background-color: #f4f4f5 !important;
+  background-image: none !important;
+}
+
+/* Pure solid black status indicator dots (replacing green/amber/red dots) */
+html.light span.rounded-full[class*="bg-emerald-"],
+html.light span.rounded-full[class*="bg-green-"],
+html.light span.rounded-full[class*="bg-amber-"],
+html.light span.rounded-full[class*="bg-red-"],
+html.light span.rounded-full[class*="bg-[#D4AF37]"],
+html.light span.rounded-full[class*="bg-[#FFF"],
+html.light span.rounded-full[class*="bg-[#F5D77F]"],
+html.light span.rounded-full[class*="bg-[#FFE"],
+html.light span.rounded-full[class*="bg-[#FDE"] {
+  background-color: #09090b !important;
+  box-shadow: none !important;
+}
+
+/* 3. Force ALL colored text & gradient text to pure crisp Black / Charcoal */
+html.light .text-white,
+html.light .text-zinc-100,
+html.light .text-zinc-200,
+html.light [class*="text-amber-"],
+html.light [class*="text-yellow-"],
+html.light [class*="text-emerald-"],
+html.light [class*="text-green-"],
+html.light [class*="text-cyan-"],
+html.light [class*="text-sky-"],
+html.light [class*="text-blue-"],
+html.light [class*="text-indigo-"],
+html.light [class*="text-violet-"],
+html.light [class*="text-purple-"],
+html.light [class*="text-pink-"],
+html.light [class*="text-orange-"],
+html.light [class*="text-red-"],
+html.light [class*="text-rose-"],
+html.light [class*="text-[#D4AF37]"],
+html.light [class*="text-[#F5D77F]"],
+html.light [class*="text-[#FFF"],
+html.light [class*="text-[#FFE"],
+html.light .text-success,
+html.light .text-warning {
+  color: #09090b !important;
+}
+
+html.light .text-zinc-300,
+html.light .text-zinc-400,
+html.light .text-zinc-500 {
+  color: #52525b !important;
+}
+
+html.light .bg-clip-text.text-transparent,
+html.light .text-gradient {
+  background-image: none !important;
+  background-clip: border-box !important;
+  -webkit-background-clip: border-box !important;
+  color: #09090b !important;
+  -webkit-text-fill-color: #09090b !important;
+}
+
+/* 4. Force ALL colored borders to pure neutral crisp gray/black */
+html.light .border-zinc-800,
+html.light [class*="border-zinc-800/"],
+html.light .border-zinc-700,
+html.light [class*="border-amber-"],
+html.light [class*="border-yellow-"],
+html.light [class*="border-emerald-"],
+html.light [class*="border-green-"],
+html.light [class*="border-cyan-"],
+html.light [class*="border-blue-"],
+html.light [class*="border-purple-"],
+html.light [class*="border-red-"],
+html.light [class*="border-rose-"],
+html.light [class*="border-[#D4AF37]"],
+html.light [class*="border-[#F5D77F]"],
+html.light [class*="border-[#FFF"],
+html.light [class*="border-[#FFE"],
+html.light [class*="border-[#B8860B]"],
+html.light [class*="border-success"],
+html.light [class*="border-warning"],
+html.light [class*="border-destructive"] {
+  border-color: #d4d4d8 !important;
+}
+
+/* 5. Pure Monochrome Grayscale on Decorative Canvases, Logos, SVGs & 3D Orbs */
+html.light canvas,
+html.light .logo-orbit-wrapper,
+html.light .auth-hero-logo-float,
+html.light .radar-frame-cw,
+html.light .radar-frame-ccw,
+html.light .radar-frame-gyro-1,
+html.light .radar-frame-gyro-2,
+html.light .hero-orbit-ring {
+  filter: grayscale(100%) contrast(1.15) !important;
+}
+
+html.light svg circle[stroke="#D4AF37"],
+html.light svg path[stroke="#D4AF37"] {
+  stroke: #09090b !important;
+  filter: none !important;
+}
+
+html.light svg circle[stroke*="212, 175, 55"] {
+  stroke: rgba(9, 9, 11, 0.14) !important;
+}
+
+/* 6. Solid Black Primary Actions with Crisp Guaranteed White Text & Icons (ZERO invisible buttons!) */
+html.light .bg-primary,
+html.light .gradient-primary,
+html.light .auth-btn-primary,
+html.light .btn-gold-animated-border-inner,
+html.light .upload-btn-gold-glow-inner,
+html.light .ai-fab-gold-animated-border-inner {
+  background: #09090b !important;
+  background-color: #09090b !important;
+  background-image: none !important;
+  color: #ffffff !important;
+  border-color: #09090b !important;
+}
+
+html.light .bg-primary *,
+html.light .gradient-primary *,
+html.light .auth-btn-primary *,
+html.light .btn-gold-animated-border-inner *,
+html.light .upload-btn-gold-glow-inner *,
+html.light .ai-fab-gold-animated-border-inner * {
+  color: #ffffff !important;
+}
+
+html.light .bg-primary svg,
+html.light .gradient-primary svg,
+html.light .btn-gold-animated-border-inner svg,
+html.light .upload-btn-gold-glow-inner svg,
+html.light .ai-fab-gold-animated-border-inner svg {
+  color: #ffffff !important;
+  stroke: #ffffff !important;
+  fill: none !important;
+}
+
+html.light .btn-gold-animated-border-inner:hover,
+html.light .upload-btn-gold-glow-inner:hover,
+html.light .auth-btn-primary:hover {
+  background: #27272a !important;
+  background-color: #27272a !important;
+  color: #ffffff !important;
+}
+
+/* Animated Borders become sleek Black & Silver monochrome in Light Mode */
+html.light .ai-fab-gold-animated-border::before,
+html.light .btn-gold-animated-border::before,
+html.light .search-gold-animated-border::before,
+html.light .gold-animated-border::before,
+html.light .gold-card-animated-border::before,
+html.light .gold-btn-rotating-border::before,
+html.light .upload-btn-gold-glow::before,
+html.light .auth-hero-gold-frame::before {
+  background: conic-gradient(
+    from 0deg,
+    #e4e4e7 0deg,
+    #d4d4d8 180deg,
+    #09090b 260deg,
+    #52525b 310deg,
+    #09090b 360deg
+  ) !important;
+}
+
+html.light .ai-fab-gold-animated-border,
+html.light .btn-gold-animated-border,
+html.light .search-gold-animated-border,
+html.light .gold-animated-border,
+html.light .gold-btn-rotating-border,
+html.light .upload-btn-gold-glow,
+html.light .auth-hero-gold-frame {
+  box-shadow: 0 4px 16px -6px rgba(0, 0, 0, 0.2) !important;
+}
+
+html.light .search-gold-animated-border-inner,
+html.light .gold-animated-border-inner,
+html.light .gold-btn-rotating-border-inner,
+html.light .auth-hero-gold-frame-inner {
+  background: #ffffff !important;
+  background-color: #ffffff !important;
+  color: #09090b !important;
+}
+
+html.light .auth-input {
+  background-color: #ffffff !important;
+  border-color: #d4d4d8 !important;
+  color: #09090b !important;
+}
+
+html.light .auth-input:focus {
+  border-color: #09090b !important;
+  box-shadow: 0 0 0 3px rgba(9, 9, 11, 0.12) !important;
+}
+
+html.light .auth-field-group:focus-within label {
+  color: #09090b !important;
+}
+
+html.light .auth-bg-grid {
+  background-image:
+    linear-gradient(to right, rgba(9, 9, 11, 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(9, 9, 11, 0.06) 1px, transparent 1px) !important;
+}
+
+html.light .logo-orbit-ring {
+  border-color: rgba(9, 9, 11, 0.18) !important;
+  box-shadow: none !important;
+}
+
+html.light [class*="shadow-[0_0_"],
+html.light [class*="shadow-[0_10px_30px"],
+html.light [class*="shadow-black"] {
+  box-shadow: 0 8px 24px -10px rgba(0, 0, 0, 0.12) !important;
+}
+
 @layer base {
   * {
     border-color: var(--color-border);

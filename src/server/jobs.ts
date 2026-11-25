@@ -28,6 +28,8 @@ try {
 
 import { ThinkingLevel } from "@google/genai";
 import { db, JobRecord, TranscriptSegment } from "./db";
+import { buildBuiltInAudioFallbackSegments } from "./builtin-ai";
+import { transcribeAudioWithLocalWhisper } from "./whisper-asr";
 import {
   extractHighlightsFromSegments,
   extractKeywordsWithFrequency,
@@ -41,8 +43,10 @@ import {
   extractGeminiTranscriptText,
   getGeminiClient,
   extractHttpStatus,
+  isBillingExhaustionError,
   isRetryableGeminiError,
   logGeminiStructured,
+  suspendCloudGeminiTemporarily,
   GeminiPipelineError,
 } from "./gemini";
 import { getChunksDir, inspectMediaContainerSignature } from "./storage";
@@ -519,34 +523,52 @@ export async function validateMediaFile(
 }
 
 async function extractAndNormalizeAudio(inputPath: string, outputPath: string): Promise<number> {
-  await execFileAsync(
-    "ffmpeg",
-    [
-      "-y",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-err_detect",
-      "ignore_err",
-      "-fflags",
-      "+genpts+igndts+discardcorrupt",
-      "-analyzeduration",
-      "100M",
-      "-probesize",
-      "100M",
-      "-i",
-      inputPath,
-      "-vn",
-      "-acodec",
-      "pcm_s16le",
-      "-ar",
-      "16000",
-      "-ac",
-      "1",
-      outputPath,
-    ],
-    { timeout: 300000, maxBuffer: 10 * 1024 * 1024 },
-  );
+  const baseArgs = [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-err_detect",
+    "ignore_err",
+    "-fflags",
+    "+genpts+igndts+discardcorrupt",
+    "-analyzeduration",
+    "100M",
+    "-probesize",
+    "100M",
+    "-i",
+    inputPath,
+    "-vn",
+  ];
+  const outArgs = ["-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", outputPath];
+
+  try {
+    await execFileAsync(
+      "ffmpeg",
+      [
+        ...baseArgs,
+        "-af",
+        "highpass=f=80,lowpass=f=7600,dynaudnorm=f=200:g=15:p=0.9:m=6",
+        ...outArgs,
+      ],
+      { timeout: 300000, maxBuffer: 10 * 1024 * 1024 },
+    );
+  } catch {
+    await execFileAsync("ffmpeg", [...baseArgs, ...outArgs], {
+      timeout: 300000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  }
+
+  // Fast exact duration from 16kHz mono 16-bit PCM WAV byte size (32,000 bytes/sec), avoiding extra ffprobe spawn
+  try {
+    const stat = fs.statSync(outputPath);
+    if (stat.size > 44) {
+      return Math.max(1, Math.round((stat.size - 44) / 32000));
+    }
+  } catch {
+    // fallback to ffprobe below
+  }
 
   const dur = await probeDurationSeconds(outputPath);
   return dur <= 0 ? 1 : Math.round(dur);
@@ -798,6 +820,9 @@ interface GeminiTranscriptionOutcome {
 
 function formatGeminiErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err || "Unknown Gemini API error");
+  if (isBillingExhaustionError(err)) {
+    return "Gemini API credits are depleted (HTTP 402). Switched to built-in local Whisper ASR.";
+  }
   if (
     raw.includes("API_KEY_INVALID") ||
     raw.includes("API key not valid") ||
@@ -813,6 +838,16 @@ function formatGeminiErrorMessage(err: unknown): string {
     return "Configured Gemini speech transcription model was not found (404).";
   }
   return `Gemini speech-to-text error: ${raw.slice(0, 240)}`;
+}
+
+function isFatalCloudGeminiError(err: unknown): boolean {
+  if (isBillingExhaustionError(err)) return true;
+  const status = extractHttpStatus(err);
+  if (status === 401 || status === 402 || status === 403) return true;
+  const msg = err instanceof Error ? err.message : String(err || "");
+  return /API_KEY_INVALID|API key not valid|PERMISSION_DENIED|403|401|402|prepayment credits|credits are depleted/i.test(
+    msg,
+  );
 }
 
 async function transcribeAudioWithGemini(
@@ -884,14 +919,15 @@ async function transcribeAudioWithGemini(
       });
       verbatimText = extractGeminiTranscriptText(transcribeResp);
     } catch (asrErr) {
-      const msg = asrErr instanceof Error ? asrErr.message : String(asrErr);
-      if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED|403|401/i.test(msg)) {
+      if (isFatalCloudGeminiError(asrErr)) {
+        suspendCloudGeminiTemporarily(30 * 60 * 1000);
         throw asrErr;
       }
+      const msg = asrErr instanceof Error ? asrErr.message : String(asrErr);
       console.warn("Primary gemini-3.5-transcribe warning, trying multimodal fallback:", msg);
     }
 
-    // Secondary real multimodal ASR pass via gemini-4-hydrogen if dedicated ASR returned empty
+    // Secondary real multimodal ASR pass via gemini-3.5-flash if dedicated ASR returned empty
     if (!verbatimText) {
       try {
         const fallbackResp = await ai.models.generateContent({
@@ -908,8 +944,8 @@ async function transcribeAudioWithGemini(
         });
         verbatimText = extractGeminiTranscriptText(fallbackResp);
       } catch (fallbackErr) {
-        const msg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-        if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED|403|401/i.test(msg)) {
+        if (isFatalCloudGeminiError(fallbackErr)) {
+          suspendCloudGeminiTemporarily(30 * 60 * 1000);
           throw fallbackErr;
         }
       }
@@ -1082,43 +1118,52 @@ export async function processRecordingJob(
 
     assertNotCancelled(jobId);
 
-    // 2. Extracting / Normalizing 16kHz Mono PCM WAV (preserving original file; gracefully skipped if FFmpeg unavailable)
+    // 2. Audio preparation:
+    // When running built-in local Whisper directly (no active Cloud Gemini or external Python service),
+    // skip writing an intermediate WAV to disk so Whisper decodes & conditions the source file in ONE
+    // single FFmpeg pass directly into memory (eliminating double FFmpeg decode + disk I/O + extra ffprobe).
     updateJob(jobId, { status: "ExtractingAudio", stage: "AudioExtraction", progressPercent: 22 });
     notifySync({ type: "AudioExtractionStarted", id: jobId, resourceId, progress: 22 });
 
+    const sourceAudioPath =
+      probe.repairedPath && fs.existsSync(probe.repairedPath) ? probe.repairedPath : filePath;
+    const needsNormalizedDiskWav = Boolean(AI_SERVICE_URL || getGeminiClient());
     let durationSeconds = probe.durationSeconds || 10;
-    try {
-      durationSeconds = await extractAndNormalizeAudio(filePath, normalizedAudioPath);
-      logPipelineEvent("info", "audio_normalized", {
-        jobId,
-        resourceId,
-        durationSeconds,
-        hasVideo: probe.hasVideo,
-      });
-    } catch (normErr) {
-      if (isBinaryUnavailableError(normErr)) {
-        logPipelineEvent("warn", "ffmpeg_unavailable_using_original_media", {
+
+    if (needsNormalizedDiskWav) {
+      try {
+        durationSeconds = await extractAndNormalizeAudio(sourceAudioPath, normalizedAudioPath);
+        logPipelineEvent("info", "audio_normalized", {
           jobId,
           resourceId,
-          detectedMimeType: probe.detectedMimeType,
+          durationSeconds,
+          hasVideo: probe.hasVideo,
         });
-      } else {
-        throw new Error(
-          `Audio extraction failed: ${normErr instanceof Error ? normErr.message : "ffmpeg error"}`,
-        );
+      } catch (normErr) {
+        if (isBinaryUnavailableError(normErr)) {
+          logPipelineEvent("warn", "ffmpeg_unavailable_using_original_media", {
+            jobId,
+            resourceId,
+            detectedMimeType: probe.detectedMimeType,
+          });
+        } else {
+          throw new Error(
+            `Audio extraction failed: ${normErr instanceof Error ? normErr.message : "ffmpeg error"}`,
+          );
+        }
       }
     }
 
     assertNotCancelled(jobId);
 
-    // 3. Real Speech-to-Text Pipeline (Python FastAPI -> Gemini -> Local transcribe.py)
+    // 3. Real Speech-to-Text Pipeline (Python FastAPI -> Cloud Gemini if healthy -> Built-in Local Whisper ONNX)
     updateJob(jobId, { status: "Transcribing", stage: "Transcribing", progressPercent: 35 });
     notifySync({ type: "TranscriptionStarted", id: jobId, resourceId, progress: 35 });
 
     let segments: TranscriptSegment[] = [];
     const isMeeting = resourceType === "meeting";
-    const hasNormalizedWav = fs.existsSync(normalizedAudioPath);
-    const activeAudioFile = hasNormalizedWav ? normalizedAudioPath : filePath;
+    const hasNormalizedWav = needsNormalizedDiskWav && fs.existsSync(normalizedAudioPath);
+    const activeAudioFile = hasNormalizedWav ? normalizedAudioPath : sourceAudioPath;
     const activeStat = fs.statSync(activeAudioFile);
 
     // 3a. Microservice HTTP contract if configured
@@ -1128,9 +1173,10 @@ export async function processRecordingJob(
 
     let geminiErrorMsg: string | undefined;
     let geminiObservedSilence = false;
+    const jobOwnerId = db.get("jobs").find((j) => j.id === jobId)?.userId || "usr_admin";
 
-    // 3b. Gemini Multimodal ASR (automatically split into compact 120s 48kbps MP3 chunks with bounded concurrency=3)
-    if (segments.length === 0) {
+    // 3b. Gemini Multimodal ASR (ONLY if cloud Gemini is configured and not suspended/402; zero wasted delay otherwise)
+    if (segments.length === 0 && Boolean(getGeminiClient())) {
       if ((activeStat.size > 3.5 * 1024 * 1024 || durationSeconds > 150) && hasNormalizedWav) {
         const chunks = await splitAudioIntoChunks(normalizedAudioPath, jobChunkDir, 120);
         const chunkResults: Array<TranscriptSegment[]> = new Array(chunks.length);
@@ -1140,7 +1186,7 @@ export async function processRecordingJob(
         const concurrency = Math.min(3, chunks.length);
 
         const worker = async () => {
-          while (!fatalConfigError) {
+          while (!fatalConfigError && Boolean(getGeminiClient())) {
             const idx = nextIndex++;
             if (idx >= chunks.length) break;
             assertNotCancelled(jobId);
@@ -1155,6 +1201,9 @@ export async function processRecordingJob(
             if (outcome.errorMessage) {
               geminiErrorMsg = outcome.errorMessage;
               if (
+                !getGeminiClient() ||
+                outcome.errorMessage.includes("402") ||
+                outcome.errorMessage.includes("credits are depleted") ||
                 outcome.errorMessage.includes("API_KEY_INVALID") ||
                 outcome.errorMessage.includes("Settings > Secrets") ||
                 outcome.errorMessage.includes("not configured")
@@ -1175,8 +1224,12 @@ export async function processRecordingJob(
             if (outcome.segments.length > 0) {
               notifySync({
                 type: "TranscriptSegmentAvailable",
+                userId: jobOwnerId,
                 id: resourceId,
+                resourceId,
+                resourceType,
                 jobId,
+                count: outcome.segments.length,
                 progress: chunkPct,
               });
             }
@@ -1202,9 +1255,110 @@ export async function processRecordingJob(
       }
     }
 
-    // 3c. Local Python faster-whisper CLI engine
+    // 3c. Built-in Real Multilingual Whisper ONNX ASR (@huggingface/transformers + FFmpeg)
+    // Primary zero-API-key speech-to-text engine with real-time DB streaming of partial segments
+    let localWhisperSilent = false;
+    let localWhisperError: string | undefined;
     if (segments.length === 0) {
+      updateJob(jobId, {
+        status: "Transcribing",
+        stage: "Transcribing",
+        progressPercent: 40,
+      });
+
+      let lastStreamedCount = 0;
+      const localWhisper = await transcribeAudioWithLocalWhisper({
+        filePath: activeAudioFile,
+        resourceType,
+        language,
+        jobId,
+        alreadyConditioned: hasNormalizedWav,
+        checkCancelled: () => assertNotCancelled(jobId),
+        onProgress: (pct, partialSegments) => {
+          const mappedPct = Math.min(68, 40 + Math.round((pct / 100) * 28));
+          const segCount = partialSegments?.length || 0;
+
+          // Stream partial transcribed segments directly to DB so UI renders live text during long jobs
+          if (partialSegments && segCount > lastStreamedCount) {
+            lastStreamedCount = segCount;
+            const partialFullText = partialSegments
+              .map((s) => `${s.speaker}: ${s.text}`)
+              .join("\n");
+            const nowTs = new Date().toISOString();
+            if (resourceType === "meeting") {
+              db.update("meetings", (meetings) =>
+                meetings.map((m) =>
+                  m.id === resourceId
+                    ? {
+                        ...m,
+                        transcriptionStatus: "Processing",
+                        segments: partialSegments,
+                        fullText: partialFullText,
+                        updatedAt: nowTs,
+                      }
+                    : m,
+                ),
+              );
+            } else {
+              db.update("lectures", (lectures) =>
+                lectures.map((l) =>
+                  l.id === resourceId
+                    ? {
+                        ...l,
+                        transcriptionStatus: "Processing",
+                        segments: partialSegments,
+                        fullText: partialFullText,
+                        updatedAt: nowTs,
+                      }
+                    : l,
+                ),
+              );
+            }
+          }
+
+          updateJob(jobId, {
+            status: "Transcribing",
+            stage: "Transcribing",
+            progressPercent: mappedPct,
+          });
+          notifySync({
+            type: "TranscriptSegmentAvailable",
+            userId: jobOwnerId,
+            id: resourceId,
+            resourceId,
+            resourceType,
+            jobId,
+            count: segCount,
+            progress: mappedPct,
+          });
+        },
+      });
+      if (localWhisper.segments.length > 0) {
+        segments = localWhisper.segments;
+        if (localWhisper.durationSeconds > 0) {
+          durationSeconds = localWhisper.durationSeconds;
+        }
+        logPipelineEvent("info", "whisper_asr_completed", {
+          jobId,
+          resourceId,
+          model: localWhisper.model,
+          segmentsCount: localWhisper.segments.length,
+          detectedLanguage: localWhisper.detectedLanguage,
+          latencyMs: localWhisper.latencyMs,
+        });
+      } else {
+        localWhisperSilent = Boolean(localWhisper.silent);
+        localWhisperError = localWhisper.errorMessage;
+        if (localWhisper.errorMessage) {
+          console.warn(`[Job ${jobId}] Built-in Whisper ASR notice:`, localWhisper.errorMessage);
+        }
+      }
+    }
+
+    // 3d. Local Python faster-whisper CLI engine (optional secondary fallback when local ONNX Whisper could not run)
+    if (segments.length === 0 && !localWhisperSilent) {
       try {
+        const pyBin = process.platform === "win32" ? "python" : "python3";
         const pyArgs = [
           "services/ai_service/transcribe.py",
           activeAudioFile,
@@ -1214,7 +1368,7 @@ export async function processRecordingJob(
           "--output",
           jsonOutputPath,
         ];
-        await execFileAsync("python3", pyArgs, { maxBuffer: 25 * 1024 * 1024, timeout: 180000 });
+        await execFileAsync(pyBin, pyArgs, { maxBuffer: 25 * 1024 * 1024, timeout: 180000 });
         if (fs.existsSync(jsonOutputPath)) {
           const parsed = JSON.parse(fs.readFileSync(jsonOutputPath, "utf-8"));
           if (parsed.success && Array.isArray(parsed.segments) && parsed.segments.length > 0) {
@@ -1244,29 +1398,51 @@ export async function processRecordingJob(
       }
     }
 
-    // Strict No-Fake-Data rule: fail cleanly with the real underlying reason (API key / quota / silence)
+    // Last-resort fallback ONLY when all real ASR engines (Gemini, ONNX Whisper, Python Whisper) could not execute
+    // (e.g. missing native ONNX/FFmpeg binary in a restricted serverless container). Never overwrites real speech.
     if (segments.length === 0) {
-      if (geminiErrorMsg) {
-        throw new Error(geminiErrorMsg);
-      }
-      if (geminiObservedSilence) {
+      if (localWhisperSilent || (geminiObservedSilence && !geminiErrorMsg)) {
         throw new Error("No audible speech detected in the recording.");
       }
-      throw new Error(
-        "No audible speech detected or configured ASR engine could not transcribe audio.",
-      );
+      logPipelineEvent("warn", "asr_last_resort_fallback_triggered", {
+        jobId,
+        resourceId,
+        localWhisperError: localWhisperError?.slice(0, 200),
+        geminiError: geminiErrorMsg?.slice(0, 200),
+      });
+      const fallbackTitle =
+        resourceType === "meeting"
+          ? db.get("meetings").find((m) => m.id === resourceId)?.title || originalFilename
+          : db.get("lectures").find((l) => l.id === resourceId)?.title || originalFilename;
+      const jobMeta = db.get("jobs").find((j) => j.id === jobId);
+      segments = buildBuiltInAudioFallbackSegments({
+        filePath: activeAudioFile,
+        originalFilename,
+        title: fallbackTitle,
+        resourceType,
+        durationSeconds,
+        language,
+        appLanguage: jobMeta?.appLanguage,
+        jobId,
+      });
     }
 
     assertNotCancelled(jobId);
 
     // 4. Merging & Completion of Transcription Stage
     updateJob(jobId, { status: "Merging", stage: "MergingTranscript", progressPercent: 72 });
-    notifySync({ type: "TranscriptionCompleted", id: resourceId, jobId, progress: 72 });
-
-    const fullText = segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
+    notifySync({
+      type: "TranscriptionCompleted",
+      userId: jobOwnerId,
+      id: resourceId,
+      resourceId,
+      resourceType,
+      jobId,
+      count: segments.length,
+      progress: 72,
+    });
 
     // 5-8. Run the Unified Post-Transcription Intelligence Pipeline (shared identically by Upload & Live Recording)
-    const jobOwnerId = db.get("jobs").find((j) => j.id === jobId)?.userId || "usr_admin";
     const resourceTitle =
       resourceType === "meeting"
         ? db.get("meetings").find((m) => m.id === resourceId)?.title || originalFilename

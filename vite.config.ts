@@ -56,6 +56,9 @@ export default defineConfig({
     preview: {
       allowedHosts: allowedPreviewHosts,
     },
+    ssr: {
+      external: ["@huggingface/transformers", "onnxruntime-node", "sharp"],
+    },
     build: {
       sourcemap: false,
       rollupOptions: {

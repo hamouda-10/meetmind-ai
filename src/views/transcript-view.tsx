@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
   FileText,
   Search,
@@ -32,6 +33,7 @@ import {
   CheckSquare,
   FileDown,
   Boxes,
+  Loader2,
 } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
 import { GlassCard } from "@/components/common/glass-card";
@@ -74,11 +76,28 @@ function formatTime(seconds: number): string {
 }
 
 export default function TranscriptView() {
-  const { t, language, isRtl } = useTranslation();
+  const { language, isRtl } = useTranslation();
   const isArabic = language === "AR";
   const queryClient = useQueryClient();
-  const [selectedId, setSelectedId] = useState<string>("");
-  const [activeTab, setActiveTab] = useState<string>("transcript");
+  const navigate = useNavigate();
+
+  // Reactively read ?id=, ?time=, ?tab= from TanStack Router location
+  const locationSearchStr = useRouterState({ select: (r) => r.location.searchStr });
+  const { urlId, urlTime, urlTab } = useMemo(() => {
+    const params = new URLSearchParams(locationSearchStr || "");
+    return {
+      urlId: params.get("id")?.trim() || "",
+      urlTime: params.get("time")?.trim() || "",
+      urlTab: params.get("tab")?.trim() || "",
+    };
+  }, [locationSearchStr]);
+
+  const [selectedId, setSelectedId] = useState<string>(() => urlId);
+  const [activeTab, setActiveTab] = useState<string>(() =>
+    urlTab === "transcript" || urlTab === "summary" || urlTab === "quiz" || urlTab === "analysis"
+      ? urlTab
+      : "transcript",
+  );
   const [viewMode, setViewMode] = useState<"continuous" | "segments">("continuous");
   const [searchQuery, setSearchQuery] = useState("");
   const [speakerFilter, setSpeakerFilter] = useState<string>("ALL");
@@ -110,19 +129,39 @@ export default function TranscriptView() {
   const [isGeneratingQuiz, setIsGeneratingQuiz] = useState(false);
   const [isGeneratingAnalysis, setIsGeneratingAnalysis] = useState(false);
   const [isRetryingAnalysis, setIsRetryingAnalysis] = useState(false);
+  const [isRetranscribing, setIsRetranscribing] = useState(false);
+  const [retranscribeProgress, setRetranscribeProgress] = useState<number | null>(null);
+  const retranscribePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [quizQuestionCount, setQuizQuestionCount] = useState<number>(5);
+
+  useEffect(() => {
+    return () => {
+      if (retranscribePollRef.current) {
+        clearInterval(retranscribePollRef.current);
+        retranscribePollRef.current = null;
+      }
+    };
+  }, []);
 
   // Quiz Interaction State
   const [userAnswers, setUserAnswers] = useState<Record<string, number>>({});
   const [quizSubmitted, setQuizSubmitted] = useState(false);
 
   // Fetch meetings and lectures
-  const { data: meetings = [], isLoading: loadingMeetings } = useQuery<Meeting[]>({
+  const {
+    data: meetings = [],
+    isLoading: loadingMeetings,
+    isFetching: fetchingMeetings,
+  } = useQuery<Meeting[]>({
     queryKey: ["meetings"],
     queryFn: () => api.getMeetings(),
   });
 
-  const { data: lectures = [], isLoading: loadingLectures } = useQuery<Lecture[]>({
+  const {
+    data: lectures = [],
+    isLoading: loadingLectures,
+    isFetching: fetchingLectures,
+  } = useQuery<Lecture[]>({
     queryKey: ["lectures"],
     queryFn: () => api.getLectures(),
   });
@@ -161,54 +200,117 @@ export default function TranscriptView() {
       })),
     ];
 
-    const extractTimestamp = (id: string) => {
+    const extractTimestamp = (id: string, fallbackDate?: string) => {
       const match = id.match(/_(\d{10,})/);
-      return match ? Number(match[1]) : 0;
+      if (match) return Number(match[1]);
+      return fallbackDate ? new Date(fallbackDate).getTime() || 0 : 0;
     };
 
-    return combined.sort((a, b) => extractTimestamp(b.id) - extractTimestamp(a.id));
+    return combined.sort(
+      (a, b) => extractTimestamp(b.id, b.item.date) - extractTimestamp(a.id, a.item.date),
+    );
   }, [meetings, lectures]);
 
-  // Read ?id= from URL search params on mount
+  // Reactively sync selectedId & activeTab whenever URL search params change
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      const urlId = new URLSearchParams(window.location.search).get("id");
-      if (urlId) {
+    if (urlId) {
+      setSelectedId(urlId);
+    }
+  }, [urlId]);
+
+  useEffect(() => {
+    if (
+      urlTab === "transcript" ||
+      urlTab === "summary" ||
+      urlTab === "quiz" ||
+      urlTab === "analysis"
+    ) {
+      setActiveTab(urlTab);
+    }
+  }, [urlTab, urlId]);
+
+  // Strictly match requested recording ID — NEVER hijack to allItems[0] while queries are loading/fetching!
+  const requestedId = selectedId || urlId;
+  const matchedSelection = requestedId ? allItems.find((a) => a.id === requestedId) || null : null;
+  const isWaitingForRequestedId = Boolean(
+    requestedId &&
+    !matchedSelection &&
+    (loadingMeetings || loadingLectures || fetchingMeetings || fetchingLectures),
+  );
+  const currentSelection =
+    matchedSelection || (isWaitingForRequestedId ? null : allItems[0] || null);
+
+  // Only settle fallback selection AFTER both meetings and lectures finish loading
+  useEffect(() => {
+    if (loadingMeetings || loadingLectures || fetchingMeetings || fetchingLectures) return;
+    if (allItems.length === 0) return;
+
+    if (urlId && allItems.some((a) => a.id === urlId)) {
+      if (selectedId !== urlId) {
         setSelectedId(urlId);
       }
+      return;
     }
-  }, []);
 
-  // Selected item
-  const currentSelection = allItems.find((a) => a.id === selectedId) || allItems[0] || null;
-
-  // Sync selectedId if invalid
-  useEffect(() => {
-    if (allItems.length > 0 && (!selectedId || !allItems.some((a) => a.id === selectedId))) {
-      const urlId =
-        typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("id") : "";
-      if (urlId && allItems.some((a) => a.id === urlId)) {
-        setSelectedId(urlId);
-      } else {
-        setSelectedId(allItems[0].id);
-      }
+    if (!selectedId || !allItems.some((a) => a.id === selectedId)) {
+      setSelectedId(allItems[0].id);
     }
-  }, [allItems, selectedId]);
+  }, [
+    allItems,
+    selectedId,
+    urlId,
+    loadingMeetings,
+    loadingLectures,
+    fetchingMeetings,
+    fetchingLectures,
+  ]);
+
+  const handleSelectRecording = (nextId: string) => {
+    setSelectedId(nextId);
+    const validTab =
+      activeTab === "transcript" ||
+      activeTab === "summary" ||
+      activeTab === "quiz" ||
+      activeTab === "analysis"
+        ? activeTab
+        : undefined;
+    void navigate({
+      to: "/transcript",
+      search: { id: nextId, tab: validTab },
+      replace: true,
+    });
+  };
 
   // Audio source URL
   const audioSrc = currentSelection ? `/api/v1/recordings/audio/${currentSelection.id}` : "";
 
-  // Reset audio playback on item change
+  // Reset ALL per-recording local UI state cleanly whenever selected recording changes
   useEffect(() => {
     setIsPlaying(false);
     setCurrentTime(0);
+    setAudioDuration(0);
     setAudioAvailable(true);
     setUserAnswers({});
     setQuizSubmitted(false);
+    setSearchQuery("");
+    setSpeakerFilter("ALL");
+    setEditingSegId(null);
+    setEditedText("");
+    setRenamingSpeaker(null);
+    setNewSpeakerName("");
+    lastScrolledSegIdRef.current = null;
+
+    if (retranscribePollRef.current) {
+      clearInterval(retranscribePollRef.current);
+      retranscribePollRef.current = null;
+      setIsRetranscribing(false);
+      setRetranscribeProgress(null);
+    }
 
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
+      audioRef.current.load();
     }
   }, [currentSelection?.id]);
 
@@ -316,24 +418,21 @@ export default function TranscriptView() {
     }
   };
 
-  // Check URL parameters for id and time seek on load or navigation
+  // Seek to ?time= once when the target recording is loaded
+  const lastSeekKeyRef = useRef<string>("");
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const params = new URLSearchParams(window.location.search);
-    const targetId = params.get("id");
-    const targetTime = params.get("time");
-    if (targetId && allItems.some((a) => a.id === targetId)) {
-      setSelectedId(targetId);
+    if (!urlTime || !currentSelection?.id) return;
+    const seekKey = `${currentSelection.id}:${urlTime}`;
+    if (lastSeekKeyRef.current === seekKey) return;
+    const parsed = parseFloat(urlTime);
+    if (!isNaN(parsed) && parsed >= 0) {
+      lastSeekKeyRef.current = seekKey;
+      const timer = setTimeout(() => {
+        jumpToTimestamp(parsed);
+      }, 450);
+      return () => clearTimeout(timer);
     }
-    if (targetTime) {
-      const parsed = parseFloat(targetTime);
-      if (!isNaN(parsed) && parsed >= 0) {
-        setTimeout(() => {
-          jumpToTimestamp(parsed);
-        }, 500);
-      }
-    }
-  }, [allItems]);
+  }, [urlTime, currentSelection?.id]);
 
   // Segments & Speakers
   const segments = useMemo(() => currentSelection?.item.segments || [], [currentSelection]);
@@ -370,8 +469,14 @@ export default function TranscriptView() {
       toast.success("تم حفظ التعديل النصي بنجاح");
       setEditingSegId(null);
     },
-    onError: () => {
-      toast.error("فشل في حفظ التعديل");
+    onError: (err) => {
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : isArabic
+            ? "فشل في حفظ التعديل"
+            : "Failed to save edit",
+      );
     },
   });
 
@@ -387,10 +492,16 @@ export default function TranscriptView() {
       }
       setRenamingSpeaker(null);
       setNewSpeakerName("");
-      toast.success("تم تحديث اسم المتحدث بنجاح");
+      toast.success(isArabic ? "تم تحديث اسم المتحدث بنجاح" : "Speaker renamed successfully");
     },
-    onError: () => {
-      toast.error("تعذر تحديث اسم المتحدث");
+    onError: (err) => {
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : isArabic
+            ? "تعذر تحديث اسم المتحدث"
+            : "Failed to rename speaker",
+      );
     },
   });
 
@@ -417,6 +528,7 @@ export default function TranscriptView() {
       toast.success("تم حذف التسجيل والملف الصوتي المرتبط بنجاح");
       setDeleteConfirmOpen(false);
       setSelectedId("");
+      void navigate({ to: "/transcript", search: {}, replace: true });
     },
     onError: (err) => {
       toast.error(err instanceof Error ? err.message : "فشل حذف التسجيل");
@@ -427,18 +539,33 @@ export default function TranscriptView() {
   const handleGenerateSummary = async () => {
     if (!currentSelection) return;
     setIsGeneratingSummary(true);
-    toast.loading("جاري توليد التلخيص الشامل الموثق باللغة العربية...", {
-      id: "summary-gen",
-    });
+    toast.loading(
+      isArabic
+        ? "جاري توليد التلخيص الشامل الموثق بالذكاء الاصطناعي المدمج..."
+        : "Generating comprehensive grounded summary...",
+      { id: "summary-gen" },
+    );
 
     try {
-      const res = await api.generateSummary(currentSelection.id, currentSelection.type);
-      queryClient.invalidateQueries({ queryKey: ["meetings"] });
-      queryClient.invalidateQueries({ queryKey: ["lectures"] });
-      toast.success("تم توليد وحفظ التلخيص الذكي بنجاح!", { id: "summary-gen" });
+      await api.generateSummary(currentSelection.id, currentSelection.type);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["meetings"] }),
+        queryClient.invalidateQueries({ queryKey: ["lectures"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] }),
+      ]);
+      toast.success(
+        isArabic ? "تم توليد وحفظ التلخيص الذكي بنجاح!" : "Summary generated and saved!",
+        { id: "summary-gen" },
+      );
       setActiveTab("summary");
     } catch (e) {
-      toast.error("تعذر توليد التلخيص بواسطة الذكاء الاصطناعي", { id: "summary-gen" });
+      const msg =
+        e instanceof Error && e.message
+          ? e.message
+          : isArabic
+            ? "تعذر توليد التلخيص بواسطة الذكاء الاصطناعي"
+            : "Failed to generate summary";
+      toast.error(msg, { id: "summary-gen" });
     } finally {
       setIsGeneratingSummary(false);
     }
@@ -448,19 +575,36 @@ export default function TranscriptView() {
   const handleGenerateQuiz = async () => {
     if (!currentSelection) return;
     setIsGeneratingQuiz(true);
-    toast.loading("جاري بناء وتنسيق أسئلة الكويز التفاعلي من المحاضرة...", {
-      id: "quiz-gen",
-    });
+    toast.loading(
+      isArabic
+        ? `جاري بناء وتنسيق ${quizQuestionCount} أسئلة كويز تفاعلي من الجلسة...`
+        : `Building ${quizQuestionCount} grounded quiz questions...`,
+      { id: "quiz-gen" },
+    );
 
     try {
       await api.generateQuiz(currentSelection.id, currentSelection.type, quizQuestionCount);
-      queryClient.invalidateQueries({ queryKey: ["quizzes"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["quizzes"] }),
+        queryClient.invalidateQueries({ queryKey: ["meetings"] }),
+        queryClient.invalidateQueries({ queryKey: ["lectures"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] }),
+      ]);
       setUserAnswers({});
       setQuizSubmitted(false);
-      toast.success("تم إنشاء الكويز التقييمي بنجاح!", { id: "quiz-gen" });
+      toast.success(
+        isArabic ? "تم إنشاء الكويز التقييمي بنجاح!" : "Interactive quiz generated successfully!",
+        { id: "quiz-gen" },
+      );
       setActiveTab("quiz");
     } catch (e) {
-      toast.error("تعذر إنشاء الكويز بواسطة الذكاء الاصطناعي", { id: "quiz-gen" });
+      const msg =
+        e instanceof Error && e.message
+          ? e.message
+          : isArabic
+            ? "تعذر إنشاء الكويز بواسطة الذكاء الاصطناعي"
+            : "Failed to generate quiz";
+      toast.error(msg, { id: "quiz-gen" });
     } finally {
       setIsGeneratingQuiz(false);
     }
@@ -470,20 +614,124 @@ export default function TranscriptView() {
   const handleGenerateAnalysis = async () => {
     if (!currentSelection) return;
     setIsGeneratingAnalysis(true);
-    toast.loading("جاري تحليل المحتوى واستخراج المصطلحات والأسئلة...", {
-      id: "analysis-gen",
-    });
+    toast.loading(
+      isArabic
+        ? "جاري تحليل المحتوى واستخراج المصطلحات والأسئلة..."
+        : "Analyzing content, keywords, and key concepts...",
+      { id: "analysis-gen" },
+    );
 
     try {
       await api.generateAnalysis(currentSelection.id, currentSelection.type);
-      queryClient.invalidateQueries({ queryKey: ["meetings"] });
-      queryClient.invalidateQueries({ queryKey: ["lectures"] });
-      toast.success("تم تحديث التحليل الذكي للمحاضرة بنجاح!", { id: "analysis-gen" });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["meetings"] }),
+        queryClient.invalidateQueries({ queryKey: ["lectures"] }),
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] }),
+      ]);
+      toast.success(
+        isArabic ? "تم تحديث التحليل الذكي للجلسة بنجاح!" : "Deep analysis updated successfully!",
+        { id: "analysis-gen" },
+      );
       setActiveTab("analysis");
     } catch (e) {
-      toast.error("تعذر تحليل المحاضرة", { id: "analysis-gen" });
+      const msg =
+        e instanceof Error && e.message
+          ? e.message
+          : isArabic
+            ? "تعذر تحليل الجلسة"
+            : "Failed to generate analysis";
+      toast.error(msg, { id: "analysis-gen" });
     } finally {
       setIsGeneratingAnalysis(false);
+    }
+  };
+
+  // Re-transcribe original audio with Built-in Whisper AI
+  const handleRetranscribeWithWhisper = async () => {
+    if (!currentSelection || isRetranscribing) return;
+    setIsRetranscribing(true);
+    setRetranscribeProgress(5);
+    const toastId = "retranscribe-whisper";
+    toast.loading(
+      isArabic
+        ? "جاري إعادة التفريغ الصوتي بدقة عالية عبر Whisper AI..."
+        : "Starting fresh transcription with built-in Whisper AI...",
+      { id: toastId },
+    );
+
+    try {
+      const res = await api.reprocessRecording(currentSelection.id);
+      if (retranscribePollRef.current) {
+        clearInterval(retranscribePollRef.current);
+      }
+
+      let lastCount = 0;
+      retranscribePollRef.current = setInterval(async () => {
+        try {
+          const job = await api.getJob(res.jobId);
+          setRetranscribeProgress(job.progressPercent || 10);
+
+          if (
+            typeof job.partialSegmentsCount === "number" &&
+            job.partialSegmentsCount > lastCount
+          ) {
+            lastCount = job.partialSegmentsCount;
+            void queryClient.invalidateQueries({ queryKey: ["meetings"] });
+            void queryClient.invalidateQueries({ queryKey: ["lectures"] });
+          }
+
+          if (job.status === "Completed") {
+            if (retranscribePollRef.current) {
+              clearInterval(retranscribePollRef.current);
+              retranscribePollRef.current = null;
+            }
+            setIsRetranscribing(false);
+            setRetranscribeProgress(null);
+            await Promise.all([
+              queryClient.invalidateQueries({ queryKey: ["meetings"] }),
+              queryClient.invalidateQueries({ queryKey: ["lectures"] }),
+              queryClient.invalidateQueries({ queryKey: ["quizzes"] }),
+              queryClient.invalidateQueries({ queryKey: ["flashcards"] }),
+              queryClient.invalidateQueries({ queryKey: ["mindmaps"] }),
+              queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+              queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] }),
+            ]);
+            toast.success(
+              isArabic
+                ? "اكتملت إعادة التفريغ الصوتي بـ Whisper AI وتحديث التحليل بنجاح!"
+                : "Re-transcription with Whisper AI and analysis completed!",
+              { id: toastId },
+            );
+          } else if (job.status === "Failed" || job.status === "Cancelled") {
+            if (retranscribePollRef.current) {
+              clearInterval(retranscribePollRef.current);
+              retranscribePollRef.current = null;
+            }
+            setIsRetranscribing(false);
+            setRetranscribeProgress(null);
+            toast.error(
+              job.errorMessage ||
+                (isArabic
+                  ? "فشلت إعادة التفريغ الصوتي بـ Whisper"
+                  : "Whisper re-transcription failed"),
+              { id: toastId },
+            );
+          }
+        } catch {
+          // keep polling briefly until job settles
+        }
+      }, 1200);
+    } catch (e) {
+      setIsRetranscribing(false);
+      setRetranscribeProgress(null);
+      const msg =
+        e instanceof Error && e.message
+          ? e.message
+          : isArabic
+            ? "تعذر بدء إعادة التفريغ الصوتي. تأكد من وجود الملف الصوتي."
+            : "Failed to start Whisper re-transcription.";
+      toast.error(msg, { id: toastId });
     }
   };
 
@@ -506,40 +754,58 @@ export default function TranscriptView() {
   const handleRetryAnalysis = async () => {
     if (!currentSelection) return;
     setIsRetryingAnalysis(true);
-    toast.loading("جاري إعادة محاولة التحليل الذكي للذكاء الاصطناعي...", { id: "retry-analysis" });
+    toast.loading(
+      isArabic
+        ? "جاري إعادة محاولة التحليل الذكي بالذكاء الاصطناعي المدمج..."
+        : "Retrying unified AI analysis...",
+      { id: "retry-analysis" },
+    );
     try {
       const res = await api.retryAnalysis(currentSelection.id, currentSelection.type);
-      queryClient.invalidateQueries({ queryKey: ["meetings"] });
-      queryClient.invalidateQueries({ queryKey: ["lectures"] });
-      queryClient.invalidateQueries({ queryKey: ["quizzes"] });
-      queryClient.invalidateQueries({ queryKey: ["flashcards"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["meetings"] }),
+        queryClient.invalidateQueries({ queryKey: ["lectures"] }),
+        queryClient.invalidateQueries({ queryKey: ["quizzes"] }),
+        queryClient.invalidateQueries({ queryKey: ["flashcards"] }),
+        queryClient.invalidateQueries({ queryKey: ["mindmaps"] }),
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] }),
+      ]);
 
       if (res.analysisStatus === "Completed") {
-        toast.success("تم إكمال التحليل الذكي بنجاح وتوليد الملخص والكويز!", {
-          id: "retry-analysis",
-        });
-        setActiveTab("summary");
-      } else if (res.analysisStatus === "Unavailable") {
-        toast.error(
-          res.analysisError ||
-            "الخدمة تشهد ضغطاً عالياً حالياً (HTTP 503 UNAVAILABLE). يمكنك المحاولة مرة أخرى لاحقاً.",
+        toast.success(
+          isArabic
+            ? "تم إكمال التحليل الذكي بنجاح وتوليد الملخص والكويز!"
+            : "AI analysis completed and summary & quiz updated!",
           { id: "retry-analysis" },
         );
+        setActiveTab("summary");
       } else {
-        toast.error(res.analysisError || "تعذر إكمال التحليل الذكي", { id: "retry-analysis" });
+        toast.error(
+          res.analysisError ||
+            (isArabic ? "تعذر إكمال التحليل الذكي" : "Failed to complete AI analysis"),
+          { id: "retry-analysis" },
+        );
       }
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "تعذرت إعادة محاولة التحليل", {
-        id: "retry-analysis",
-      });
+      toast.error(
+        e instanceof Error && e.message
+          ? e.message
+          : isArabic
+            ? "تعذرت إعادة محاولة التحليل"
+            : "Failed to retry analysis",
+        { id: "retry-analysis" },
+      );
     } finally {
       setIsRetryingAnalysis(false);
     }
   };
 
-  // Find linked quiz
+  // Find linked quiz strictly for the active recording
   const currentQuiz = allQuizzes.find(
-    (q) => q.lectureId === currentSelection?.id || q.meetingId === currentSelection?.id,
+    (q) =>
+      Boolean(currentSelection?.id) &&
+      (q.lectureId === currentSelection?.id || q.meetingId === currentSelection?.id),
   );
 
   // Copy transcript text
@@ -728,16 +994,28 @@ export default function TranscriptView() {
   // Active item's summary text
   const currentSummary =
     currentSelection?.type === "meeting"
-      ? (currentSelection.item as Meeting).summary
-      : (currentSelection?.item as Lecture).studyNotes;
+      ? (currentSelection.item as Meeting).summary ||
+        (currentSelection.item as Meeting).detailedSummary ||
+        (currentSelection.item as Meeting).executiveSummary
+      : (currentSelection?.item as Lecture)?.studyNotes ||
+        (currentSelection?.item as Lecture)?.summary ||
+        (currentSelection?.item as Lecture)?.detailedSummary;
 
   // Active item's analysis
   const currentAnalysis = currentSelection?.item.analysis;
 
   return (
     <div className="space-y-6" dir={isRtl ? "rtl" : "ltr"}>
-      {/* Hidden native HTML audio element */}
-      {audioSrc && <audio ref={audioRef} src={audioSrc} preload="metadata" className="hidden" />}
+      {/* Hidden native HTML audio element (keyed by recording ID so audio always reloads cleanly) */}
+      {audioSrc && (
+        <audio
+          key={currentSelection?.id || "none"}
+          ref={audioRef}
+          src={audioSrc}
+          preload="metadata"
+          className="hidden"
+        />
+      )}
 
       <PageHeader
         eyebrow={isArabic ? "استوديو الذكاء الاصطناعي" : "AI Speech & Lecture Studio"}
@@ -788,8 +1066,15 @@ export default function TranscriptView() {
         }
       />
 
-      {/* When no recordings exist at all: Genuine Clean Empty State */}
-      {allItems.length === 0 && !loadingMeetings && !loadingLectures ? (
+      {/* Loading requested recording from URL ?id= without flashing wrong item */}
+      {isWaitingForRequestedId ? (
+        <GlassCard className="my-8 p-12 flex flex-col items-center justify-center gap-3 text-center">
+          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+          <p className="text-sm font-medium text-muted-foreground">
+            {isArabic ? "جاري تحميل بيانات الجلسة المحددة..." : "Loading selected recording..."}
+          </p>
+        </GlassCard>
+      ) : allItems.length === 0 && !loadingMeetings && !loadingLectures ? (
         <EmptyState
           icon={Mic}
           title={isArabic ? "لا توجد أي تسجيلات أو محاضرات بعد" : "No recordings or lectures yet"}
@@ -826,10 +1111,7 @@ export default function TranscriptView() {
               <span className="text-xs font-semibold text-muted-foreground whitespace-nowrap">
                 {isArabic ? "الجلسة المحددة:" : "Selected Session:"}
               </span>
-              <Select
-                value={selectedId || (allItems[0]?.id ?? "")}
-                onValueChange={(val) => setSelectedId(val)}
-              >
+              <Select value={currentSelection?.id ?? ""} onValueChange={handleSelectRecording}>
                 <SelectTrigger
                   className={`w-full md:w-96 bg-background/60 ${isRtl ? "text-right" : "text-left"}`}
                 >
@@ -1148,8 +1430,8 @@ export default function TranscriptView() {
                 <Sparkles className="h-4 w-4 text-primary animate-spin" />
                 <span className="text-xs font-medium">
                   {isArabic
-                    ? "جاري تشغيل المعالجة والتحليل الذكي بواسطة Gemini AI في الخلفية..."
-                    : "Gemini AI processing and analysis running in background..."}
+                    ? "جاري تشغيل المعالجة والتحليل الذكي عبر الذكاء الاصطناعي المدمج في الخلفية..."
+                    : "Built-in AI processing and analysis running in background..."}
                 </span>
               </div>
               <span className="text-[11px] text-muted-foreground">
@@ -1175,6 +1457,35 @@ export default function TranscriptView() {
                 </span>
               </div>
               <div className="flex flex-wrap items-center gap-2">
+                {/* 0. إعادة التفريغ الصوتي بـ Whisper */}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleRetranscribeWithWhisper}
+                  disabled={isRetranscribing || !audioAvailable}
+                  className="cursor-pointer text-xs gap-1.5 border-amber-500/40 hover:border-amber-400 hover:bg-amber-500/10"
+                  title={
+                    !audioAvailable
+                      ? isArabic
+                        ? "الملف الصوتي غير متاح على القرص لإعادة التفريغ"
+                        : "Original audio file is not available on disk"
+                      : isArabic
+                        ? "إعادة التفريغ الصوتي من الملف الأصلي باستخدام Whisper AI المدمج"
+                        : "Re-transcribe original audio from scratch using Built-in Whisper AI"
+                  }
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 text-amber-500 ${isRetranscribing ? "animate-spin" : ""}`}
+                  />
+                  {isRetranscribing
+                    ? isArabic
+                      ? `جاري التفريغ (${retranscribeProgress ?? 0}%)...`
+                      : `Transcribing (${retranscribeProgress ?? 0}%)...`
+                    : isArabic
+                      ? "إعادة التفريغ الصوتي بـ Whisper"
+                      : "Re-transcribe with Whisper AI"}
+                </Button>
+
                 {/* 1. تلخيص النص */}
                 <Button
                   size="sm"
@@ -2365,7 +2676,7 @@ export default function TranscriptView() {
         onCompleted={(resourceId) => {
           queryClient.invalidateQueries({ queryKey: ["meetings"] });
           queryClient.invalidateQueries({ queryKey: ["lectures"] });
-          setSelectedId(resourceId);
+          handleSelectRecording(resourceId);
         }}
       />
 
@@ -2376,7 +2687,7 @@ export default function TranscriptView() {
         onUploaded={(resourceId) => {
           queryClient.invalidateQueries({ queryKey: ["meetings"] });
           queryClient.invalidateQueries({ queryKey: ["lectures"] });
-          setSelectedId(resourceId);
+          handleSelectRecording(resourceId);
         }}
       />
     </div>
@@ -2402,6 +2713,116 @@ function highlightQuery(text: string, query: string) {
   );
 }
 
+function renderSummaryInline(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const tokenRegex = /(`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let keyIdx = 0;
+
+  while ((match = tokenRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index).replace(/\*\*/g, ""));
+    }
+    const token = match[0];
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(
+        <code
+          key={`sc-${keyIdx++}`}
+          className="rounded bg-secondary/80 border border-border/60 px-1 py-0.5 font-mono text-xs text-primary"
+        >
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else {
+      nodes.push(
+        <strong key={`sb-${keyIdx++}`} className="font-bold text-foreground">
+          {token.slice(2, -2)}
+        </strong>,
+      );
+    }
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex).replace(/\*\*/g, ""));
+  }
+
+  return nodes;
+}
+
+function renderSummaryBody(content: string): ReactNode {
+  const lines = content.split(/\r?\n/);
+  const nodes: ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    const subHeading = trimmed.match(/^#{3,4}\s+(.+)$/);
+    if (subHeading) {
+      nodes.push(
+        <h5 key={`sh-${key++}`} className="mt-2 font-semibold text-foreground text-sm">
+          {renderSummaryInline(subHeading[1].trim())}
+        </h5>,
+      );
+      i++;
+      continue;
+    }
+
+    if (/^\s*[-*•]\s+/.test(line)) {
+      const bullets: string[] = [];
+      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
+        bullets.push(lines[i].replace(/^\s*[-*•]\s+/, "").trim());
+        i++;
+      }
+      nodes.push(
+        <ul key={`sul-${key++}`} className="list-disc space-y-1.5 ps-5">
+          {bullets.map((b, bIdx) => (
+            <li key={bIdx} className="leading-relaxed">
+              {renderSummaryInline(b)}
+            </li>
+          ))}
+        </ul>,
+      );
+      continue;
+    }
+
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+[.)]\s+/, "").trim());
+        i++;
+      }
+      nodes.push(
+        <ol key={`sol-${key++}`} className="list-decimal space-y-1.5 ps-5">
+          {items.map((item, idx) => (
+            <li key={idx} className="leading-relaxed">
+              {renderSummaryInline(item)}
+            </li>
+          ))}
+        </ol>,
+      );
+      continue;
+    }
+
+    nodes.push(
+      <p key={`sp-${key++}`} className="leading-relaxed">
+        {renderSummaryInline(trimmed)}
+      </p>,
+    );
+    i++;
+  }
+
+  return <div className="space-y-2">{nodes}</div>;
+}
+
 // Helper to render the structured sections
 function renderSummarySections(markdown: string, isRtl: boolean = true) {
   if (!markdown) return null;
@@ -2414,9 +2835,9 @@ function renderSummarySections(markdown: string, isRtl: boolean = true) {
     return (
       <GlassCard className={`p-6 ${isRtl ? "text-right" : "text-left"} space-y-3`}>
         <div
-          className={`prose prose-sm dark:prose-invert max-w-none ${isRtl ? "text-right" : "text-left"} leading-relaxed font-sans whitespace-pre-wrap`}
+          className={`prose prose-sm dark:prose-invert max-w-none ${isRtl ? "text-right" : "text-left"} leading-relaxed font-sans select-text`}
         >
-          {markdown}
+          {renderSummaryBody(markdown.replace(/^#\s+/gm, "### "))}
         </div>
       </GlassCard>
     );
@@ -2424,7 +2845,10 @@ function renderSummarySections(markdown: string, isRtl: boolean = true) {
 
   return sections.map((sec, idx) => {
     const lines = sec.trim().split("\n");
-    const rawHeader = lines[0].replace(/^##\s*/, "").trim();
+    const rawHeader = lines[0]
+      .replace(/^##\s*/, "")
+      .replace(/\*\*/g, "")
+      .trim();
     const content = lines.slice(1).join("\n").trim();
 
     return (
@@ -2440,8 +2864,8 @@ function renderSummarySections(markdown: string, isRtl: boolean = true) {
             <Sparkles className="h-4 w-4 text-primary" />
           </h4>
         </div>
-        <div className="text-sm text-foreground/90 leading-relaxed font-sans whitespace-pre-wrap select-text">
-          {content}
+        <div className="text-sm text-foreground/90 leading-relaxed font-sans select-text">
+          {renderSummaryBody(content)}
         </div>
       </GlassCard>
     );
