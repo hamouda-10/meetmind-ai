@@ -94,11 +94,17 @@ export function CentralMicCore({ isArabic, onActivateMic, className = "" }: Cent
   const micCapsuleRef = useRef<HTMLButtonElement | null>(null);
 
   const audioSystemMode = useUIStore((s) => s.audioSystemMode);
+  const resolvedTheme = useUIStore((s) => s.resolvedTheme);
   const modeRef = useRef<AudioSystemMode>(audioSystemMode);
+  const themeRef = useRef(resolvedTheme);
 
   useEffect(() => {
     modeRef.current = audioSystemMode;
   }, [audioSystemMode]);
+
+  useEffect(() => {
+    themeRef.current = resolvedTheme;
+  }, [resolvedTheme]);
 
   useEffect(() => {
     const container = rootRef.current;
@@ -295,29 +301,35 @@ export function CentralMicCore({ isArabic, onActivateMic, className = "" }: Cent
       const cx = width * 0.5;
       const cy = height * 0.5;
 
-      // LAYER 1: Volumetric Ambient Gold Glow & Soft Bloom
+      // Theme-reactive palette read from ref (zero React re-renders, zero canvas teardown)
+      const activeTheme = themeRef.current;
+      const isSkyBlue = activeTheme === "sky-blue";
+      const isPureWhite = activeTheme === "pure-white";
+      const pLight = isSkyBlue ? "56, 189, 248" : isPureWhite ? "75, 85, 99" : "255, 243, 176";
+      const pMid = isSkyBlue ? "2, 132, 199" : isPureWhite ? "17, 17, 17" : "212, 175, 55";
+      const pSoft = isSkyBlue ? "6, 182, 212" : isPureWhite ? "107, 114, 128" : "245, 215, 127";
+      const pDeep = isSkyBlue ? "3, 105, 161" : isPureWhite ? "55, 65, 81" : "184, 134, 11";
+      const pEdge = isSkyBlue
+        ? "rgba(244, 250, 255, 0)"
+        : isPureWhite
+          ? "rgba(255, 255, 255, 0)"
+          : "rgba(10, 10, 12, 0)";
+      const pWarm = isSkyBlue ? "2, 132, 199" : isPureWhite ? "17, 17, 17" : "255, 250, 224";
+
+      // LAYER 1: Volumetric Ambient Glow & Soft Bloom
       const outerBloomRadius = Math.min(width, height) * (0.44 + smoothedEnergy * 0.12);
       const bloomGrad = ctx.createRadialGradient(cx, cy, 6, cx, cy, outerBloomRadius);
-      bloomGrad.addColorStop(
-        0,
-        `rgba(245, 215, 127, ${(0.22 + smoothedEnergy * 0.26).toFixed(3)})`,
-      );
-      bloomGrad.addColorStop(
-        0.38,
-        `rgba(212, 175, 55, ${(0.1 + smoothedEnergy * 0.14).toFixed(3)})`,
-      );
-      bloomGrad.addColorStop(
-        0.72,
-        `rgba(184, 134, 11, ${(0.03 + smoothedEnergy * 0.05).toFixed(3)})`,
-      );
-      bloomGrad.addColorStop(1, "rgba(10, 10, 12, 0)");
+      bloomGrad.addColorStop(0, `rgba(${pSoft}, ${(0.22 + smoothedEnergy * 0.26).toFixed(3)})`);
+      bloomGrad.addColorStop(0.38, `rgba(${pMid}, ${(0.1 + smoothedEnergy * 0.14).toFixed(3)})`);
+      bloomGrad.addColorStop(0.72, `rgba(${pDeep}, ${(0.03 + smoothedEnergy * 0.05).toFixed(3)})`);
+      bloomGrad.addColorStop(1, pEdge);
 
       ctx.fillStyle = bloomGrad;
       ctx.beginPath();
       ctx.arc(cx, cy, outerBloomRadius, 0, Math.PI * 2);
       ctx.fill();
 
-      // LAYER 2: Radial Energy Waves (Expanding Concentric Gold Ripples)
+      // LAYER 2: Radial Energy Waves (Expanding Concentric Ripples)
       const rippleSpeedBoost = 1 + smoothedEnergy * 1.9;
       const minRippleR = 26;
       const maxRippleR = Math.min(width, height) * 0.46;
@@ -328,7 +340,7 @@ export function CentralMicCore({ isArabic, onActivateMic, className = "" }: Cent
         const r = minRippleR + rp.progress * (maxRippleR - minRippleR);
         const fade = Math.sin(rp.progress * Math.PI) * (0.22 + smoothedEnergy * 0.25);
 
-        ctx.strokeStyle = `rgba(212, 175, 55, ${fade.toFixed(3)})`;
+        ctx.strokeStyle = `rgba(${pMid}, ${fade.toFixed(3)})`;
         ctx.lineWidth = 1.0;
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -373,8 +385,8 @@ export function CentralMicCore({ isArabic, onActivateMic, className = "" }: Cent
         const barAlpha = 0.28 + smoothedSpectrum[i] * 0.62;
         ctx.strokeStyle =
           smoothedSpectrum[i] > 0.45
-            ? `rgba(255, 243, 176, ${barAlpha.toFixed(3)})`
-            : `rgba(212, 175, 55, ${barAlpha.toFixed(3)})`;
+            ? `rgba(${pLight}, ${barAlpha.toFixed(3)})`
+            : `rgba(${pMid}, ${barAlpha.toFixed(3)})`;
         ctx.lineWidth = tier === "mobile" ? 1.5 : 1.35;
         ctx.lineCap = "round";
         ctx.beginPath();
@@ -401,7 +413,7 @@ export function CentralMicCore({ isArabic, onActivateMic, className = "" }: Cent
         else ctx.lineTo(px, py);
       }
       ctx.closePath();
-      ctx.strokeStyle = `rgba(245, 215, 127, ${(0.35 + smoothedEnergy * 0.4).toFixed(3)})`;
+      ctx.strokeStyle = `rgba(${pSoft}, ${(0.35 + smoothedEnergy * 0.4).toFixed(3)})`;
       ctx.lineWidth = 1.15;
       ctx.stroke();
 
@@ -418,12 +430,9 @@ export function CentralMicCore({ isArabic, onActivateMic, className = "" }: Cent
           cx + scanHalfWidth,
           scanY,
         );
-        scanGrad.addColorStop(0, "rgba(212, 175, 55, 0)");
-        scanGrad.addColorStop(
-          0.5,
-          `rgba(255, 243, 176, ${(0.18 + smoothedEnergy * 0.2).toFixed(3)})`,
-        );
-        scanGrad.addColorStop(1, "rgba(212, 175, 55, 0)");
+        scanGrad.addColorStop(0, `rgba(${pMid}, 0)`);
+        scanGrad.addColorStop(0.5, `rgba(${pLight}, ${(0.18 + smoothedEnergy * 0.2).toFixed(3)})`);
+        scanGrad.addColorStop(1, `rgba(${pMid}, 0)`);
         ctx.strokeStyle = scanGrad;
         ctx.lineWidth = 0.9;
         ctx.beginPath();
@@ -459,8 +468,10 @@ export function CentralMicCore({ isArabic, onActivateMic, className = "" }: Cent
         const alpha = Math.min(0.92, p.baseAlpha * fadeCycle * (0.85 + smoothedEnergy * 0.6));
 
         ctx.fillStyle = p.warmWhite
-          ? `rgba(255, 250, 224, ${alpha.toFixed(3)})`
-          : `rgba(212, 175, 55, ${alpha.toFixed(3)})`;
+          ? `rgba(${pWarm}, ${alpha.toFixed(3)})`
+          : isSkyBlue && i % 2 === 1
+            ? `rgba(${pSoft}, ${alpha.toFixed(3)})`
+            : `rgba(${pMid}, ${alpha.toFixed(3)})`;
         ctx.beginPath();
         ctx.arc(px, py, p.size, 0, Math.PI * 2);
         ctx.fill();

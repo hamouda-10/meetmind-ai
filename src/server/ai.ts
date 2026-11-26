@@ -5,9 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { ThinkingLevel } from "@google/genai";
+import { z } from "zod";
 import { db, TranscriptSegment, MindMapNode } from "./db";
 import { getDataDir } from "./storage";
+import { transcribeAudioWithLocalWhisper } from "./whisper-asr";
 import {
+  categorizeAiError,
   executeWithRetryAndFallback,
   getGeminiConfig,
   GeminiPipelineError,
@@ -20,20 +23,29 @@ import {
   suspendCloudGeminiTemporarily,
 } from "./gemini";
 import {
+  buildConversationalIdentityReply,
+  buildSmartChatContext,
+  type ChatScope,
+} from "./chat-context";
+import {
   answerBuiltInChat,
   buildBuiltInSummary,
   buildBuiltInLectureAnalysis,
   buildBuiltInFlashcards,
   buildBuiltInMindMap,
   buildBuiltInQuiz,
-  detectIsArabic,
   normalizeText,
   retrieveRelevantSegmentsBM25,
   selectHighSignalSegments,
-  tryAnswerIdentityQuery,
   trySolveMathQuery,
 } from "./builtin-ai";
-import { generateLocalLlmJson, generateLocalLlmText, getLocalLlmModelId } from "./local-llm";
+import {
+  extractJsonFromLlmOutput,
+  generateLocalLlmJson,
+  generateLocalLlmText,
+  generateLocalLlmTextStream,
+  getLocalLlmModelId,
+} from "./local-llm";
 
 const execFileAsync = promisify(execFile);
 const geminiConfig = getGeminiConfig();
@@ -42,7 +54,145 @@ const FALLBACK_TEXT_MODEL = geminiConfig.fallbackTextModel;
 const ASR_MODEL = geminiConfig.asrModel;
 const FALLBACK_ASR_MODEL = geminiConfig.fallbackAsrModel;
 
-const PROMPT_VERSION = 4;
+const PROMPT_VERSION = 5;
+
+// ============================================================================
+// ZOD STRUCTURED AI RESPONSE SCHEMAS & VALIDATE → REPAIR → VALIDATE PIPELINE
+// ============================================================================
+const AiSummaryZodSchema = z.object({
+  executiveSummary: z.string().min(10).optional(),
+  detailedSummary: z.string().min(10).optional(),
+  keyPoints: z.array(z.string()).default([]),
+  decisions: z.array(z.string()).default([]),
+  actionItems: z
+    .array(
+      z.object({
+        title: z.string().min(2),
+        ownerName: z.string().nullable().optional(),
+        dueDate: z.string().nullable().optional(),
+        sourceTimestamp: z.string().nullable().optional(),
+        priority: z.string().optional(),
+      }),
+    )
+    .default([]),
+});
+
+const AiLectureAnalysisZodSchema = z.object({
+  overview: z.string().optional(),
+  topics: z.array(z.string()).default([]),
+  keywords: z.array(z.string()).default([]),
+  definitions: z
+    .array(
+      z.object({
+        term: z.string().min(1),
+        definition: z.string().min(1),
+        timestamp: z.string().optional(),
+      }),
+    )
+    .default([]),
+  questionsAsked: z
+    .array(
+      z.object({
+        question: z.string().min(1),
+        answer: z.string().nullable().optional(),
+        timestamp: z.string().optional(),
+      }),
+    )
+    .default([]),
+  actionItems: z
+    .array(
+      z.object({
+        task: z.string().min(1),
+        owner: z.string().nullable().optional(),
+        deadline: z.string().nullable().optional(),
+      }),
+    )
+    .default([]),
+  emphasizedPoints: z.array(z.string()).default([]),
+  importantSentences: z.array(z.string()).default([]),
+  reviewAreas: z.array(z.string()).default([]),
+});
+
+const AiQuizItemZodSchema = z.object({
+  question: z.string().min(5),
+  type: z.enum(["multiple_choice", "true_false", "short_answer", "fill_in_the_blank"]).optional(),
+  options: z.array(z.string()).optional(),
+  correctOptionIndex: z.number().int().optional(),
+  correctAnswerText: z.string().optional(),
+  acceptableAnswers: z.array(z.string()).optional(),
+  explanation: z.string().optional(),
+  difficulty: z.string().optional(),
+  sectionRef: z.string().optional(),
+  timestampRef: z.string().optional(),
+  sourceTranscriptSegment: z.string().optional(),
+});
+
+const AiQuizArrayZodSchema = z.array(AiQuizItemZodSchema).min(1);
+
+const AiFlashcardsZodSchema = z
+  .array(
+    z.object({
+      front: z.string().min(2),
+      back: z.string().min(2),
+      sourceReference: z.string().optional(),
+      topic: z.string().optional(),
+      difficulty: z.string().optional(),
+    }),
+  )
+  .min(1);
+
+async function parseValidateOrRepairJson<T>(
+  rawText: string,
+  schema: z.ZodType<T>,
+  repairFn?: (malformed: string, issues: string) => Promise<string | null>,
+): Promise<T | null> {
+  const tryOnce = (candidate: string): { ok: true; data: T } | { ok: false; issues: string } => {
+    const extracted = extractJsonFromLlmOutput<unknown>(candidate);
+    if (extracted === null) {
+      return { ok: false, issues: "Invalid or unparseable JSON payload." };
+    }
+    const res = schema.safeParse(extracted);
+    if (res.success) {
+      return { ok: true, data: res.data };
+    }
+    return {
+      ok: false,
+      issues: res.error.issues
+        .slice(0, 4)
+        .map((i) => `${i.path.join(".") || "root"}: ${i.message}`)
+        .join("; "),
+    };
+  };
+
+  const first = tryOnce(rawText);
+  if (first.ok) return first.data;
+
+  if (repairFn) {
+    try {
+      const repairedRaw = await repairFn(rawText.slice(0, 3500), first.issues);
+      if (repairedRaw) {
+        const second = tryOnce(repairedRaw);
+        if (second.ok) return second.data;
+      }
+    } catch {
+      // Repair retry failed — caller proceeds cleanly to next real tier or error
+    }
+  }
+  return null;
+}
+
+/**
+ * Neutralizes common prompt-injection directives inside untrusted user input
+ * while preserving legitimate Arabic/English academic & technical questions.
+ */
+function sanitizePromptUserInput(input: string, maxLen = 4000): string {
+  return String(input || "")
+    .split("\0")
+    .join("")
+    .replace(/<\/?(?:system|assistant|developer|instructions?|prompt)>/gi, "")
+    .trim()
+    .slice(0, maxLen);
+}
 
 function suspendGeminiIfUnavailableError(err: unknown): void {
   const status = extractHttpStatus(err);
@@ -665,14 +815,80 @@ export async function transcribeAndTranslateAudioChunk(params: {
     }
   }
 
+  // Local ONNX Whisper real ASR helper for live microphone chunks whenever Gemini ASR is unavailable
+  const runLocalWhisperLiveChunk = async (): Promise<{
+    arabicText: string;
+    text: string;
+    detectedLanguage: string;
+    isSilence?: boolean;
+    error?: string;
+    retryable?: boolean;
+  }> => {
+    if (!rawAudioBytes || rawAudioBytes.length < 100) {
+      return {
+        arabicText: "",
+        text: "",
+        detectedLanguage: language || "auto",
+        isSilence: true,
+      };
+    }
+    const normalized = await normalizeLiveAudioChunkToWav(rawAudioBytes, mimeType);
+    const tmpId = `live_wh_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+    const ext = normalized.mimeType.includes("wav") ? ".wav" : ".webm";
+    const tmpPath = path.join(os.tmpdir(), `${tmpId}${ext}`);
+    try {
+      fs.writeFileSync(tmpPath, normalized.bytes);
+      const whisperRes = await transcribeAudioWithLocalWhisper({
+        filePath: tmpPath,
+        resourceType: isMeeting ? "meeting" : "lecture",
+        language: language || "auto",
+        jobId: tmpId,
+      });
+      if (whisperRes.segments.length > 0) {
+        const text = whisperRes.fullText.trim();
+        return {
+          arabicText: text,
+          text,
+          detectedLanguage:
+            whisperRes.detectedLanguage || detectLanguageLabelFromText(text, language),
+          isSilence: false,
+        };
+      }
+      if (whisperRes.silent) {
+        return {
+          arabicText: "",
+          text: "",
+          detectedLanguage: language || "auto",
+          isSilence: true,
+        };
+      }
+      return {
+        arabicText: "",
+        text: "",
+        detectedLanguage: language || "auto",
+        error: whisperRes.errorMessage || "Live chunk speech recognition failed.",
+        retryable: true,
+      };
+    } catch (whErr) {
+      return {
+        arabicText: "",
+        text: "",
+        detectedLanguage: language || "auto",
+        error: whErr instanceof Error ? whErr.message : String(whErr),
+        retryable: true,
+      };
+    } finally {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {
+        // best-effort temp cleanup
+      }
+    }
+  };
+
   const ai = getGeminiClient();
   if (!ai) {
-    return {
-      arabicText: "",
-      text: "",
-      detectedLanguage: language || "auto",
-      isSilence: true,
-    };
+    return await runLocalWhisperLiveChunk();
   }
 
   if (!rawAudioBytes || rawAudioBytes.length < 100) {
@@ -800,21 +1016,22 @@ Strict rules:
       finalFailureReason: msg,
     });
 
-    // Gracefully yield to client built-in Web Speech API when cloud ASR key is missing/depleted
-    if (isBillingDepleted || isAuthOrConfig) {
-      return {
-        arabicText: "",
-        text: "",
-        detectedLanguage: language || "auto",
-        isSilence: true,
-      };
+    // Fallback to REAL local Whisper ONNX ASR when Gemini cloud ASR fails/is depleted
+    if (isBillingDepleted || isAuthOrConfig || retryable) {
+      if (isBillingDepleted || isAuthOrConfig) {
+        suspendCloudGeminiTemporarily(10 * 60 * 1000);
+      }
+      const localFallback = await runLocalWhisperLiveChunk();
+      if (!localFallback.error) {
+        return localFallback;
+      }
     }
 
     return {
       arabicText: "",
       text: "",
       detectedLanguage: language || "auto",
-      isSilence: true,
+      error: msg,
       retryable: retryable && !isAuthOrConfig && !isBillingDepleted,
     };
   }
@@ -1024,16 +1241,14 @@ ${preparedTranscript}
         {
           primaryModel: config.textModel,
           fallbackModel: config.fallbackTextModel,
-          maxRetries: 0,
-          baseDelayMs: 100,
-          maxDelayMs: 150,
+          maxRetries: Math.min(2, config.maxRetries),
+          baseDelayMs: 500,
+          maxDelayMs: 2000,
+          timeoutMs: 35000,
         },
       );
 
-      const rawText = (response.text || "")
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/i, "")
-        .trim();
+      const rawText = (response.text || "").trim();
       if (!rawText) {
         throw new GeminiPipelineError("AI summary model returned empty text.", {
           model: config.textModel,
@@ -1042,19 +1257,31 @@ ${preparedTranscript}
         });
       }
 
-      const parsed = JSON.parse(rawText) as {
-        executiveSummary?: string;
-        detailedSummary?: string;
-        keyPoints?: unknown[];
-        decisions?: unknown[];
-        actionItems?: Array<{
-          title?: string;
-          ownerName?: string;
-          dueDate?: string;
-          sourceTimestamp?: string;
-          priority?: string;
-        }>;
-      };
+      const parsed = await parseValidateOrRepairJson(
+        rawText,
+        AiSummaryZodSchema,
+        async (malformed, issues) => {
+          const { result: repaired } = await executeWithRetryAndFallback(
+            "repairAiSummaryJson",
+            async (model) =>
+              ai.models.generateContent({
+                model,
+                contents: `Repair this JSON so it strictly matches {executiveSummary, detailedSummary, keyPoints, decisions, actionItems}. Validation errors: ${issues}\n\nMalformed output:\n${malformed}`,
+                config: { responseMimeType: "application/json" },
+              }),
+            { primaryModel: config.fallbackTextModel, maxRetries: 0, timeoutMs: 15000 },
+          );
+          return repaired.text || null;
+        },
+      );
+
+      if (!parsed) {
+        throw new GeminiPipelineError("AI summary failed schema validation after repair.", {
+          model: config.textModel,
+          retryable: true,
+          operation: "generateAiSummary",
+        });
+      }
 
       const detailed = String(parsed.detailedSummary || parsed.executiveSummary || "").trim();
       const executive = String(parsed.executiveSummary || detailed).trim();
@@ -1422,7 +1649,8 @@ ZERO HALLUCINATION & TRANSCRIPT GROUNDING RULES:
 4. Accepted types:
    - "multiple_choice": question with 4 distinct options (1 correct, 3 plausible but incorrect distractors from context).
    - "true_false": unambiguous declarative statement, options: ["True", "False"].
-5. Include sectionRef and timestampRef.
+   - "short_answer": concise analytical/recall question answered directly from transcript (options: [], provide grounded "correctAnswerText" and 2-3 key terms in "acceptableAnswers").
+5. Include sectionRef, timestampRef, and difficulty ("easy" | "medium" | "hard")${options?.difficulty && options.difficulty !== "all" ? ` — focus on "${options.difficulty}" difficulty` : " — mix easy, medium, and hard"}.
 6. ${avoidList ? `Avoid repeating these questions: ${avoidList}` : `This is variant ${variant} of the quiz.`}
 
 Transcript:
@@ -1462,7 +1690,8 @@ ${langDirective}
 4. الأنواع المعتمدة حصراً:
    - "multiple_choice": سؤال مع 4 خيارات دقيقة ومتباينة (خيار واحد صحيح و3 مشتتات منطقية من سياق المحتوى ولكنها خاطئة بدقة).
    - "true_false": عبارة قاطعة لا لبس فيها، والخيارات ["صح (صواب)", "خطأ"].
-5. حدد القسم والزمن الفعلي (sectionRef، timestampRef).
+   - "short_answer": سؤال مقالي/إجابة قصيرة مستند للنص المفرغ (options: [] مع إجابة نموذجية موثقة في "correctAnswerText" وكلمات مفتاحية مقبولة في "acceptableAnswers").
+5. حدد القسم والزمن الفعلي (sectionRef، timestampRef) ومستوى الصعوبة (easy | medium | hard)${options?.difficulty && options.difficulty !== "all" ? ` مع التركيز على مستوى "${options.difficulty}"` : ""}.
 6. ${avoidList ? `تجنب تكرار هذه الأسئلة التي طُرحت سابقاً: ${avoidList}` : `هذا الإصدار ${variant} من الاختبار.`}
 
 النص المفرغ:
@@ -1508,18 +1737,33 @@ ${summaryText || ""}
         {
           primaryModel: config.textModel,
           fallbackModel: config.fallbackTextModel,
-          maxRetries: 0,
-          baseDelayMs: 100,
-          maxDelayMs: 150,
+          maxRetries: Math.min(2, config.maxRetries),
+          baseDelayMs: 500,
+          maxDelayMs: 2000,
+          timeoutMs: 35000,
         },
       );
 
-      const jsonStr = (response.text || "")
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/i, "")
-        .trim();
-      const parsed = JSON.parse(jsonStr);
+      const parsed = await parseValidateOrRepairJson(
+        response.text || "",
+        AiQuizArrayZodSchema,
+        async (malformed, issues) => {
+          const { result: repaired } = await executeWithRetryAndFallback(
+            "repairAiQuizJson",
+            async (model) =>
+              ai.models.generateContent({
+                model,
+                contents: `Repair this JSON array of quiz questions. Validation errors: ${issues}\n\nMalformed output:\n${malformed}`,
+                config: { responseMimeType: "application/json" },
+              }),
+            { primaryModel: config.fallbackTextModel, maxRetries: 0, timeoutMs: 15000 },
+          );
+          return repaired.text || null;
+        },
+      );
+
       if (Array.isArray(parsed) && parsed.length > 0) {
+        const requestedDifficulty = options?.difficulty;
         const seenQuestions = new Set<string>();
         const verifiedQuestions = parsed
           .map((q, idx) => {
@@ -1529,10 +1773,14 @@ ${summaryText || ""}
             if (seenQuestions.has(normQ)) return null;
             seenQuestions.add(normQ);
 
-            const qType: "multiple_choice" | "true_false" =
-              q.type === "true_false" ? "true_false" : "multiple_choice";
+            const qType: "multiple_choice" | "true_false" | "short_answer" =
+              q.type === "true_false"
+                ? "true_false"
+                : q.type === "short_answer"
+                  ? "short_answer"
+                  : "multiple_choice";
 
-            let options: string[] = [];
+            let qOptions: string[] = [];
             let correctOptionIndex =
               typeof q.correctOptionIndex === "number" ? q.correctOptionIndex : 0;
 
@@ -1544,15 +1792,19 @@ ${summaryText || ""}
                 Boolean(x),
               );
               if (uniqueOpts.length < 4) return null; // Reject incomplete or duplicate options
-              options = uniqueOpts.slice(0, 4);
+              qOptions = uniqueOpts.slice(0, 4);
               if (correctOptionIndex < 0 || correctOptionIndex >= 4) correctOptionIndex = 0;
-            } else {
-              options = isEnglish ? ["True", "False"] : ["صح (صواب)", "خطأ"];
+            } else if (qType === "true_false") {
+              qOptions = isEnglish ? ["True", "False"] : ["صح (صواب)", "خطأ"];
               if (correctOptionIndex !== 0 && correctOptionIndex !== 1) correctOptionIndex = 0;
+            } else {
+              qOptions = [];
+              correctOptionIndex = 0;
+              if (!q.correctAnswerText || !q.correctAnswerText.trim()) return null;
             }
 
             const verification = verifyQuizQuestionGrounding(
-              { ...q, question: rawQ, options, correctOptionIndex },
+              { ...q, question: rawQ, options: qOptions, correctOptionIndex },
               segments,
             );
             if (!verification.grounded) return null;
@@ -1560,23 +1812,33 @@ ${summaryText || ""}
             const resolvedTs = q.timestampRef || verification.matchedTimestamp || "00:00";
             const resolvedQuote =
               q.sourceTranscriptSegment || verification.matchedSegmentText || "";
+            const resolvedCorrectText =
+              q.correctAnswerText?.trim() || qOptions[correctOptionIndex] || "";
+            const resolvedAcceptable =
+              Array.isArray(q.acceptableAnswers) && q.acceptableAnswers.length > 0
+                ? q.acceptableAnswers.map((a) => String(a).trim()).filter(Boolean)
+                : resolvedCorrectText
+                  ? [resolvedCorrectText]
+                  : [];
 
             return {
               id: `q_${Date.now()}_${idx + 1}`,
               question: rawQ,
               type: qType,
-              options,
+              options: qOptions,
               correctOptionIndex,
-              correctAnswerText: q.correctAnswerText || options[correctOptionIndex],
-              acceptableAnswers: [options[correctOptionIndex]],
+              correctAnswerText: resolvedCorrectText,
+              acceptableAnswers: resolvedAcceptable,
               explanation:
                 q.explanation ||
                 (detectedLang === "en"
                   ? `Directly verified at [${resolvedTs}] from the transcript.`
                   : `موثق ومستخرج مباشرة من نص الجلسة عند [${resolvedTs}].`),
-              difficulty: (["easy", "medium", "hard"].includes(q.difficulty)
+              difficulty: (["easy", "medium", "hard"].includes(q.difficulty || "")
                 ? q.difficulty
-                : "medium") as "easy" | "medium" | "hard",
+                : requestedDifficulty && requestedDifficulty !== "all"
+                  ? requestedDifficulty
+                  : "medium") as "easy" | "medium" | "hard",
               sectionRef:
                 q.sectionRef || (detectedLang === "en" ? "Transcript Section" : "محاور الجلسة"),
               timestampRef: resolvedTs,
@@ -1982,13 +2244,37 @@ ${preparedTranscript}
         {
           primaryModel: config.textModel,
           fallbackModel: config.fallbackTextModel,
-          maxRetries: 0,
-          baseDelayMs: 100,
-          maxDelayMs: 150,
+          maxRetries: Math.min(2, config.maxRetries),
+          baseDelayMs: 500,
+          maxDelayMs: 2000,
+          timeoutMs: 35000,
         },
       );
 
-      const parsed = JSON.parse(response.text || "{}");
+      const parsed = await parseValidateOrRepairJson(
+        response.text || "",
+        AiLectureAnalysisZodSchema,
+        async (malformed, issues) => {
+          const { result: repaired } = await executeWithRetryAndFallback(
+            "repairAiAnalysisJson",
+            async (model) =>
+              ai.models.generateContent({
+                model,
+                contents: `Repair this JSON object so it strictly matches {overview, topics, keywords, definitions, questionsAsked, actionItems, emphasizedPoints, importantSentences, reviewAreas}. Validation errors: ${issues}\n\nMalformed output:\n${malformed}`,
+                config: { responseMimeType: "application/json" },
+              }),
+            { primaryModel: config.fallbackTextModel, maxRetries: 0, timeoutMs: 15000 },
+          );
+          return repaired.text || null;
+        },
+      );
+      if (!parsed) {
+        throw new GeminiPipelineError("AI lecture analysis failed schema validation.", {
+          model: config.textModel,
+          retryable: true,
+          operation: "generateAiLectureAnalysis",
+        });
+      }
       const refOverview = buildBuiltInSummary(
         title,
         segments,
@@ -2001,14 +2287,22 @@ ${preparedTranscript}
           typeof parsed.overview === "string" && parsed.overview.trim().length >= 12
             ? parsed.overview.trim()
             : refOverview,
-        topics: parsed.topics || [title],
-        keywords: parsed.keywords || [],
-        definitions: parsed.definitions || [],
-        questionsAsked: parsed.questionsAsked || [],
-        actionItems: parsed.actionItems || [],
-        emphasizedPoints: parsed.emphasizedPoints || [],
-        importantSentences: parsed.importantSentences || [],
-        reviewAreas: parsed.reviewAreas || [],
+        topics: parsed.topics && parsed.topics.length > 0 ? parsed.topics : [title],
+        keywords: parsed.keywords ?? [],
+        definitions: parsed.definitions ?? [],
+        questionsAsked: (parsed.questionsAsked ?? []).map((qa) => ({
+          question: qa.question,
+          answer: qa.answer || undefined,
+          timestamp: qa.timestamp,
+        })),
+        actionItems: (parsed.actionItems ?? []).map((a) => ({
+          task: a.task,
+          owner: a.owner || undefined,
+          deadline: a.deadline || undefined,
+        })),
+        emphasizedPoints: parsed.emphasizedPoints ?? [],
+        importantSentences: parsed.importantSentences ?? [],
+        reviewAreas: parsed.reviewAreas ?? [],
       };
       setCachedAiAnalysis(cacheHash, "deep_analysis", config.textModel, finalResult);
       return finalResult;
@@ -2122,16 +2416,72 @@ export function answerGroundedQuestion(
   };
 }
 
+export interface StreamChatMeta {
+  engine: "identity" | "math" | "gemini" | "local-llm" | "analytical";
+  model: string;
+  scope?: ChatScope;
+  citations: { speaker: string; timestamp: string; quote: string }[];
+  evidenceFound: boolean;
+}
+
+export interface StreamChatTelemetry {
+  ttftMs: number;
+  totalMs: number;
+  engine: StreamChatMeta["engine"];
+  model: string;
+}
+
+export interface StreamChatDone {
+  answer: string;
+  evidenceFound: boolean;
+  citations: { speaker: string; timestamp: string; quote: string }[];
+  suggestedFollowUps?: string[];
+  telemetry?: StreamChatTelemetry;
+  aborted?: boolean;
+}
+
+const NOT_MENTIONED_RX =
+  /(not mentioned in (?:this|the available) recording|this information is not mentioned|غير مذكور في هذا التسجيل|المعلومة دي غير موجودة في التسجيل المتاح|لم يرد ذكر هذا في التسجيل)/i;
+
+function buildContextualFollowUps(isArabic: boolean, hasRecording: boolean): string[] {
+  if (hasRecording) {
+    return isArabic
+      ? [
+          "لخص أهم النقاط في 3 نقاط سريعة",
+          "إيه المهام والقرارات المذكورة في التسجيل؟",
+          "اعمل لي 5 أسئلة مراجعة من التسجيل",
+        ]
+      : [
+          "Summarize the key points in 3 bullets",
+          "What action items or decisions were mentioned?",
+          "Create 5 quiz questions from this recording",
+        ];
+  }
+  return isArabic
+    ? [
+        "اشرح النقطة الأهم بمثال عملي",
+        "اختصر الإجابة في 3 نقاط واضحة",
+        "اديني مثال كود عملي على الموضوع ده",
+      ]
+    : [
+        "Explain the key point with a practical example",
+        "Summarize this in 3 concise bullet points",
+        "Show a practical code example",
+      ];
+}
+
 export async function askMeetMindAI({
   question,
   resourceId,
-  history = [],
+  scope,
+  history,
   userId = "usr_admin",
   isAdmin = true,
   appLanguage,
 }: {
   question: string;
   resourceId?: string;
+  scope?: ChatScope;
   history?: Array<{ role: "user" | "model"; text: string }>;
   userId?: string;
   isAdmin?: boolean;
@@ -2141,8 +2491,70 @@ export async function askMeetMindAI({
   evidenceFound: boolean;
   citations: { speaker: string; timestamp: string; quote: string }[];
   suggestedFollowUps?: string[];
+  telemetry?: StreamChatTelemetry;
   forbidden?: boolean;
 }> {
+  const outcome = await askMeetMindAIStream(
+    { question, resourceId, scope, history, userId, isAdmin, appLanguage },
+    { onToken: () => {} },
+  );
+
+  if (outcome.forbidden) {
+    return {
+      answer: "Forbidden",
+      evidenceFound: false,
+      citations: [],
+      forbidden: true,
+    };
+  }
+
+  return (
+    outcome.result || {
+      answer: "",
+      evidenceFound: false,
+      citations: [],
+    }
+  );
+}
+
+/**
+ * Production MeetMind Super AI Chat Engine (streaming + non-streaming unified):
+ * - Structured multi-turn context management (System + User Profile/Facts + Earlier Summary + Recent Native Turns + Optional Scoped Recording RAG)
+ * - Strict 4-mode scope isolation (general / all-recordings / specific meeting / specific lecture)
+ * - Natural MeetMind AI persona with anti-repetition & ChatGPT clarification
+ * - Tier 1: Cloud Gemini (`GEMINI_CHAT_MODEL` -> `GEMINI_CHAT_FALLBACK_MODEL`) with retry, exponential backoff & native multi-turn streaming
+ * - Tier 2: Embedded Local Gemma 3 1B ONNX (`TextStreamer`) with native multi-turn messages & adaptive token budget
+ * - Tier 3: Grounded recording analytical fallback ONLY for recording/workspace queries (never fake general AI answers)
+ * - Full TTFT + total latency structured telemetry logging (zero secrets logged)
+ */
+export async function askMeetMindAIStream(
+  params: {
+    question: string;
+    resourceId?: string;
+    scope?: ChatScope;
+    history?: Array<{ role: "user" | "model"; text: string }>;
+    userId?: string;
+    isAdmin?: boolean;
+    appLanguage?: "en" | "ar";
+  },
+  callbacks: {
+    onMeta?: (meta: StreamChatMeta) => void;
+    onToken: (token: string) => void;
+    onDone?: (done: StreamChatDone) => void;
+  },
+  signal?: AbortSignal,
+): Promise<{ forbidden?: boolean; result?: StreamChatDone }> {
+  const requestStartMs = Date.now();
+  const question = sanitizePromptUserInput(params.question, 4000);
+  const { resourceId, history, userId = "usr_admin", isAdmin = true } = params;
+  const appLanguage: "en" | "ar" | undefined =
+    params.appLanguage === "ar" ? "ar" : params.appLanguage === "en" ? "en" : undefined;
+  const effectiveScope: ChatScope = resourceId
+    ? "recording"
+    : params.scope === "general"
+      ? "general"
+      : "all-recordings";
+
   const allMeetings = db.get("meetings");
   const allLectures = db.get("lectures");
   const allTasks = db.get("actionItems");
@@ -2152,6 +2564,15 @@ export async function askMeetMindAI({
   const meetings = isAdmin ? allMeetings : allMeetings.filter((m) => m.hostId === userId);
   const lectures = isAdmin ? allLectures : allLectures.filter((l) => l.instructorId === userId);
   const allowedIds = new Set([...meetings.map((m) => m.id), ...lectures.map((l) => l.id)]);
+
+  if (resourceId) {
+    const existsAnywhere =
+      allMeetings.some((m) => m.id === resourceId) || allLectures.some((l) => l.id === resourceId);
+    if (existsAnywhere && !allowedIds.has(resourceId)) {
+      return { forbidden: true };
+    }
+  }
+
   const tasks = isAdmin
     ? allTasks
     : allTasks.filter(
@@ -2166,11 +2587,13 @@ export async function askMeetMindAI({
         allowedIds.has(f.lectureId || f.meetingId || f.deckId.replace("deck_", "")),
       );
 
-  const persistChatTurn = (res: {
-    answer: string;
-    evidenceFound: boolean;
-    citations: { speaker: string; timestamp: string; quote: string }[];
-  }) => {
+  const userRecord = db.get("users").find((u) => u.id === userId);
+  const scopedDbMessages = (db.get("chatMessages") || []).filter(
+    (m) => m.userId === userId && (resourceId ? m.resourceId === resourceId : !m.resourceId),
+  );
+
+  const persistTurn = (res: StreamChatDone) => {
+    if (!res.answer.trim()) return;
     const now = new Date().toISOString();
     db.update("chatMessages", (msgs = []) => [
       ...msgs.slice(-198),
@@ -2195,462 +2618,161 @@ export async function askMeetMindAI({
     ]);
   };
 
-  if (resourceId) {
-    const existsAnywhere =
-      allMeetings.some((m) => m.id === resourceId) || allLectures.some((l) => l.id === resourceId);
-    if (existsAnywhere && !allowedIds.has(resourceId)) {
-      return {
-        answer: "Access denied to this recording.",
-        evidenceFound: false,
-        citations: [],
-        forbidden: true,
-      };
-    }
-  }
-
-  // Mandatory AI Identity fast-path (<5ms, consistent across Arabic & English, never bypassed)
-  const identityHit = tryAnswerIdentityQuery(question, appLanguage);
-  if (identityHit) {
-    const identityRes = {
-      answer: identityHit.answer,
-      evidenceFound: true,
-      citations: [],
-      suggestedFollowUps: identityHit.isAr
-        ? [
-            "لخص لي آخر تسجيل أو محاضرة",
-            "اشرح لي الفرق بين TCP و UDP باختصار",
-            "اعمل لي 5 أسئلة اختبار مع الإجابات",
-          ]
-        : [
-            "Summarize my latest recording or lecture",
-            "Explain how RAG works in 3 bullet points",
-            "Create 5 quiz questions with answers",
-          ],
-    };
-    persistChatTurn(identityRes);
-    return identityRes;
-  }
-
-  const targetMeeting = resourceId ? meetings.find((m) => m.id === resourceId) : undefined;
-  const targetLecture = resourceId ? lectures.find((l) => l.id === resourceId) : undefined;
-
-  if (resourceId && !targetMeeting && !targetLecture) {
-    const missing = {
-      answer: "Not mentioned in this recording.",
-      evidenceFound: false,
-      citations: [],
-    };
-    persistChatTurn(missing);
-    return missing;
-  }
-
+  const targetMeeting =
+    effectiveScope === "recording" && resourceId
+      ? meetings.find((m) => m.id === resourceId)
+      : undefined;
+  const targetLecture =
+    effectiveScope === "recording" && resourceId
+      ? lectures.find((l) => l.id === resourceId)
+      : undefined;
   const targetItem = targetLecture || targetMeeting;
   const targetSegments = targetItem?.segments || [];
 
-  // Optional delegation to Python AI service when configured
-  if (AI_SERVICE_URL && targetItem) {
-    try {
-      const resp = await fetch(`${AI_SERVICE_URL}/api/v1/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: targetItem.title,
-          question,
-          segments: targetSegments,
-        }),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (resp.ok) {
-        const data = (await resp.json()) as {
-          answer: string;
-          evidenceFound: boolean;
-          citations: { speaker: string; timestamp: string; quote: string }[];
-        };
-        const out = {
-          answer: data.evidenceFound ? data.answer : "Not mentioned in this recording.",
-          evidenceFound: data.evidenceFound,
-          citations: data.citations || [],
-        };
-        persistChatTurn(out);
-        return out;
-      }
-    } catch {
-      // Fallback seamlessly to Gemini or deterministic transcript search
-    }
-  }
+  // Preliminary smart context to inspect intent, language, and multi-turn identity state
+  const preContext = buildSmartChatContext({
+    question,
+    clientHistory: history,
+    dbMessages: scopedDbMessages,
+    userRecord,
+    scope: effectiveScope,
+    targetItem,
+    appLanguage,
+  });
 
-  const latestLecture = lectures[0];
-  const latestMeeting = meetings[0];
+  const questionIsAr = preContext.intent.isArabic;
+  const defaultFollowUps = buildContextualFollowUps(questionIsAr, Boolean(targetItem));
 
-  if (targetItem && targetSegments.length === 0) {
-    const emptyRes = {
-      answer: "Not mentioned in this recording.",
-      evidenceFound: false,
+  // 0a. Natural MeetMind AI Identity & ChatGPT Clarification Fast-Path (with anti-repetition)
+  const identityReply = buildConversationalIdentityReply(preContext.intent);
+  if (identityReply) {
+    const ttftMs = Math.max(1, Date.now() - requestStartMs);
+    callbacks.onMeta?.({
+      engine: "identity",
+      model: "meetmind-identity",
+      scope: effectiveScope,
       citations: [],
-    };
-    persistChatTurn(emptyRes);
-    return emptyRes;
-  }
-
-  // Helper: select all segments for short recordings, or top relevance-scored + boundary segments for long recordings
-  const selectTranscriptSegmentsForChat = (segs: TranscriptSegment[], limit = 80) => {
-    if (segs.length <= limit) return segs;
-    const qTokens = normalizeArabicAndLatin(question)
-      .split(" ")
-      .filter((t) => t.length >= 2);
-    const chosen = new Set<number>();
-    // Always include opening and closing context
-    for (let i = 0; i < Math.min(10, segs.length); i++) chosen.add(i);
-    for (let i = Math.max(0, segs.length - 10); i < segs.length; i++) chosen.add(i);
-
-    const scored = segs
-      .map((s, idx) => {
-        const norm = normalizeArabicAndLatin(s.text);
-        let score = 0;
-        for (const t of qTokens) {
-          if (norm.includes(t)) score += t.length >= 4 ? 3 : 1;
-        }
-        return { idx, score };
-      })
-      .filter((x) => x.score > 0)
-      .sort((a, b) => b.score - a.score);
-
-    for (const item of scored) {
-      if (chosen.size >= limit) break;
-      chosen.add(item.idx);
-      if (item.idx > 0 && chosen.size < limit) chosen.add(item.idx - 1);
-      if (item.idx + 1 < segs.length && chosen.size < limit) chosen.add(item.idx + 1);
-    }
-
-    return Array.from(chosen)
-      .sort((a, b) => a - b)
-      .map((i) => segs[i]);
-  };
-
-  // Build grounded transcript + metadata context (strictly scoped to authorized user recordings)
-  let contextDetails = "";
-  const lecturesToInclude = targetLecture
-    ? [targetLecture]
-    : targetMeeting
-      ? []
-      : lectures.slice(0, 4);
-  for (const l of lecturesToInclude) {
-    contextDetails += `[Lecture: "${l.title}" (${l.courseCode || "General"}, ${l.date})]:\n`;
-    if (l.summary || l.studyNotes) contextDetails += `Summary: ${l.summary || l.studyNotes}\n`;
-    if (l.topics && l.topics.length > 0) contextDetails += `Topics: ${l.topics.join(", ")}\n`;
-    if (l.keywords && l.keywords.length > 0) {
-      contextDetails += `Keywords: ${l.keywords.map((k) => k.term).join(", ")}\n`;
-    }
-    if (l.segments && l.segments.length > 0) {
-      const picked = selectTranscriptSegmentsForChat(l.segments, targetLecture ? 120 : 40);
-      contextDetails += `Transcript (${picked.length}/${l.segments.length} segments):\n`;
-      picked.forEach((s) => {
-        contextDetails += `[${formatMmSs(s.startTime)}] ${s.speaker}: ${s.text}\n`;
-      });
-    }
-    const relQuiz = quizzes.find((q) => q.lectureId === l.id);
-    if (relQuiz && relQuiz.questions.length > 0) {
-      contextDetails += `Generated Quiz Questions: ${relQuiz.questions
-        .slice(0, 6)
-        .map((q) => q.question)
-        .join(" | ")}\n`;
-    }
-    const relCards = flashcards.filter((f) => f.lectureId === l.id).slice(0, 6);
-    if (relCards.length > 0) {
-      contextDetails += `Flashcards: ${relCards.map((c) => `${c.front} -> ${c.back}`).join(" | ")}\n`;
-    }
-    contextDetails += `\n`;
-  }
-
-  const meetingsToInclude = targetMeeting
-    ? [targetMeeting]
-    : targetLecture
-      ? []
-      : meetings.slice(0, 4);
-  for (const m of meetingsToInclude) {
-    contextDetails += `[Meeting: "${m.title}" (${m.date})]:\n`;
-    if (m.summary) contextDetails += `Summary: ${m.summary}\n`;
-    if (m.topics && m.topics.length > 0) contextDetails += `Topics: ${m.topics.join(", ")}\n`;
-    if (m.keywords && m.keywords.length > 0) {
-      contextDetails += `Keywords: ${m.keywords.map((k) => k.term).join(", ")}\n`;
-    }
-    if (m.decisions && m.decisions.length > 0) {
-      contextDetails += `Decisions: ${m.decisions.join("; ")}\n`;
-    }
-    if (m.segments && m.segments.length > 0) {
-      const picked = selectTranscriptSegmentsForChat(m.segments, targetMeeting ? 120 : 40);
-      contextDetails += `Transcript (${picked.length}/${m.segments.length} segments):\n`;
-      picked.forEach((s) => {
-        contextDetails += `[${formatMmSs(s.startTime)}] ${s.speaker}: ${s.text}\n`;
-      });
-    }
-    const relQuiz = quizzes.find((q) => q.meetingId === m.id);
-    if (relQuiz && relQuiz.questions.length > 0) {
-      contextDetails += `Generated Quiz Questions: ${relQuiz.questions
-        .slice(0, 6)
-        .map((q) => q.question)
-        .join(" | ")}\n`;
-    }
-    contextDetails += `\n`;
-  }
-
-  const relevantTasks = targetItem
-    ? tasks.filter((t) => t.meetingId === targetItem.id || t.lectureId === targetItem.id)
-    : tasks;
-  if (relevantTasks.length > 0) {
-    contextDetails += `[Extracted Tasks]:\n`;
-    relevantTasks.slice(0, 15).forEach((t) => {
-      contextDetails += `- ${t.title} (Owner: ${t.ownerName || "Unassigned"}, Deadline: ${t.deadlineText || t.dueDate || "Deadline not specified."})\n`;
+      evidenceFound: true,
     });
-  }
-
-  const isArabicQuestion =
-    appLanguage === "ar" || (appLanguage !== "en" && /[\u0600-\u06FF]/.test(question));
-  const ai = getGeminiClient();
-
-  if (ai) {
-    try {
-      const hasWorkspaceContext = contextDetails.trim().length > 0;
-      const identityRule =
-        'Mandatory Identity Rule: You are MeetMind AI, programmed by a team of Software Engineers from the Computer Science Department at Modern Academy. In Arabic ALWAYS say "مبرمجني مجموعة من مهندسين برمجة قسم علوم حاسب مودرن أكاديمي". NEVER claim Google, Gemma, Gemini, or OpenAI created or trained you.';
-      const systemInstruction = targetItem
-        ? `You are MeetMind AI, a helpful intelligent assistant for meetings, lectures, and learning.
-${identityRule}
-The user currently has a specific recording selected: "${targetItem.title}".
-Rules:
-1. If the user asks what was said, decided, assigned, or covered in this recording, answer accurately using ONLY the provided transcript and extracted records, citing speaker names and timestamps [MM:SS]. If that specific detail was NOT mentioned in the recording, state clearly: "Not mentioned in this recording." (or in Arabic: "غير مذكور في هذا التسجيل.").
-2. If the user asks a general, conceptual, academic, coding, or study question (e.g., explaining a concept, giving examples, solving a problem, writing code, or preparing for an exam), answer it thoroughly and helpfully in the user's language (Arabic, Egyptian Arabic, or English).
-3. Never fabricate quotes or claim something was spoken in the recording if it is not in the transcript.`
-        : `You are MeetMind AI, a super-intelligent, helpful AI assistant capable of answering ANY question across all subjects (science, programming, math, engineering, languages, study tips, exam prep, writing, everyday questions, and more), in addition to analyzing the user's uploaded meetings and lectures.
-${identityRule}
-Rules:
-1. Answer ANY question the user asks clearly, accurately, and naturally in the same language/dialect they used (Standard Arabic, Egyptian Arabic, English, etc.).
-2. If the user asks about their meetings, lectures, recordings, summaries, tasks, quizzes, or flashcards, ground your answer strictly in the provided workspace context below and cite speaker names and timestamps [MM:SS]. Never invent recording content.
-3. If the user asks a general question unrelated to their recordings, answer it directly and completely — NEVER refuse with "Not mentioned in this recording.".`;
-
-      const recentHistory = history
-        .slice(-10)
-        .filter((h) => h.text && h.text.trim())
-        .map((h) => `${h.role === "user" ? "User" : "Assistant"}: ${h.text}`)
-        .join("\n\n");
-
-      const promptParts: string[] = [];
-      if (hasWorkspaceContext) {
-        promptParts.push(`[User's Authorized Workspace Recordings & Notes]:\n${contextDetails}`);
-      } else {
-        promptParts.push(
-          `[Workspace Status]: The user currently has no transcribed recordings uploaded.`,
-        );
-      }
-      if (recentHistory) {
-        promptParts.push(`[Conversation History]:\n${recentHistory}`);
-      }
-      promptParts.push(`[User Question]:\n${question}`);
-
-      const config = getGeminiConfig();
-      const { result: response } = await executeWithRetryAndFallback(
-        "askMeetMindAI",
-        async (model) => {
-          return ai.models.generateContent({
-            model,
-            contents: promptParts.join("\n\n"),
-            config: {
-              systemInstruction,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            },
-          });
-        },
-        {
-          primaryModel: config.textModel,
-          fallbackModel: config.fallbackTextModel,
-          maxRetries: 0,
-          baseDelayMs: 100,
-          maxDelayMs: 150,
-        },
-      );
-
-      const replyText = (response.text || "").trim();
-      if (replyText) {
-        const activeSegments =
-          targetSegments.length > 0
-            ? targetSegments
-            : [...(latestLecture?.segments || []), ...(latestMeeting?.segments || [])];
-
-        const grounded =
-          activeSegments.length > 0
-            ? answerGroundedQuestion(question, activeSegments, targetItem?.title || "Recordings")
-            : { citations: [], evidenceFound: false };
-
-        const notMentioned =
-          Boolean(targetItem) &&
-          (replyText === "Not mentioned in this recording." ||
-            replyText === "غير مذكور في هذا التسجيل.");
-
-        const finalAnswer = {
-          answer: replyText,
-          evidenceFound: !notMentioned && (grounded.evidenceFound || !targetItem),
-          citations: grounded.evidenceFound ? grounded.citations : [],
-          suggestedFollowUps: isArabicQuestion
-            ? [
-                "اشرح هذه النقطة بأمثلة عملية أكثر",
-                "لخص الإجابة في نقاط سريعة للمذاكرة",
-                "اعمل لي 5 أسئلة اختبار على الموضوع ده",
-              ]
-            : [
-                "Explain this with practical examples",
-                "Summarize into concise study bullets",
-                "Create 5 practice quiz questions on this topic",
-              ],
-        };
-        persistChatTurn(finalAnswer);
-        return finalAnswer;
-      }
-    } catch (err) {
-      suspendGeminiIfUnavailableError(err);
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const errStatus = extractHttpStatus(err);
-      logGeminiStructured({
-        level: "warn",
-        event: "gemini_query_fallback_builtin",
-        operation: "askMeetMindAI",
-        model: getGeminiConfig().textModel,
-        status: errStatus,
-        finalFailureReason: errMsg,
-      });
-    }
-  }
-
-  // Tier 2: Real Embedded Local LLM with BM25 RAG (Arabic + Egyptian Arabic + English)
-  const questionIsAr = detectIsArabic(question, appLanguage);
-  const directMath = trySolveMathQuery(question, questionIsAr);
-  if (directMath) {
-    const mathRes = {
-      answer: directMath,
+    callbacks.onToken(identityReply);
+    const totalMs = Math.max(ttftMs, Date.now() - requestStartMs);
+    const done: StreamChatDone = {
+      answer: identityReply,
       evidenceFound: true,
       citations: [],
-      suggestedFollowUps: questionIsAr
-        ? ["احسب 25% من 840", "اشرح لي الفرق بين TCP و UDP باختصار", "لخص لي آخر تسجيل"]
-        : [
-            "Calculate 25% of 840",
-            "Explain how RAG works in 3 bullet points",
-            "Summarize my latest recording",
-          ],
+      suggestedFollowUps: defaultFollowUps,
+      telemetry: { ttftMs, totalMs, engine: "identity", model: "meetmind-identity" },
     };
-    persistChatTurn(mathRes);
-    return mathRes;
+    persistTurn(done);
+    callbacks.onDone?.(done);
+    return { result: done };
   }
 
-  // Build crisp BM25-retrieved transcript evidence ONLY when relevant to the question or scoped recording
-  const workspaceIntent =
-    /(التسجيل|تسجيلات|المحاضر[ةه]|محاضرات|الاجتماع|اجتماعات|ملخص|لخص|المهام|تكليف|قرارات|التفريغ|my recording|this recording|the recording|transcript|my lecture|this lecture|my meeting|this meeting|summarize my|action items|what did .* say)/i.test(
-      question,
-    );
-
-  const bm25Pool: Array<{ seg: TranscriptSegment; title: string }> = [];
-  if (targetItem) {
-    for (const seg of targetSegments) bm25Pool.push({ seg, title: targetItem.title });
-  } else {
-    for (const l of lectures.slice(0, 5)) {
-      for (const seg of l.segments || []) bm25Pool.push({ seg, title: l.title });
-    }
-    for (const m of meetings.slice(0, 5)) {
-      for (const seg of m.segments || []) bm25Pool.push({ seg, title: m.title });
-    }
-  }
-
-  // Require high-confidence domain-token coverage for unscoped workspace search so general questions stay clean
-  const rawBm25Matches =
-    bm25Pool.length > 0
-      ? retrieveRelevantSegmentsBM25(question, bm25Pool, {
-          topK: targetItem ? 6 : 4,
-          minScore: targetItem ? 0.35 : workspaceIntent ? 1.5 : 3.5,
-        })
-      : [];
-
-  const framingStopWords = new Set([
-    "الفرق",
-    "فرق",
-    "باختصار",
-    "مختصر",
-    "اشرح",
-    "اشرحلي",
-    "شرح",
-    "قارن",
-    "مقارنه",
-    "مثال",
-    "امثله",
-    "نقاط",
-    "نقطه",
-    "ببساطه",
-    "وضوح",
-    "توضيح",
-    "ماهو",
-    "ماهي",
-    "كيف",
-    "يعمل",
-    "تعمل",
-    "بين",
-    "عن",
-    "علي",
-    "الي",
-    "difference",
-    "compare",
-    "comparison",
-    "brief",
-    "briefly",
-    "short",
-    "points",
-    "bullet",
-    "bullets",
-    "explain",
-    "works",
-    "work",
-    "example",
-    "examples",
-    "simply",
-    "simple",
-    "summary",
-    "summarize",
-  ]);
-  const stripArAl = (w: string) => (w.startsWith("ال") && w.length >= 5 ? w.slice(2) : w);
-  const contentTokens = normalizeText(question)
-    .split(" ")
-    .filter((w) => (w.length >= 3 || /\d/.test(w)) && !framingStopWords.has(w))
-    .map(stripArAl);
-
-  const bm25Matches = targetItem
-    ? rawBm25Matches
-    : rawBm25Matches.filter((m) => {
-        if (workspaceIntent) return true;
-        if (contentTokens.length === 0) return false;
-        const segNorm = normalizeText(`${m.title} ${m.seg.text}`);
-        const segWordSet = new Set(segNorm.split(" ").filter(Boolean).map(stripArAl));
-        const matchedCount = contentTokens.filter(
-          (t) => segWordSet.has(t) || (t.length >= 4 && segNorm.includes(t)),
-        ).length;
-        const requiredMatches =
-          contentTokens.length <= 2
-            ? contentTokens.length
-            : Math.min(3, Math.max(2, Math.ceil(contentTokens.length * 0.45)));
-        return matchedCount >= requiredMatches;
+  // 0b. Exact Math Fast-Path (only outside single-recording grounding mode)
+  if (effectiveScope !== "recording") {
+    const directMath = trySolveMathQuery(question, questionIsAr);
+    if (directMath) {
+      const ttftMs = Math.max(1, Date.now() - requestStartMs);
+      callbacks.onMeta?.({
+        engine: "math",
+        model: "meetmind-math",
+        scope: effectiveScope,
+        citations: [],
+        evidenceFound: true,
       });
+      callbacks.onToken(directMath);
+      const totalMs = Math.max(ttftMs, Date.now() - requestStartMs);
+      const done: StreamChatDone = {
+        answer: directMath,
+        evidenceFound: true,
+        citations: [],
+        suggestedFollowUps: defaultFollowUps,
+        telemetry: { ttftMs, totalMs, engine: "math", model: "meetmind-math" },
+      };
+      persistTurn(done);
+      callbacks.onDone?.(done);
+      return { result: done };
+    }
+  }
 
+  // 0c. Missing/empty transcript guard for explicit recording scope
+  if (effectiveScope === "recording" && (!targetItem || targetSegments.length === 0)) {
+    const msg = questionIsAr
+      ? "المعلومة دي غير موجودة في التسجيل المتاح."
+      : "This information is not mentioned in the available recording.";
+    const ttftMs = Math.max(1, Date.now() - requestStartMs);
+    callbacks.onMeta?.({
+      engine: "analytical",
+      model: "meetmind-grounded",
+      scope: effectiveScope,
+      citations: [],
+      evidenceFound: false,
+    });
+    callbacks.onToken(msg);
+    const totalMs = Math.max(ttftMs, Date.now() - requestStartMs);
+    const done: StreamChatDone = {
+      answer: msg,
+      evidenceFound: false,
+      citations: [],
+      suggestedFollowUps: defaultFollowUps,
+      telemetry: { ttftMs, totalMs, engine: "analytical", model: "meetmind-grounded" },
+    };
+    persistTurn(done);
+    callbacks.onDone?.(done);
+    return { result: done };
+  }
+
+  // Build Strictly Scoped Recording RAG Context (NEVER injected when effectiveScope === "general")
   let localRagBlock = "";
   let ragCitations: { speaker: string; timestamp: string; quote: string }[] = [];
 
-  if (targetItem && targetSegments.length > 0) {
-    const totalTargetChars = targetSegments.reduce((acc, s) => acc + (s.text?.length || 0) + 22, 0);
-    let pickedForTarget: TranscriptSegment[];
+  if (effectiveScope === "recording" && targetItem && targetSegments.length > 0) {
+    const bm25Pool = targetSegments.map((seg) => ({ seg, title: targetItem.title }));
+    const rawBm25Matches = retrieveRelevantSegmentsBM25(question, bm25Pool, {
+      topK: 6,
+      minScore: 0.35,
+    });
 
-    if (targetSegments.length <= 14 || totalTargetChars <= 2500) {
-      // Compact scoped recording: pass ALL chronological segments so multi-segment facts never split apart
-      pickedForTarget = targetSegments;
-    } else if (bm25Matches.length > 0) {
-      // Long scoped recording: expand each BM25 hit with +-1 chronological neighbors
+    // Strict anti-hallucination gate for specific factual recording queries with zero lexical evidence
+    const isBroadRecordingRequest =
+      /(لخص|ملخص|موضوع|عن إيه|عن ايه|أهم النقاط|اهم النقاط|المهام|تكليف|القرارات|كويز|اختبار|أسئلة|اسئلة|نقاط|فكرة|المحتوى|اشرح|مراجعة|ملاحظات|summary|summarize|overview|main points|key points|topics|action items|tasks|decisions|quiz|flashcards|what is this|what was discussed|explain this)/i.test(
+        question,
+      );
+    if (!isBroadRecordingRequest && rawBm25Matches.length === 0) {
+      const notFoundMsg = questionIsAr
+        ? "المعلومة دي غير موجودة في التسجيل المتاح."
+        : "This information is not mentioned in the available recording.";
+      const ttftMs = Math.max(1, Date.now() - requestStartMs);
+      callbacks.onMeta?.({
+        engine: "analytical",
+        model: "meetmind-grounded",
+        scope: effectiveScope,
+        citations: [],
+        evidenceFound: false,
+      });
+      callbacks.onToken(notFoundMsg);
+      const totalMs = Math.max(ttftMs, Date.now() - requestStartMs);
+      const done: StreamChatDone = {
+        answer: notFoundMsg,
+        evidenceFound: false,
+        citations: [],
+        suggestedFollowUps: defaultFollowUps,
+        telemetry: { ttftMs, totalMs, engine: "analytical", model: "meetmind-grounded" },
+      };
+      persistTurn(done);
+      callbacks.onDone?.(done);
+      return { result: done };
+    }
+
+    const totalTargetChars = targetSegments.reduce((acc, s) => acc + (s.text?.length || 0) + 22, 0);
+    let picked: TranscriptSegment[];
+    if (targetSegments.length <= 16 || totalTargetChars <= 2800) {
+      picked = targetSegments;
+    } else if (rawBm25Matches.length > 0) {
       const idToIndex = new Map<string, number>();
       targetSegments.forEach((s, i) => idToIndex.set(s.id, i));
       const expanded = new Set<number>();
-      for (const m of bm25Matches) {
+      for (const m of rawBm25Matches) {
         const idx = idToIndex.get(m.seg.id);
         if (typeof idx === "number") {
           if (idx > 0) expanded.add(idx - 1);
@@ -2658,17 +2780,17 @@ Rules:
           if (idx + 1 < targetSegments.length) expanded.add(idx + 1);
         }
       }
-      pickedForTarget = Array.from(expanded)
+      picked = Array.from(expanded)
         .sort((a, b) => a - b)
         .map((i) => targetSegments[i]);
     } else {
-      pickedForTarget = selectHighSignalSegments(targetSegments, 2200);
+      picked = selectHighSignalSegments(targetSegments, 2400);
     }
 
     ragCitations = (
-      bm25Matches.length >= 2
-        ? bm25Matches.slice(0, 3)
-        : pickedForTarget.slice(0, 3).map((seg) => ({ seg }))
+      rawBm25Matches.length >= 2
+        ? rawBm25Matches.slice(0, 3)
+        : picked.slice(0, 3).map((seg) => ({ seg }))
     ).map((entry) => ({
       speaker: entry.seg.speaker,
       timestamp: formatMmSs(entry.seg.startTime),
@@ -2676,7 +2798,7 @@ Rules:
     }));
 
     const structuredHints =
-      targetSegments.length <= 14 || totalTargetChars <= 2500
+      targetSegments.length <= 16 || totalTargetChars <= 2800
         ? buildBuiltInSummary(
             targetItem.title,
             targetSegments,
@@ -2685,117 +2807,318 @@ Rules:
             questionIsAr ? "ar" : "en",
           ).keyPoints.slice(0, 9)
         : [];
-
-    const chronologicalText = pickedForTarget
-      .map((s) => `[${formatMmSs(s.startTime)}] ${s.speaker}: ${s.text.trim()}`)
-      .join("\n")
-      .slice(0, 2100);
     const factsHeader =
       structuredHints.length > 0
         ? `[Verified Extracted Facts]\n${structuredHints
             .map((pt) => `- ${pt.replace(/\s*\[\d{2}:\d{2}\]\s*$/, "").trim()}`)
             .join("\n")}\n\n`
         : "";
+    const chronologicalText = picked
+      .map((s) => `[${formatMmSs(s.startTime)}] ${s.speaker}: ${s.text.trim()}`)
+      .join("\n")
+      .slice(0, 2400);
     localRagBlock =
       `[Recording: "${targetItem.title}"]\n${factsHeader}[Transcript]\n${chronologicalText}`.slice(
         0,
-        2800,
+        3200,
       );
-  } else if (bm25Matches.length > 0 || (workspaceIntent && bm25Pool.length > 0)) {
+  } else if (effectiveScope === "all-recordings" && preContext.intent.isWorkspaceQuery) {
+    const bm25Pool: Array<{ seg: TranscriptSegment; title: string }> = [];
+    for (const l of lectures.slice(0, 5)) {
+      for (const seg of l.segments || []) bm25Pool.push({ seg, title: l.title });
+    }
+    for (const m of meetings.slice(0, 5)) {
+      for (const seg of m.segments || []) bm25Pool.push({ seg, title: m.title });
+    }
+
+    const rawBm25Matches =
+      bm25Pool.length > 0
+        ? retrieveRelevantSegmentsBM25(question, bm25Pool, {
+            topK: 4,
+            minScore: 1.5,
+          })
+        : [];
+
+    const latestRec = lectures[0] || meetings[0];
     const chosenHits =
-      bm25Matches.length > 0
-        ? bm25Matches
-        : selectHighSignalSegments((latestLecture || latestMeeting)?.segments || [], 1600).map(
-            (seg) => ({
+      rawBm25Matches.length > 0
+        ? rawBm25Matches
+        : latestRec && latestRec.segments?.length
+          ? selectHighSignalSegments(latestRec.segments, 1600).map((seg) => ({
               seg,
-              title: (latestLecture || latestMeeting)?.title || "Recording",
+              title: latestRec.title,
               score: 1,
-            }),
-          );
+            }))
+          : [];
 
-    ragCitations = chosenHits.slice(0, 3).map((m) => ({
-      speaker: m.seg.speaker,
-      timestamp: formatMmSs(m.seg.startTime),
-      quote: m.seg.text,
-    }));
-    localRagBlock = chosenHits
-      .map(
-        (m) =>
-          `[${m.title} | ${formatMmSs(m.seg.startTime)}] ${m.seg.speaker}: ${m.seg.text.trim()}`,
-      )
-      .join("\n")
-      .slice(0, 1900);
+    if (chosenHits.length > 0) {
+      ragCitations = chosenHits.slice(0, 3).map((m) => ({
+        speaker: m.seg.speaker,
+        timestamp: formatMmSs(m.seg.startTime),
+        quote: m.seg.text,
+      }));
+      localRagBlock = chosenHits
+        .map(
+          (m) =>
+            `[${m.title} | ${formatMmSs(m.seg.startTime)}] ${m.seg.speaker}: ${m.seg.text.trim()}`,
+        )
+        .join("\n")
+        .slice(0, 2000);
+    }
   }
 
-  const localHistoryBlock = history
-    .slice(-4)
-    .filter((h) => h.text && h.text.trim())
-    .map((h) => `${h.role === "user" ? "User" : "Assistant"}: ${h.text.trim().slice(0, 220)}`)
-    .join("\n");
-
-  const localSystemPrompt = localRagBlock
-    ? questionIsAr
-      ? `أنت مساعد MeetMind AI الذكي. أجب مباشرة وبإيجاز بالعربية الفصحى الواضحة دون مقدمات مطولة أو أسئلة ختامية. اعتمد أولاً على قسم [Verified Extracted Facts] ثم [Transcript] المرفق؛ انقل كل حقل بقيمته الدقيقة كما هي (المنطقة/الموقع، المساحة بالمتر، الميزانية/السعر بالجنيه، عدد الغرف، عدد الحمامات، الإطلالة، والتشطيب) ولا تخلط رقم الهاتف مع المساحة ولا تبدّل بين الحقول إطلاقاً.`
-      : `You are MeetMind AI. Answer directly and concisely without filler intros or closing questions. Rely first on [Verified Extracted Facts] and then [Transcript]; copy each field's exact value (location/zone, area in meters, budget/price, room/bath counts, view, finishing) and never mix phone digits with area or swap fields.`
-    : questionIsAr
-      ? `أنت مساعد MeetMind AI الذكي. أجب مباشرة وبإيجاز باللغة العربية الفصحى السليمة وبمعلومات علمية وتقنية دقيقة ومنظمة في نقاط عند الحاجة، بدون مقدمات مطولة أو أسئلة ختامية.`
-      : `You are MeetMind AI, an accurate and concise technical assistant. Answer directly in clear English using structured markdown bullets when helpful, without filler intros or closing follow-up questions.`;
-
-  const localUserParts: string[] = [];
-  if (localRagBlock) {
-    localUserParts.push(`Transcript Context:\n"""\n${localRagBlock}\n"""`);
-  }
-  if (localHistoryBlock) {
-    localUserParts.push(`Recent Conversation:\n${localHistoryBlock}`);
-  }
-  localUserParts.push(localRagBlock || localHistoryBlock ? `Question: ${question}` : question);
-
-  const localReply = await generateLocalLlmText({
-    systemPrompt: localSystemPrompt,
-    userPrompt: localUserParts.join("\n\n"),
-    maxNewTokens: 265,
-    temperature: 0,
-    timeoutMs: 40000,
-  });
-
-  if (localReply && localReply.length >= 4) {
-    const notMentioned =
-      Boolean(targetItem) &&
-      /(not mentioned in this recording|غير مذكور في هذا التسجيل)/i.test(localReply);
-
-    const localChatResult = {
-      answer: localReply,
-      evidenceFound: !notMentioned && (ragCitations.length > 0 || !targetItem),
-      citations: notMentioned ? [] : ragCitations,
-      suggestedFollowUps: questionIsAr
-        ? [
-            "اشرح هذه النقطة بمثال عملي",
-            "لخص الإجابة في 3 نقاط سريعة",
-            "اعمل لي أسئلة اختبار على الموضوع ده",
-          ]
-        : [
-            "Explain this with a practical example",
-            "Summarize this into 3 quick bullets",
-            "Create practice quiz questions on this topic",
-          ],
-    };
-    persistChatTurn(localChatResult);
-    return localChatResult;
-  }
-
-  // Tier 3: Always-On Built-In Bilingual Analytical Assistant Fallback
-  const builtInAnswer = answerBuiltInChat({
+  // Finalize smart chat context with resolved recording RAG block
+  const ctx = buildSmartChatContext({
     question,
-    appLanguage,
+    clientHistory: history,
+    dbMessages: scopedDbMessages,
+    userRecord,
+    scope: effectiveScope,
     targetItem,
-    meetings,
-    lectures,
-    tasks,
-    quizzes,
-    flashcards,
+    recordingContextBlock: localRagBlock || undefined,
+    appLanguage,
   });
-  persistChatTurn(builtInAnswer);
-  return builtInAnswer;
+
+  // Tier 1: Cloud Gemini Native Multi-Turn Streaming with Retry + Exponential Backoff + Fallback Model
+  const ai = getGeminiClient();
+  if (ai && !signal?.aborted) {
+    const config = getGeminiConfig();
+    const cloudSystemParts = [ctx.systemInstructionCloud];
+    if (ctx.userProfileBlock) cloudSystemParts.push(ctx.userProfileBlock);
+    if (ctx.earlierSummaryBlock) cloudSystemParts.push(ctx.earlierSummaryBlock);
+
+    const cloudContents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> =
+      ctx.recentTurns.map((t) => ({
+        role: t.role === "user" ? "user" : "model",
+        parts: [{ text: t.content }],
+      }));
+
+    const currentTurnBlocks: string[] = [];
+    if (localRagBlock) {
+      currentTurnBlocks.push(`[Authorized Recording Context]\n"""\n${localRagBlock}\n"""`);
+    }
+    currentTurnBlocks.push(question);
+    cloudContents.push({
+      role: "user",
+      parts: [{ text: currentTurnBlocks.join("\n\n") }],
+    });
+
+    try {
+      const { result: streamResult, modelUsed: activeCloudModel } =
+        await executeWithRetryAndFallback(
+          "askMeetMindAIStream",
+          async (model) => {
+            if (signal?.aborted) {
+              throw new Error("Aborted by client");
+            }
+            return ai.models.generateContentStream({
+              model,
+              contents: cloudContents,
+              config: {
+                systemInstruction: cloudSystemParts.join("\n\n"),
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            });
+          },
+          {
+            primaryModel: config.chatModel,
+            fallbackModel: config.fallbackChatModel,
+            maxRetries: 2,
+            timeoutMs: 45_000,
+          },
+        );
+
+      callbacks.onMeta?.({
+        engine: "gemini",
+        model: activeCloudModel,
+        scope: effectiveScope,
+        citations: ragCitations,
+        evidenceFound: ragCitations.length > 0 || !targetItem,
+      });
+
+      let fullReply = "";
+      let firstTokenAt: number | null = null;
+      for await (const chunk of streamResult) {
+        if (signal?.aborted) break;
+        const delta = chunk.text || "";
+        if (delta) {
+          if (firstTokenAt === null) firstTokenAt = Date.now();
+          fullReply += delta;
+          callbacks.onToken(delta);
+        }
+      }
+
+      if (fullReply.trim()) {
+        const nowMs = Date.now();
+        const ttftMs = Math.max(1, (firstTokenAt ?? nowMs) - requestStartMs);
+        const totalMs = Math.max(ttftMs, nowMs - requestStartMs);
+        const notMentioned = Boolean(targetItem) && NOT_MENTIONED_RX.test(fullReply);
+
+        logGeminiStructured({
+          level: "info",
+          event: "chat_stream_success",
+          operation: "askMeetMindAIStream",
+          model: activeCloudModel,
+          ttftMs,
+          latencyMs: totalMs,
+        });
+
+        const done: StreamChatDone = {
+          answer: fullReply.trim(),
+          evidenceFound: !notMentioned && (ragCitations.length > 0 || !targetItem),
+          citations: notMentioned ? [] : ragCitations,
+          suggestedFollowUps: defaultFollowUps,
+          telemetry: { ttftMs, totalMs, engine: "gemini", model: activeCloudModel },
+          aborted: Boolean(signal?.aborted),
+        };
+        if (!signal?.aborted) persistTurn(done);
+        callbacks.onDone?.(done);
+        return { result: done };
+      }
+    } catch (err) {
+      suspendGeminiIfUnavailableError(err);
+      logGeminiStructured({
+        level: "warn",
+        event: "gemini_stream_fallback_local",
+        operation: "askMeetMindAIStream",
+        model: config.chatModel,
+        status: extractHttpStatus(err),
+        errorCategory: categorizeAiError(err),
+        latencyMs: Date.now() - requestStartMs,
+        finalFailureReason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Tier 2: Embedded Local Gemma 3 1B ONNX Native Multi-Turn TextStreamer
+  if (!signal?.aborted) {
+    const localSystemParts = [ctx.systemInstructionLocal];
+    if (ctx.userProfileBlock) localSystemParts.push(ctx.userProfileBlock);
+    if (ctx.earlierSummaryBlock) localSystemParts.push(ctx.earlierSummaryBlock);
+
+    const localUserPrompt = localRagBlock
+      ? `[Authorized Recording Context]\n"""\n${localRagBlock}\n"""\n\nQuestion: ${question}`
+      : question;
+
+    const localModelId = getLocalLlmModelId();
+    let streamedLocalTokens = false;
+    let streamedLocalBuffer = "";
+    let firstTokenAt: number | null = null;
+
+    callbacks.onMeta?.({
+      engine: "local-llm",
+      model: localModelId,
+      scope: effectiveScope,
+      citations: ragCitations,
+      evidenceFound: ragCitations.length > 0 || !targetItem,
+    });
+
+    const localReply = await generateLocalLlmTextStream({
+      systemPrompt: localSystemParts.join("\n\n"),
+      conversationTurns: ctx.recentTurns,
+      userPrompt: localUserPrompt,
+      maxNewTokens: ctx.intent.recommendedLocalMaxTokens,
+      temperature: 0,
+      timeoutMs: 75_000,
+      signal,
+      onToken: (tok) => {
+        if (firstTokenAt === null) firstTokenAt = Date.now();
+        streamedLocalTokens = true;
+        streamedLocalBuffer += tok;
+        callbacks.onToken(tok);
+      },
+    });
+
+    const finalAnswer = (localReply || streamedLocalBuffer || "").trim();
+    if (finalAnswer.length >= 2 || streamedLocalTokens) {
+      const nowMs = Date.now();
+      const ttftMs = Math.max(1, (firstTokenAt ?? nowMs) - requestStartMs);
+      const totalMs = Math.max(ttftMs, nowMs - requestStartMs);
+      const notMentioned = Boolean(targetItem) && NOT_MENTIONED_RX.test(finalAnswer);
+
+      logGeminiStructured({
+        level: "info",
+        event: "chat_stream_success",
+        operation: "askMeetMindAIStream",
+        model: localModelId,
+        ttftMs,
+        latencyMs: totalMs,
+      });
+
+      const done: StreamChatDone = {
+        answer: finalAnswer,
+        evidenceFound: !notMentioned && (ragCitations.length > 0 || !targetItem),
+        citations: notMentioned ? [] : ragCitations,
+        suggestedFollowUps: defaultFollowUps,
+        telemetry: { ttftMs, totalMs, engine: "local-llm", model: localModelId },
+        aborted: Boolean(signal?.aborted),
+      };
+      if (!signal?.aborted && finalAnswer) persistTurn(done);
+      callbacks.onDone?.(done);
+      return { result: done };
+    }
+  }
+
+  // Tier 3: Grounded recording analytical fallback ONLY for explicit recording/workspace queries
+  if (effectiveScope === "recording" || ctx.intent.isWorkspaceQuery) {
+    const builtIn = answerBuiltInChat({
+      question,
+      appLanguage,
+      targetItem,
+      meetings,
+      lectures,
+      tasks,
+      quizzes,
+      flashcards,
+    });
+    const ttftMs = Math.max(1, Date.now() - requestStartMs);
+    callbacks.onMeta?.({
+      engine: "analytical",
+      model: "meetmind-analytical",
+      scope: effectiveScope,
+      citations: builtIn.citations,
+      evidenceFound: builtIn.evidenceFound,
+    });
+    if (!signal?.aborted) {
+      callbacks.onToken(builtIn.answer);
+    }
+    const totalMs = Math.max(ttftMs, Date.now() - requestStartMs);
+    const done: StreamChatDone = {
+      ...builtIn,
+      telemetry: { ttftMs, totalMs, engine: "analytical", model: "meetmind-analytical" },
+      aborted: Boolean(signal?.aborted),
+    };
+    if (!signal?.aborted) persistTurn(done);
+    callbacks.onDone?.(done);
+    return { result: done };
+  }
+
+  // Aborted cleanly by client
+  if (signal?.aborted) {
+    const done: StreamChatDone = {
+      answer: "",
+      evidenceFound: false,
+      citations: [],
+      aborted: true,
+    };
+    callbacks.onDone?.(done);
+    return { result: done };
+  }
+
+  // NO FAKE AI: If every real AI model failed on a general question, fail cleanly with a retryable error
+  logGeminiStructured({
+    level: "error",
+    event: "chat_all_engines_unavailable",
+    operation: "askMeetMindAIStream",
+    model: "none",
+    errorCategory: "unavailable",
+    latencyMs: Date.now() - requestStartMs,
+  });
+  throw new Error(
+    questionIsAr
+      ? "تعذر الوصول إلى الذكاء الاصطناعي حاليًا. حاول مرة أخرى بعد لحظات."
+      : "Unable to reach the AI right now. Please try again in a moment.",
+  );
 }
 
 // Generate Spaced Repetition Flashcards Grounded in Transcript
@@ -2915,13 +3238,30 @@ ${summaryText || ""}
         {
           primaryModel: config.textModel,
           fallbackModel: config.fallbackTextModel,
-          maxRetries: 0,
-          baseDelayMs: 100,
-          maxDelayMs: 150,
+          maxRetries: Math.min(2, config.maxRetries),
+          baseDelayMs: 500,
+          maxDelayMs: 2000,
+          timeoutMs: 35000,
         },
       );
 
-      const parsed = JSON.parse(response.text || "[]");
+      const parsed = await parseValidateOrRepairJson(
+        response.text || "[]",
+        AiFlashcardsZodSchema,
+        async (malformed, issues) => {
+          const { result: repaired } = await executeWithRetryAndFallback(
+            "repairAiFlashcardsJson",
+            async (model) =>
+              ai.models.generateContent({
+                model,
+                contents: `Repair this JSON array of flashcards [{front, back, sourceReference, topic, difficulty}]. Errors: ${issues}\n\nMalformed output:\n${malformed}`,
+                config: { responseMimeType: "application/json" },
+              }),
+            { primaryModel: config.fallbackTextModel, maxRetries: 0, timeoutMs: 15000 },
+          );
+          return repaired.text || null;
+        },
+      );
       if (Array.isArray(parsed) && parsed.length >= 1) {
         const finalResult = parsed
           .map((item) => ({
@@ -2929,7 +3269,7 @@ ${summaryText || ""}
             back: String(item.back || "").trim(),
             sourceReference: item.sourceReference ? String(item.sourceReference).trim() : "00:00",
             topic: item.topic ? String(item.topic).trim() : courseCode || title,
-            difficulty: (["easy", "medium", "hard"].includes(item.difficulty)
+            difficulty: (["easy", "medium", "hard"].includes(item.difficulty || "")
               ? item.difficulty
               : "medium") as "easy" | "medium" | "hard",
           }))
@@ -3043,13 +3383,14 @@ ${summaryText || ""}
         {
           primaryModel: config.textModel,
           fallbackModel: config.fallbackTextModel,
-          maxRetries: 0,
-          baseDelayMs: 100,
-          maxDelayMs: 150,
+          maxRetries: Math.min(2, config.maxRetries),
+          baseDelayMs: 500,
+          maxDelayMs: 2000,
+          timeoutMs: 35000,
         },
       );
 
-      const parsed = JSON.parse(response.text || "{}");
+      const parsed = extractJsonFromLlmOutput<unknown>(response.text || "{}");
       const normalizedCloud = normalizeMindMapTree(parsed, title);
       if (
         normalizedCloud &&

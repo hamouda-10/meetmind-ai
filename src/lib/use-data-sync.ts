@@ -3,6 +3,70 @@ import { useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { useAuthStore } from "@/stores/auth-store";
 
+const EVENT_QUERY_MAP: Record<string, string[][]> = {
+  TranscriptSegmentAvailable: [["transcript"], ["recordingSessions"]],
+  TranscriptFinal: [
+    ["transcript"],
+    ["meetings"],
+    ["lectures"],
+    ["jobs"],
+    ["dashboardMetrics"],
+    ["dashboard-metrics"],
+  ],
+  SummaryReady: [["meetings"], ["lectures"], ["transcript"], ["dashboardMetrics"]],
+  SUMMARY_GENERATED: [["meetings"], ["lectures"], ["transcript"], ["dashboardMetrics"]],
+  ANALYSIS_GENERATED: [["meetings"], ["lectures"], ["transcript"], ["dashboardMetrics"]],
+  TasksReady: [["tasks"], ["actionItems"], ["dashboardMetrics"], ["dashboard-metrics"]],
+  TASK_CREATED: [["tasks"], ["actionItems"], ["dashboardMetrics"]],
+  TASK_UPDATED: [["tasks"], ["actionItems"], ["dashboardMetrics"]],
+  TASK_DELETED: [["tasks"], ["actionItems"], ["dashboardMetrics"]],
+  QUIZ_GENERATED: [["quizzes"], ["dashboardMetrics"], ["dashboard-metrics"]],
+  QUIZ_READY: [["quizzes"], ["dashboardMetrics"]],
+  QuizReady: [["quizzes"], ["dashboardMetrics"]],
+  QUIZ_ATTEMPTED: [["quizzes"], ["dashboardMetrics"], ["dashboard-trends"]],
+  FlashcardsReady: [["flashcards"], ["dashboardMetrics"]],
+  FLASHCARDS_GENERATED: [["flashcards"], ["dashboardMetrics"]],
+  MindMapReady: [["mindmaps"], ["mindMaps"]],
+  MINDMAP_GENERATED: [["mindmaps"], ["mindMaps"]],
+  JOB_PROGRESS: [["jobs"]],
+  JOB_COMPLETED: [
+    ["jobs"],
+    ["meetings"],
+    ["lectures"],
+    ["transcript"],
+    ["dashboardMetrics"],
+    ["dashboard-metrics"],
+    ["notifications"],
+  ],
+  JOB_FAILED: [["jobs"], ["meetings"], ["lectures"], ["notifications"]],
+  NOTIFICATION_CREATED: [["notifications"]],
+  NOTIFICATION_READ: [["notifications"]],
+  MEETING_CREATED: [["meetings"], ["dashboardMetrics"], ["dashboard-metrics"]],
+  MEETING_UPDATED: [["meetings"], ["transcript"]],
+  MEETING_DELETED: [["meetings"], ["dashboardMetrics"], ["dashboard-metrics"], ["transcript"]],
+  LECTURE_CREATED: [["lectures"], ["dashboardMetrics"], ["dashboard-metrics"]],
+  LECTURE_UPDATED: [["lectures"], ["transcript"]],
+  LECTURE_DELETED: [["lectures"], ["dashboardMetrics"], ["dashboard-metrics"], ["transcript"]],
+  SESSION_STARTED: [["recordingSessions"]],
+  SESSION_FINALIZED: [
+    ["recordingSessions"],
+    ["meetings"],
+    ["lectures"],
+    ["transcript"],
+    ["jobs"],
+    ["dashboardMetrics"],
+  ],
+};
+
+const FALLBACK_KEYS: string[][] = [
+  ["dashboardMetrics"],
+  ["dashboard-metrics"],
+  ["meetings"],
+  ["lectures"],
+  ["jobs"],
+  ["notifications"],
+];
+
 export function useDataSync() {
   const queryClient = useQueryClient();
   const authStatus = useAuthStore((s) => s.status);
@@ -16,8 +80,20 @@ export function useDataSync() {
 
     let es: EventSource | null = null;
     let fallbackInterval: ReturnType<typeof setInterval> | null = null;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let isConnected = false;
     let isDisposed = false;
+    const pendingKeys = new Map<string, string[]>();
+
+    const flushInvalidations = () => {
+      flushTimer = null;
+      if (isDisposed || pendingKeys.size === 0) return;
+      const keys = Array.from(pendingKeys.values());
+      pendingKeys.clear();
+      for (const queryKey of keys) {
+        queryClient.invalidateQueries({ queryKey });
+      }
+    };
 
     const handleSyncEvent = (eventData: { type: string; id?: string; timestamp?: number }) => {
       if (eventData.timestamp && eventData.timestamp <= lastSyncTimestampRef.current) {
@@ -27,22 +103,13 @@ export function useDataSync() {
         lastSyncTimestampRef.current = eventData.timestamp;
       }
 
-      // Invalidate relevant queries immediately
-      queryClient.invalidateQueries({ queryKey: ["dashboardMetrics"] });
-      queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] });
-      queryClient.invalidateQueries({ queryKey: ["dashboard-trends"] });
-      queryClient.invalidateQueries({ queryKey: ["lectures"] });
-      queryClient.invalidateQueries({ queryKey: ["meetings"] });
-      queryClient.invalidateQueries({ queryKey: ["quizzes"] });
-      queryClient.invalidateQueries({ queryKey: ["flashcards"] });
-      queryClient.invalidateQueries({ queryKey: ["mindmaps"] });
-      queryClient.invalidateQueries({ queryKey: ["mindMaps"] });
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      queryClient.invalidateQueries({ queryKey: ["actionItems"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      queryClient.invalidateQueries({ queryKey: ["transcript"] });
-      queryClient.invalidateQueries({ queryKey: ["notifications"] });
-      queryClient.invalidateQueries({ queryKey: ["recordingSessions"] });
+      const targetKeys = EVENT_QUERY_MAP[eventData.type] || FALLBACK_KEYS;
+      for (const key of targetKeys) {
+        pendingKeys.set(key.join(":"), key);
+      }
+      if (!flushTimer) {
+        flushTimer = setTimeout(flushInvalidations, 120);
+      }
     };
 
     // Defer SSE connection to let browser finish initial page load without keeping tab spinner active
@@ -101,6 +168,7 @@ export function useDataSync() {
     return () => {
       isDisposed = true;
       clearTimeout(startTimer);
+      if (flushTimer) clearTimeout(flushTimer);
       if (es) es.close();
       if (fallbackInterval) clearInterval(fallbackInterval);
     };

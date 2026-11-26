@@ -36,6 +36,12 @@ export function AudioCenterCard({ isArabic, onOpenUpload, className = "" }: Audi
 
   const audioSystemMode = useUIStore((s) => s.audioSystemMode);
   const audioJobProgress = useUIStore((s) => s.audioJobProgress);
+  const resolvedTheme = useUIStore((s) => s.resolvedTheme);
+  const themeRef = useRef(resolvedTheme);
+
+  useEffect(() => {
+    themeRef.current = resolvedTheme;
+  }, [resolvedTheme]);
 
   const { data: metrics } = useQuery<DashboardMetrics>({
     queryKey: ["dashboardMetrics"],
@@ -111,6 +117,20 @@ export function AudioCenterCard({ isArabic, onOpenUpload, className = "" }: Audi
       const t = now * 0.001;
       ctx.clearRect(0, 0, width, height);
 
+      const curTheme = themeRef.current;
+      const lineRgb =
+        curTheme === "sky-blue"
+          ? "2, 132, 199"
+          : curTheme === "pure-white"
+            ? "17, 17, 17"
+            : "212, 175, 55";
+      const nodeRgb =
+        curTheme === "sky-blue"
+          ? "6, 182, 212"
+          : curTheme === "pure-white"
+            ? "75, 85, 99"
+            : "245, 215, 127";
+
       for (let i = 0; i < nodes.length; i++) {
         const n = nodes[i];
         n.x += n.vx;
@@ -127,7 +147,7 @@ export function AudioCenterCard({ isArabic, onOpenUpload, className = "" }: Audi
           const dist = Math.sqrt(dx * dx + dy * dy);
           if (dist < 78) {
             const alpha = (1 - dist / 78) * 0.12;
-            ctx.strokeStyle = `rgba(212, 175, 55, ${alpha.toFixed(3)})`;
+            ctx.strokeStyle = `rgba(${lineRgb}, ${alpha.toFixed(3)})`;
             ctx.lineWidth = 0.8;
             ctx.beginPath();
             ctx.moveTo(n.x, n.y);
@@ -137,7 +157,7 @@ export function AudioCenterCard({ isArabic, onOpenUpload, className = "" }: Audi
         }
 
         const pulse = 0.25 + 0.2 * Math.sin(t * 2 + n.phase);
-        ctx.fillStyle = `rgba(245, 215, 127, ${pulse.toFixed(3)})`;
+        ctx.fillStyle = `rgba(${nodeRgb}, ${pulse.toFixed(3)})`;
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
         ctx.fill();

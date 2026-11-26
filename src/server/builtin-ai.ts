@@ -1,5 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
 import type {
   ActionItemRecord,
   FlashcardRecord,
@@ -1203,30 +1201,54 @@ const KNOWLEDGE_BASE: KnowledgeTopic[] = [
 ];
 
 // ============================================================================
-// MANDATORY AI IDENTITY HANDLER (ARABIC & ENGLISH — <5ms, ZERO EXCEPTIONS)
+// MANDATORY AI IDENTITY HANDLER (ARABIC & ENGLISH — CONTEXT-AWARE, NON-REPETITIVE)
 // ============================================================================
 export const MEETMIND_IDENTITY_AR =
-  "أنا مساعد MeetMind AI الذكي، مبرمجني مجموعة من مهندسين برمجة قسم علوم حاسب مودرن أكاديمي.\n\nيمكنني مساعدتك في تحليل وتلخيص المحاضرات والاجتماعات الصوتية، استخراج المهام والقرارات، إنشاء الاختبارات والبطاقات التعليمية، والإجابة على أي سؤال علمي أو برمجي أو دراسي باللغتين العربية والإنجليزية.";
+  "أنا MeetMind AI، المساعد الذكي داخل منصة MeetMind AI.\nتم تطويري وبرمجتي بواسطة مجموعة من مهندسي البرمجة من قسم علوم الحاسب في Modern Academy.";
 
 export const MEETMIND_IDENTITY_EN =
-  "I am MeetMind AI, programmed by a team of Software Engineers from the Computer Science Department at Modern Academy.\n\nI can help you summarize and analyze lectures and meetings, extract decisions and action items, generate grounded quizzes and flashcards, and answer technical, academic, or general questions in English and Arabic.";
+  "I am MeetMind AI, the intelligent assistant integrated into the MeetMind AI platform.\nI was programmed and developed by a group of software engineering students from the Computer Science Department at Modern Academy.";
 
 export function tryAnswerIdentityQuery(
   question: string,
   appLanguage?: "en" | "ar",
+  recentAssistantMessages: string[] = [],
 ): { answer: string; isAr: boolean } | null {
   const q = String(question || "").trim();
-  if (!q || q.length > 180) return null;
+  if (!q || q.length > 280) return null;
   const norm = normalizeText(q);
   const isAr = detectIsArabic(q, appLanguage);
 
+  // Explicit "Are you ChatGPT / Gemini / Claude?" check
+  const chatGptRx =
+    /(?:هل\s*(?:انت|أنت)\s*(?:شات\s*جي\s*بي\s*تي|chatgpt|gpt|جيميناي|gemini|كلود|claude|جوجل|google)|انت\s*(?:شات\s*جي\s*بي\s*تي|chatgpt|gpt|gemini|claude)|are\s+you\s+(?:chatgpt|gpt|openai|gemini|google|claude|gemma))/i;
+  if (chatGptRx.test(q)) {
+    return {
+      answer: isAr
+        ? "لا، أنا لست ChatGPT. أنا **MeetMind AI**، المساعد الذكي المدمج داخل منصة MeetMind AI، وأعمل بنموذج الذكاء الاصطناعي المُعد داخل المنصة.\nتم تطويري وبرمجتي بواسطة مجموعة من مهندسي البرمجة من قسم علوم الحاسب في Modern Academy."
+        : "No, I am not ChatGPT. I am the **MeetMind AI** assistant powered by the AI model configured by the platform, developed by software engineering students from the Computer Science Department at Modern Academy.",
+      isAr,
+    };
+  }
+
   const arIdentityRx =
-    /(?:^|\s)(?:انت\s*مين|من\s*انت|مين\s*انت|مين\s*(?:اللي\s*)?(?:برمجك|عملك|طورك|صممك|صنعك|انشاك|اسسك|بناك|وراك)|من\s*(?:الذي\s*)?(?:برمجك|عملك|طورك|صممك|صنعك|انشاك|اسسك|بناك)|مين\s*(?:مبرمجك|مطورك|مطورينك|مبرمجينك)|من\s*(?:هو\s*)?(?:مبرمجك|مطورك|صانعك)|انت\s*تبع\s*مين|تبع\s*مين|تابع\s*لمين|عرفني\s*بنفسك|عرف\s*بنفسك|اسمك\s*ايه|ما\s*اسمك|تقدر\s*تعمل\s*ايه|ما\s*هي\s*مميزاتك|انت\s*(?:جوجل|غوغل|جيما|شات\s*جي\s*بي\s*تي|موديل\s*ايه)|شغال\s*بايه)(?:\s|$)/i;
+    /(?:^|\s)(?:انت\s*مين|من\s*انت|مين\s*انت|مين\s*(?:اللي\s*)?(?:برمجك|عملك|طورك|صممك|صنعك|انشاك|اسسك|بناك|وراك)|من\s*(?:الذي\s*)?(?:برمجك|عملك|طورك|صممك|صنعك|انشاك|اسسك|بناك)|مين\s*(?:مبرمجك|مطورك|مطورينك|مبرمجينك|مصممك|صانعك)|من\s*(?:هو\s*)?(?:مبرمجك|مطورك|صانعك|مصممك)|انت\s*تبع\s*مين|تبع\s*مين|تابع\s*لمين|عرفني\s*بنفسك|عرف\s*بنفسك|اسمك\s*ايه|انت\s*اسمك\s*ايه|ما\s*اسمك|هويتك|شغال\s*بايه)(?:\s|$)/i;
 
   const enIdentityRx =
-    /\b(?:who\s+(?:are\s+you|made\s+you|programmed\s+you|built\s+you|created\s+you|developed\s+you|designed\s+you|trained\s+you|owns\s+you)|who\s+(?:is|are)\s+your\s+(?:creator|creators|developer|developers|programmer|programmers|maker|makers|team|author|authors)|what\s+(?:are\s+you|is\s+your\s+name|model\s+are\s+you)|introduce\s+yourself|tell\s+me\s+about\s+yourself|are\s+you\s+(?:google|gemma|openai|chatgpt|gemini))\b/i;
+    /\b(?:who\s+(?:are\s+you|made\s+you|programmed\s+you|built\s+you|created\s+you|developed\s+you|designed\s+you|trained\s+you|owns\s+you)|who\s+(?:is|are)\s+your\s+(?:creator|creators|developer|developers|programmer|programmers|maker|makers|designer|designers|team|author|authors)|what\s+(?:are\s+you|is\s+your\s+name|model\s+are\s+you)|introduce\s+yourself|tell\s+me\s+about\s+yourself)\b/i;
 
   if (arIdentityRx.test(norm) || enIdentityRx.test(q)) {
+    const alreadyAnswered = recentAssistantMessages.some((m) =>
+      /(Modern Academy|مهندسي البرمجة|software engineering students)/i.test(m),
+    );
+    if (alreadyAnswered) {
+      return {
+        answer: isAr
+          ? "أنا MeetMind AI 😄\nولو تقصد مين اللي طورني، فأنا تم تطويري بواسطة مجموعة من مهندسي البرمجة من قسم علوم الحاسب في Modern Academy. تحب نكمل في سؤال معين؟"
+          : "I'm still MeetMind AI! As mentioned, I was developed by software engineering students from the Computer Science Department at Modern Academy. What would you like to ask next?",
+        isAr,
+      };
+    }
     return {
       answer: isAr ? MEETMIND_IDENTITY_AR : MEETMIND_IDENTITY_EN,
       isAr,
@@ -1989,12 +2011,14 @@ export function buildBuiltInQuiz(
   const clauses = splitIntoClauses(segments);
   const questions: BuiltInQuizQuestion[] = [];
   const seenQuestions = new Set<string>(avoidSet);
+  const requestedDifficulty =
+    options?.difficulty && options.difficulty !== "all" ? options.difficulty : undefined;
 
   const pushQuestion = (q: BuiltInQuizQuestion) => {
     const key = normalizeText(q.question);
     if (!key || seenQuestions.has(key) || questions.length >= targetCount) return;
     seenQuestions.add(key);
-    questions.push(q);
+    questions.push(requestedDifficulty ? { ...q, difficulty: requestedDifficulty } : q);
   };
 
   // 1. Quantitative / Specification MCQs (sharp, factual, non-trivial!)
@@ -2173,6 +2197,52 @@ export function buildBuiltInQuiz(
       sourceTranscriptSegment: cl.segmentText,
       groundingVerified: true,
     });
+  }
+
+  // 4b. Grounded Short-Answer / Analytical Questions (always include at least 1 when targetCount >= 4)
+  const shortAnswerSlot =
+    targetCount >= 4 && !questions.some((q) => q.type === "short_answer")
+      ? Math.max(1, Math.min(2, Math.floor(targetCount / 4)))
+      : 0;
+  if (shortAnswerSlot > 0) {
+    // Make room if earlier MCQ/TF stages filled all targetCount slots
+    if (questions.length >= targetCount && questions.length >= 2) {
+      questions.splice(questions.length - 1, 1);
+    }
+    const shortCandidates = [
+      ...facts.filter((f) => f.kind === "definition" || f.kind === "entity" || f.kind === "spec"),
+    ];
+    for (let i = 0; i < shortCandidates.length && questions.length < targetCount; i++) {
+      const f = shortCandidates[i];
+      if (!f.value || f.value.length < 2) continue;
+      const alreadyUsed = questions.some(
+        (q) =>
+          q.type === "short_answer" &&
+          normalizeText(q.correctAnswerText || "") === normalizeText(f.value),
+      );
+      if (alreadyUsed) continue;
+      pushQuestion({
+        id: `q_sa_${Date.now()}_${questions.length + 1}`,
+        question: isAr
+          ? `باختصار، ما الذي ذُكر في «${title}» بخصوص (${f.labelAr})؟ اذكر التفاصيل الدقيقة.`
+          : `Briefly explain what was stated in "${title}" regarding "${f.labelEn}".`,
+        type: "short_answer",
+        options: [],
+        correctOptionIndex: 0,
+        correctAnswerText: `${f.value} — ${f.clause}`,
+        acceptableAnswers: [f.value, f.clause],
+        explanation: isAr
+          ? `الإجابة النموذجية الموثقة عند [${f.timestamp}]: «${f.value}» في سياق «${f.clause}».`
+          : `Verified model answer from [${f.timestamp}]: "${f.value}" in context: "${f.clause}".`,
+        difficulty: requestedDifficulty || "hard",
+        sectionRef: isAr ? f.labelAr : f.labelEn,
+        timestampRef: f.timestamp,
+        sourceReference: `${isAr ? f.labelAr : f.labelEn} [${f.timestamp}]`,
+        sourceTranscriptSegment: f.segmentText,
+        groundingVerified: true,
+      });
+      if (questions.filter((q) => q.type === "short_answer").length >= shortAnswerSlot) break;
+    }
   }
 
   // 5. Fallback True/False for any remaining slots on sparse transcripts
@@ -2390,122 +2460,4 @@ export function buildBuiltInMindMap(
     description: summary.executiveSummary.slice(0, 180),
     children: branches.slice(0, 4),
   };
-}
-
-// ============================================================================
-// BUILT-IN AUDIO ACOUSTIC INSPECTOR (LAST-RESORT FALLBACK WHEN ASR CANNOT RUN)
-// ============================================================================
-export function buildBuiltInAudioFallbackSegments(params: {
-  filePath: string;
-  originalFilename: string;
-  title: string;
-  resourceType: "meeting" | "lecture";
-  durationSeconds: number;
-  language?: string;
-  appLanguage?: "en" | "ar";
-  jobId: string;
-}): TranscriptSegment[] {
-  const { filePath, originalFilename, title, resourceType, language, appLanguage, jobId } = params;
-  const isAr = appLanguage === "ar" || (language ? language.toLowerCase().startsWith("ar") : true);
-
-  let sizeBytes = 0;
-  let sampleRate = 16000;
-  let channels = 1;
-  let detectedWindows: Array<{ start: number; end: number; energy: number }> = [];
-
-  try {
-    if (fs.existsSync(filePath)) {
-      const stat = fs.statSync(filePath);
-      sizeBytes = stat.size;
-      const buf = fs.readFileSync(filePath);
-
-      if (buf.length > 44 && buf.subarray(0, 4).toString("ascii") === "RIFF") {
-        channels = buf.readUInt16LE(22) || 1;
-        sampleRate = buf.readUInt32LE(24) || 16000;
-        const bitsPerSample = buf.readUInt16LE(34) || 16;
-        const bytesPerSample = Math.max(1, bitsPerSample / 8);
-        const dataOffset = 44;
-        const totalSamples = Math.floor((buf.length - dataOffset) / (bytesPerSample * channels));
-        const totalSec = Math.max(1, Math.round(totalSamples / sampleRate));
-        const windowCount = Math.min(5, Math.max(2, Math.ceil(totalSec / 25)));
-        const windowSec = Math.max(2, Math.floor(totalSec / windowCount));
-
-        for (let w = 0; w < windowCount; w++) {
-          const startS = w * windowSec;
-          const endS = w === windowCount - 1 ? totalSec : (w + 1) * windowSec;
-          let sumSq = 0;
-          let count = 0;
-          const startByte = dataOffset + startS * sampleRate * channels * bytesPerSample;
-          const endByte = Math.min(
-            buf.length - 2,
-            dataOffset + endS * sampleRate * channels * bytesPerSample,
-          );
-          const step = Math.max(2, Math.floor((endByte - startByte) / 2000) * 2);
-          for (let pos = startByte; pos < endByte; pos += step) {
-            const sample = buf.readInt16LE(pos) / 32768;
-            sumSq += sample * sample;
-            count++;
-          }
-          const rms = count > 0 ? Math.sqrt(sumSq / count) : 0.1;
-          detectedWindows.push({ start: startS, end: endS, energy: Number(rms.toFixed(3)) });
-        }
-      }
-    }
-  } catch {
-    // Non-WAV formats fall through to container metadata
-  }
-
-  const safeDur = Math.max(
-    10,
-    params.durationSeconds || detectedWindows[detectedWindows.length - 1]?.end || 30,
-  );
-  const ext =
-    path
-      .extname(originalFilename || filePath)
-      .replace(".", "")
-      .toUpperCase() || "AUDIO";
-  const sizeKb = Math.max(1, Math.round(sizeBytes / 1024));
-  const speaker =
-    resourceType === "lecture"
-      ? isAr
-        ? "المحاضر"
-        : "Lecturer"
-      : isAr
-        ? "المتحدث الرئيسي"
-        : "Main Speaker";
-
-  if (detectedWindows.length === 0) {
-    const mid = Math.floor(safeDur / 2);
-    detectedWindows = [
-      { start: 0, end: mid, energy: 0.12 },
-      { start: mid, end: safeDur, energy: 0.14 },
-    ];
-  }
-
-  return [
-    {
-      id: `seg_${jobId}_1`,
-      speaker,
-      startTime: detectedWindows[0].start,
-      endTime: detectedWindows[0].end,
-      text: isAr
-        ? `تم استقبال وحفظ التسجيل الصوتي "${title}" بنجاح (صيغة ${ext}، حجم ${sizeKb} كيلوبايت، مدة ${formatMmSs(safeDur)}). تم تحليل المسار الصوتي وتجهيز الملخص والاختبار والبطاقات التعليمية عبر محرك MeetMind المدمج.`
-        : `Audio recording "${title}" has been verified and saved (${ext}, ${sizeKb} KB, duration ${formatMmSs(safeDur)}). Audio stream analyzed and processed via the built-in MeetMind AI engine for summary, study notes, and quiz generation.`,
-      confidence: 0.92,
-      language: isAr ? "ar" : "en",
-      isPartial: false,
-    },
-    {
-      id: `seg_${jobId}_2`,
-      speaker,
-      startTime: detectedWindows[detectedWindows.length - 1].start,
-      endTime: detectedWindows[detectedWindows.length - 1].end,
-      text: isAr
-        ? `تم رصد ${detectedWindows.length} مقاطع صوتية نشطة في "${title}" (معدل العينة ${sampleRate} هرتز، ${channels} قناة). يمكنك تشغيل الصوت مباشرة أو طرح أي سؤال حول "${title}" في شات MeetMind AI أو تعديل النص وإعادة التلخيص في أي وقت.`
-        : `Detected ${detectedWindows.length} active audio windows in "${title}" (${sampleRate} Hz, ${channels} ch). You can play back the original recording, ask MeetMind AI Chat anything about "${title}", or add notes and regenerate summaries and quizzes anytime.`,
-      confidence: 0.9,
-      language: isAr ? "ar" : "en",
-      isPartial: false,
-    },
-  ];
 }

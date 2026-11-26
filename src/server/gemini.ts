@@ -86,6 +86,8 @@ export function getGeminiClient(): GoogleGenAI | null {
 export interface GeminiConfig {
   textModel: string;
   fallbackTextModel: string;
+  chatModel: string;
+  fallbackChatModel: string;
   asrModel: string;
   fallbackAsrModel: string;
   maxRetries: number;
@@ -102,11 +104,18 @@ export function getGeminiConfig(): GeminiConfig {
     parseInt(process.env.GEMINI_RETRY_MAX_DELAY_MS || "8000", 10),
   );
 
+  const textModel = (process.env.GEMINI_MODEL || "gemini-3.5-flash").trim();
+  const fallbackTextModel = (process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite").trim();
+  const chatModel = (process.env.GEMINI_CHAT_MODEL || textModel).trim();
+  const fallbackChatModel = (process.env.GEMINI_CHAT_FALLBACK_MODEL || fallbackTextModel).trim();
+
   return {
-    textModel: (process.env.GEMINI_MODEL || "gemini-3.5-flash").trim(),
-    fallbackTextModel: (process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite").trim(),
+    textModel,
+    fallbackTextModel,
+    chatModel,
+    fallbackChatModel,
     asrModel: (process.env.GEMINI_ASR_MODEL || "gemini-3.5-transcribe").trim(),
-    fallbackAsrModel: (process.env.GEMINI_ASR_FALLBACK_MODEL || "gemini-3.5-flash").trim(),
+    fallbackAsrModel: (process.env.GEMINI_ASR_FALLBACK_MODEL || textModel).trim(),
     maxRetries: Number.isFinite(maxRetries) ? maxRetries : 3,
     baseDelayMs: Number.isFinite(baseDelayMs) ? baseDelayMs : 1000,
     maxDelayMs: Number.isFinite(maxDelayMs) ? maxDelayMs : 8000,
@@ -207,8 +216,25 @@ export interface GeminiLogEvent {
   attempt?: number;
   maxRetries?: number;
   retryDelayMs?: number;
+  latencyMs?: number;
+  ttftMs?: number;
+  errorCategory?: string;
   finalFailureReason?: string;
   detail?: string;
+}
+
+export function categorizeAiError(err: unknown): string {
+  const status = extractHttpStatus(err);
+  if (isBillingExhaustionError(err)) return "billing_exhausted";
+  if (status === 401 || status === 403) return "auth_error";
+  if (status === 400) return "validation_error";
+  if (status === 404) return "model_not_found";
+  if (status === 429) return "rate_limited";
+  if (status && status >= 500) return "upstream_server_error";
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err || "").toLowerCase();
+  if (msg.includes("timeout") || msg.includes("timed out")) return "timeout";
+  if (/fetch failed|enotfound|econnrefused|econnreset|network/.test(msg)) return "network_error";
+  return "unknown_error";
 }
 
 export function logGeminiStructured(evt: GeminiLogEvent): void {
@@ -223,6 +249,9 @@ export function logGeminiStructured(evt: GeminiLogEvent): void {
     attempt: evt.attempt,
     maxRetries: evt.maxRetries,
     retryDelayMs: evt.retryDelayMs,
+    latencyMs: evt.latencyMs,
+    ttftMs: evt.ttftMs,
+    errorCategory: evt.errorCategory,
     finalFailureReason: evt.finalFailureReason
       ? sanitizeLogText(evt.finalFailureReason)
       : undefined,
@@ -247,6 +276,7 @@ export async function executeWithRetryAndFallback<T>(
     maxRetries?: number;
     baseDelayMs?: number;
     maxDelayMs?: number;
+    timeoutMs?: number;
   },
 ): Promise<{ result: T; modelUsed: string; attemptsMade: number }> {
   const config = getGeminiConfig();
@@ -255,6 +285,26 @@ export async function executeWithRetryAndFallback<T>(
   const maxRetries = options?.maxRetries ?? config.maxRetries;
   const baseDelayMs = options?.baseDelayMs ?? config.baseDelayMs;
   const maxDelayMs = options?.maxDelayMs ?? config.maxDelayMs;
+  const timeoutMs = options?.timeoutMs ?? 45000;
+
+  const invokeWithTimeout = async (model: string): Promise<T> => {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return fn(model);
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        fn(model),
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Gemini request timed out after ${timeoutMs}ms (${operation})`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 
   const modelsToTry: string[] = [primaryModel];
   if (fallbackModel && fallbackModel !== primaryModel) {
@@ -272,7 +322,7 @@ export async function executeWithRetryAndFallback<T>(
     for (let attempt = 0; attempt < modelMaxAttempts; attempt++) {
       totalAttempts++;
       try {
-        const result = await fn(currentModel);
+        const result = await invokeWithTimeout(currentModel);
         if (totalAttempts > 1) {
           logGeminiStructured({
             level: "info",

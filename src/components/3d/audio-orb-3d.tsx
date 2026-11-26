@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { RotateCw, Eye, Cpu } from "lucide-react";
@@ -16,7 +16,7 @@ interface AudioOrb3DProps {
 // Pre-allocated module-level helpers to guarantee zero GC allocations in the render loop
 const _tempColor = new THREE.Color();
 
-export function AudioOrb3D({
+export const AudioOrb3D = memo(function AudioOrb3D({
   isPlaying = true,
   className = "",
   size = "md",
@@ -34,6 +34,7 @@ export function AudioOrb3D({
 
   const audioSystemMode = useUIStore((s) => s.audioSystemMode);
   const audioJobProgress = useUIStore((s) => s.audioJobProgress);
+  const resolvedTheme = useUIStore((s) => s.resolvedTheme);
 
   // Store reactive props in refs so React updates never tear down or recreate the WebGL context
   const stateRef = useRef<{
@@ -41,11 +42,13 @@ export function AudioOrb3D({
     wireframeMode: boolean;
     speedMultiplier: number;
     systemMode: AudioSystemMode;
+    theme: typeof resolvedTheme;
   }>({
     isPlaying,
     wireframeMode,
     speedMultiplier,
     systemMode: audioSystemMode,
+    theme: resolvedTheme,
   });
 
   useEffect(() => {
@@ -53,7 +56,8 @@ export function AudioOrb3D({
     stateRef.current.wireframeMode = wireframeMode;
     stateRef.current.speedMultiplier = speedMultiplier;
     stateRef.current.systemMode = audioSystemMode;
-  }, [isPlaying, wireframeMode, speedMultiplier, audioSystemMode]);
+    stateRef.current.theme = resolvedTheme;
+  }, [isPlaying, wireframeMode, speedMultiplier, audioSystemMode, resolvedTheme]);
 
   useEffect(() => {
     setMounted(true);
@@ -408,6 +412,68 @@ export function AudioOrb3D({
       }
     }
 
+    let appliedTheme = "";
+    const applyScenePalette = (themeId: string) => {
+      if (appliedTheme === themeId) return;
+      appliedTheme = themeId;
+      if (themeId === "sky-blue") {
+        (scene.fog as THREE.FogExp2).color.setHex(0xf4faff);
+        hemiLight.color.setHex(0xffffff);
+        hemiLight.groundColor.setHex(0xeaf6ff);
+        keyLight.color.setHex(0x38bdf8);
+        rimLight.color.setHex(0x0284c7);
+        coreMat.color.setHex(0x0369a1);
+        latticeMat.color.setHex(0x0284c7);
+        latticeMat.emissive.setHex(0x38bdf8);
+        ringMatPrimary.color.setHex(0x0284c7);
+        ringMatPrimary.emissive.setHex(0x0369a1);
+        ringMatSecondary.color.setHex(0x06b6d4);
+        ringMatSecondary.emissive.setHex(0x38bdf8);
+        waveLayer1.mat.color.setHex(0x0284c7);
+        waveLayer2.mat.color.setHex(0x38bdf8);
+        waveLayer3.mat.color.setHex(0x06b6d4);
+        nodeMat.emissive.setHex(0x0284c7);
+        particleMat.color.setHex(0x0284c7);
+      } else if (themeId === "pure-white") {
+        (scene.fog as THREE.FogExp2).color.setHex(0xf7f8fa);
+        hemiLight.color.setHex(0xffffff);
+        hemiLight.groundColor.setHex(0xd1d5db);
+        keyLight.color.setHex(0xffffff);
+        rimLight.color.setHex(0x374151);
+        coreMat.color.setHex(0x111111);
+        latticeMat.color.setHex(0x374151);
+        latticeMat.emissive.setHex(0x111111);
+        ringMatPrimary.color.setHex(0x111111);
+        ringMatPrimary.emissive.setHex(0x1f2937);
+        ringMatSecondary.color.setHex(0x4b5563);
+        ringMatSecondary.emissive.setHex(0x374151);
+        waveLayer1.mat.color.setHex(0x111111);
+        waveLayer2.mat.color.setHex(0x4b5563);
+        waveLayer3.mat.color.setHex(0x6b7280);
+        nodeMat.emissive.setHex(0x111111);
+        particleMat.color.setHex(0x4b5563);
+      } else {
+        (scene.fog as THREE.FogExp2).color.setHex(0x09090b);
+        hemiLight.color.setHex(0xfff4d2);
+        hemiLight.groundColor.setHex(0x12100b);
+        keyLight.color.setHex(0xffdf80);
+        rimLight.color.setHex(0xd4af37);
+        coreMat.color.setHex(0x1c1608);
+        latticeMat.color.setHex(0xf3cf65);
+        latticeMat.emissive.setHex(0x9a7b1c);
+        ringMatPrimary.color.setHex(0xd4af37);
+        ringMatPrimary.emissive.setHex(0xb8860b);
+        ringMatSecondary.color.setHex(0xffe58f);
+        ringMatSecondary.emissive.setHex(0xd4af37);
+        waveLayer1.mat.color.setHex(0xfff3b0);
+        waveLayer2.mat.color.setHex(0xd4af37);
+        waveLayer3.mat.color.setHex(0xb8860b);
+        nodeMat.emissive.setHex(0xffd700);
+        particleMat.color.setHex(0xffe484);
+      }
+    };
+    applyScenePalette(stateRef.current.theme);
+
     const tick = () => {
       if (disposed) return;
 
@@ -418,7 +484,13 @@ export function AudioOrb3D({
       }
 
       const delta = Math.min(clock.getDelta(), 0.1);
-      const { wireframeMode: wf, speedMultiplier: spd, systemMode } = stateRef.current;
+      const {
+        wireframeMode: wf,
+        speedMultiplier: spd,
+        systemMode,
+        theme: curTheme,
+      } = stateRef.current;
+      applyScenePalette(curTheme);
 
       if (coreMat.wireframe !== wf) {
         coreMat.wireframe = wf;
@@ -532,7 +604,11 @@ export function AudioOrb3D({
       // Subtle emissive intensity modulation
       coreMat.emissiveIntensity = 0.34 + smoothedEnergy * 0.55 + Math.sin(elapsed * 2.2) * 0.08;
 
-      if (isProcessingStage) {
+      if (curTheme === "sky-blue") {
+        _tempColor.setHex(isProcessingStage ? 0x06b6d4 : 0x0284c7);
+      } else if (curTheme === "pure-white") {
+        _tempColor.setHex(0x374151);
+      } else if (isProcessingStage) {
         _tempColor.setHex(0xf59e0b);
       } else {
         _tempColor.setHex(0xd4af37);
@@ -548,7 +624,17 @@ export function AudioOrb3D({
       }
     };
 
-    frameId = requestAnimationFrame(tick);
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (prefersReducedMotion) {
+      // Render a single high-craft static frame and skip continuous animation loop
+      renderer.render(scene, camera);
+    } else {
+      frameId = requestAnimationFrame(tick);
+    }
 
     // 11. ResizeObserver
     const handleResize = () => {
@@ -558,6 +644,9 @@ export function AudioOrb3D({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      if (prefersReducedMotion) {
+        renderer.render(scene, camera);
+      }
     };
 
     const resizeObserver = new ResizeObserver(handleResize);
@@ -679,4 +768,4 @@ export function AudioOrb3D({
       </div>
     </div>
   );
-}
+});

@@ -14,11 +14,12 @@ import {
   Bot,
   User,
   FileAudio,
+  Square,
+  RotateCcw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { useUIStore } from "@/stores/ui-store";
-import { api, GroundedAnswer, Lecture, Meeting } from "@/lib/api-client";
+import { api, Lecture, Meeting } from "@/lib/api-client";
 import { useTranslation } from "@/lib/i18n";
 import { toast } from "sonner";
 
@@ -26,6 +27,9 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   citations?: { speaker: string; timestamp: string; quote: string }[];
+  streaming?: boolean;
+  error?: boolean;
+  retryQuestion?: string;
 }
 
 function renderInlineMarkdown(text: string): ReactNode[] {
@@ -84,15 +88,36 @@ function AssistantMarkdown({ text }: { text: string }) {
     if (!segment) continue;
 
     if (segment.startsWith("```") && segment.endsWith("```")) {
-      const inner = segment.slice(3, -3).replace(/^[a-zA-Z0-9_-]*\n/, "");
+      const firstNewline = segment.indexOf("\n");
+      const langLabel =
+        firstNewline > 3 ? segment.slice(3, firstNewline).trim().slice(0, 24) : "code";
+      const inner = (
+        firstNewline > 3 ? segment.slice(firstNewline + 1, -3) : segment.slice(3, -3)
+      ).trimEnd();
       blocks.push(
-        <pre
+        <div
           key={`pre-${blockKey++}`}
           dir="ltr"
-          className="my-2 overflow-x-auto rounded-lg border border-border/60 bg-background/85 p-2.5 font-mono text-[11px] leading-relaxed text-foreground"
+          className="my-2 overflow-hidden rounded-lg border border-border/60 bg-background/90"
         >
-          <code>{inner.trimEnd()}</code>
-        </pre>,
+          <div className="flex items-center justify-between border-b border-border/50 bg-secondary/40 px-2.5 py-1 text-[10px] font-mono text-muted-foreground">
+            <span>{langLabel || "code"}</span>
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard.writeText(inner);
+                toast.success("Code copied");
+              }}
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] hover:bg-background/80 hover:text-foreground cursor-pointer"
+            >
+              <Copy className="h-2.5 w-2.5" />
+              <span>Copy</span>
+            </button>
+          </div>
+          <pre className="overflow-x-auto p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
+            <code>{inner}</code>
+          </pre>
+        </div>,
       );
       continue;
     }
@@ -136,6 +161,65 @@ function AssistantMarkdown({ text }: { text: string }) {
           ),
         );
         i++;
+        continue;
+      }
+
+      if (
+        trimmed.includes("|") &&
+        i + 1 < lines.length &&
+        /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1].trim())
+      ) {
+        const splitRow = (line: string): string[] =>
+          line
+            .trim()
+            .replace(/^\|/, "")
+            .replace(/\|$/, "")
+            .split("|")
+            .map((cell) => cell.trim());
+
+        const headers = splitRow(trimmed);
+        i += 2; // skip header + separator line
+        const rows: string[][] = [];
+        while (i < lines.length && lines[i].trim().includes("|") && !/^\s*$/.test(lines[i])) {
+          rows.push(splitRow(lines[i]));
+          i++;
+        }
+
+        blocks.push(
+          <div
+            key={`tbl-${blockKey++}`}
+            className="my-2 overflow-x-auto rounded-lg border border-border/60 bg-background/70"
+          >
+            <table className="w-full border-collapse text-[11px]">
+              <thead>
+                <tr className="border-b border-border/60 bg-secondary/50">
+                  {headers.map((cell, cIdx) => (
+                    <th
+                      key={cIdx}
+                      className="px-2.5 py-1.5 text-start font-semibold text-foreground"
+                    >
+                      {renderInlineMarkdown(cell)}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, rIdx) => (
+                  <tr
+                    key={rIdx}
+                    className="border-b border-border/40 last:border-b-0 even:bg-secondary/20"
+                  >
+                    {headers.map((_, cIdx) => (
+                      <td key={cIdx} className="px-2.5 py-1.5 align-top text-foreground/90">
+                        {renderInlineMarkdown(row[cIdx] || "")}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>,
+        );
         continue;
       }
 
@@ -491,7 +575,9 @@ export function FloatingAIAssistant() {
       ];
 
   const [input, setInput] = useState("");
+  // "" = General AI + All Recordings, "__general__" = Pure General AI Only, otherwise specific meeting/lecture ID
   const [selectedResourceId, setSelectedResourceId] = useState<string>("");
+  const inputTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([defaultGreeting]);
   const [suggestions, setSuggestions] = useState<string[]>(defaultSuggestions);
   const [isLoading, setIsLoading] = useState(false);
@@ -499,6 +585,8 @@ export function FloatingAIAssistant() {
   const [laserEvent, setLaserEvent] = useState<LaserEvent | null>(null);
   const [geniePhase, setGeniePhase] = useState<"idle" | "opening" | "closing">("idle");
   const [fabCoords, setFabCoords] = useState<{ x: number; y: number } | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const isNearBottomRef = useRef(true);
 
   const { data: meetings = [] } = useQuery<Meeting[]>({
     queryKey: ["meetings"],
@@ -511,6 +599,45 @@ export function FloatingAIAssistant() {
     queryFn: () => api.getLectures(),
     enabled: open,
   });
+
+  const effectiveResourceId =
+    selectedResourceId && selectedResourceId !== "__general__" ? selectedResourceId : undefined;
+  const effectiveScope: "general" | "all-recordings" | "recording" = effectiveResourceId
+    ? "recording"
+    : selectedResourceId === "__general__"
+      ? "general"
+      : "all-recordings";
+
+  // Load persisted conversation history from database for the active scope (survives refresh & re-login)
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void api
+      .getChatHistory(
+        effectiveResourceId ? { resourceId: effectiveResourceId } : { scope: "general" },
+      )
+      .then((persisted) => {
+        if (cancelled) return;
+        if (Array.isArray(persisted) && persisted.length > 0) {
+          setMessages(
+            persisted.map((m) => ({
+              role: m.role,
+              text: m.content,
+              citations: m.citations,
+            })),
+          );
+        } else {
+          setMessages([defaultGreeting]);
+        }
+      })
+      .catch(() => {
+        // Non-fatal: keep current messages
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, effectiveResourceId]);
 
   useEffect(() => {
     setMessages((prev) => (prev.length <= 1 ? [defaultGreeting] : prev));
@@ -532,15 +659,23 @@ export function FloatingAIAssistant() {
     void api.warmupAi().catch(() => {});
   }, [open]);
 
+  // Abort active stream on unmount
+  useEffect(() => {
+    return () => {
+      streamAbortRef.current?.abort();
+    };
+  }, []);
+
   const prevOpenRef = useRef<boolean>(open);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Auto-scroll chat body when messages or loading state changes
+  // Smart auto-scroll: follow streaming tokens while near bottom without fighting user manual scroll
   useEffect(() => {
-    if (chatScrollRef.current) {
-      chatScrollRef.current.scrollTo({
-        top: chatScrollRef.current.scrollHeight,
-        behavior: "smooth",
+    const el = chatScrollRef.current;
+    if (el && isNearBottomRef.current) {
+      el.scrollTo({
+        top: el.scrollHeight,
+        behavior: isLoading ? "auto" : "smooth",
       });
     }
   }, [messages, isLoading, open]);
@@ -602,6 +737,12 @@ export function FloatingAIAssistant() {
   useEffect(() => {
     if (open) {
       setLaserEvent(null);
+      return;
+    }
+    if (
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ) {
       return;
     }
 
@@ -696,58 +837,183 @@ export function FloatingAIAssistant() {
     setTimeout(() => setCopiedIdx(null), 2000);
   };
 
-  const handleClear = () => {
+  const handleClear = async () => {
+    streamAbortRef.current?.abort();
+    setIsLoading(false);
     setMessages([defaultGreeting]);
     setSuggestions(defaultSuggestions);
+    try {
+      await api.clearChatHistory(
+        effectiveResourceId ? { resourceId: effectiveResourceId } : { scope: "general" },
+      );
+    } catch {
+      // keep UI cleared even if network hiccups
+    }
     toast.info(isArabic ? "تم مسح المحادثة" : "Chat cleared");
+  };
+
+  const handleStopStreaming = () => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+    setIsLoading(false);
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i === prev.length - 1 && m.streaming
+          ? {
+              ...m,
+              streaming: false,
+              text:
+                m.text ||
+                (isArabic ? "تم إيقاف التوليد بناءً على طلبك." : "Generation stopped by user."),
+            }
+          : m,
+      ),
+    );
   };
 
   const handleSend = async (questionText?: string) => {
     const q = (questionText || input).trim();
     if (!q || isLoading) return;
 
-    const newMessages: ChatMessage[] = [...messages, { role: "user", text: q }];
-    setMessages(newMessages);
+    // Send prior valid turns only — never duplicate the current question `q` inside `history`
+    const historyBase = messages.filter((m) => !m.error && !m.streaming && m.text.trim());
+    const historyPayload = historyBase.map((m) => ({
+      role: m.role === "user" ? ("user" as const) : ("model" as const),
+      text: m.text,
+    }));
+
+    isNearBottomRef.current = true;
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", text: q },
+      { role: "assistant", text: "", streaming: true, retryQuestion: q },
+    ]);
     setInput("");
+    if (inputTextareaRef.current) {
+      inputTextareaRef.current.style.height = "auto";
+    }
     setIsLoading(true);
 
-    try {
-      const historyPayload = newMessages.map((m) => ({
-        role: m.role === "user" ? ("user" as const) : ("model" as const),
-        text: m.text,
-      }));
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    const timeoutHandle = window.setTimeout(() => controller.abort(), 90_000);
 
-      const res: GroundedAnswer = await api.askQuestion(
-        q,
-        selectedResourceId || undefined,
-        historyPayload,
-      );
-      setMessages((prev) => [
-        ...prev,
+    try {
+      let streamedText = "";
+      let latestCitations: { speaker: string; timestamp: string; quote: string }[] = [];
+
+      const res = await api.askQuestionStream(
         {
-          role: "assistant",
-          text: res.answer,
-          citations: res.citations,
+          question: q,
+          resourceId: effectiveResourceId,
+          scope: effectiveScope,
+          history: historyPayload,
         },
-      ]);
-      if (res.suggestedFollowUps && res.suggestedFollowUps.length > 0) {
-        setSuggestions(res.suggestedFollowUps);
+        {
+          onMeta: (meta) => {
+            if (meta.citations?.length) {
+              latestCitations = meta.citations;
+              setMessages((prev) =>
+                prev.map((m, i) =>
+                  i === prev.length - 1 ? { ...m, citations: latestCitations } : m,
+                ),
+              );
+            }
+          },
+          onToken: (tok) => {
+            streamedText += tok;
+            setMessages((prev) =>
+              prev.map((m, i) =>
+                i === prev.length - 1 ? { ...m, text: streamedText, streaming: true } : m,
+              ),
+            );
+          },
+          onDone: (done) => {
+            const finalText = done.answer || streamedText;
+            const finalCitations = done.citations?.length ? done.citations : latestCitations;
+            setMessages((prev) =>
+              prev.map((m, i) =>
+                i === prev.length - 1
+                  ? {
+                      ...m,
+                      text: finalText,
+                      citations: finalCitations,
+                      streaming: false,
+                      error: false,
+                    }
+                  : m,
+              ),
+            );
+            if (done.suggestedFollowUps && done.suggestedFollowUps.length > 0) {
+              setSuggestions(done.suggestedFollowUps);
+            }
+          },
+        },
+        controller.signal,
+      );
+
+      if (!res.answer && !streamedText) {
+        setMessages((prev) =>
+          prev.map((m, i) =>
+            i === prev.length - 1
+              ? {
+                  ...m,
+                  text: isArabic
+                    ? "لم يتم استلام رد من محرك الذكاء الاصطناعي. يمكنك إعادة المحاولة."
+                    : "No response received from the AI engine. Please retry.",
+                  streaming: false,
+                  error: true,
+                  retryQuestion: q,
+                }
+              : m,
+          ),
+        );
       }
     } catch (err) {
-      const serverErr = err instanceof Error && err.message ? err.message : "";
-      toast.error(serverErr || (isArabic ? "تعذر استرجاع الإجابة" : "Failed to retrieve response"));
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          text:
-            serverErr ||
-            (isArabic
-              ? "حدث خطأ أثناء التواصل مع محرك الذكاء الاصطناعي. يرجى المحاولة مرة أخرى."
-              : "An error occurred while communicating with the AI engine. Please try again."),
-        },
-      ]);
+      const isAborted =
+        controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
+      if (isAborted) {
+        setMessages((prev) =>
+          prev.map((m, i) =>
+            i === prev.length - 1
+              ? {
+                  ...m,
+                  text: m.text || (isArabic ? "تم إيقاف التوليد." : "Generation cancelled."),
+                  streaming: false,
+                }
+              : m,
+          ),
+        );
+      } else {
+        const serverErr = err instanceof Error && err.message ? err.message : "";
+        toast.error(
+          serverErr || (isArabic ? "تعذر استرجاع الإجابة" : "Failed to retrieve response"),
+        );
+        setMessages((prev) =>
+          prev.map((m, i) =>
+            i === prev.length - 1
+              ? {
+                  ...m,
+                  text:
+                    serverErr ||
+                    (isArabic
+                      ? "حدث خطأ أثناء التواصل مع محرك الذكاء الاصطناعي. اضغط إعادة المحاولة."
+                      : "An error occurred while communicating with the AI engine. Click Retry."),
+                  streaming: false,
+                  error: true,
+                  retryQuestion: q,
+                }
+              : m,
+          ),
+        );
+      }
     } finally {
+      window.clearTimeout(timeoutHandle);
+      if (streamAbortRef.current === controller) {
+        streamAbortRef.current = null;
+      }
       setIsLoading(false);
     }
   };
@@ -1198,7 +1464,7 @@ export function FloatingAIAssistant() {
                 {isArabic ? "النطاق:" : "Scope:"}
               </span>
               <select
-                aria-label={isArabic ? "اختر التسجيل" : "Select recording scope"}
+                aria-label={isArabic ? "اختر النطاق" : "Select scope"}
                 value={selectedResourceId}
                 onChange={(e) => setSelectedResourceId(e.target.value)}
                 className="min-w-0 flex-1 truncate rounded-md border border-border/60 bg-secondary/50 px-2 py-1 text-[11px] text-foreground focus:border-primary focus:outline-none"
@@ -1207,6 +1473,9 @@ export function FloatingAIAssistant() {
                   {isArabic
                     ? "مساعد ذكي شامل (أي سؤال + جميع التسجيلات)"
                     : "General AI + All Recordings (Ask anything)"}
+                </option>
+                <option value="__general__">
+                  {isArabic ? "مساعد عام فقط (بدون تسجيلات)" : "General AI Only (No recordings)"}
                 </option>
                 {meetings.map((m) => (
                   <option key={m.id} value={m.id}>
@@ -1224,14 +1493,23 @@ export function FloatingAIAssistant() {
             </div>
 
             {/* Chat Body */}
-            <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-3 max-h-[380px]">
+            <div
+              ref={chatScrollRef}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+              }}
+              className="flex-1 overflow-y-auto p-4 space-y-3 max-h-[380px]"
+            >
               {messages.map((m, idx) => (
                 <div
                   key={idx}
                   className={`group relative rounded-xl p-3 text-xs leading-relaxed transition-all ${
                     m.role === "user"
                       ? "bg-primary text-primary-foreground ml-6 shadow-sm"
-                      : "bg-secondary/70 border border-border/60 mr-4 text-foreground"
+                      : m.error
+                        ? "bg-destructive/10 border border-destructive/40 mr-4 text-foreground"
+                        : "bg-secondary/70 border border-border/60 mr-4 text-foreground"
                   }`}
                 >
                   <div className="flex items-start justify-between gap-2">
@@ -1255,18 +1533,32 @@ export function FloatingAIAssistant() {
                       )}
                     </div>
 
-                    {m.role === "assistant" && (
-                      <button
-                        onClick={() => handleCopy(m.text, idx)}
-                        className="opacity-60 hover:opacity-100 transition p-1 text-muted-foreground rounded hover:bg-background/60"
-                        title={isArabic ? "نسخ الرد" : "Copy text"}
-                      >
-                        {copiedIdx === idx ? (
-                          <Check className="h-3.5 w-3.5 text-emerald-500" />
-                        ) : (
-                          <Copy className="h-3.5 w-3.5" />
+                    {m.role === "assistant" && !m.streaming && (
+                      <div className="flex items-center gap-1">
+                        {m.retryQuestion && (
+                          <button
+                            type="button"
+                            onClick={() => handleSend(m.retryQuestion)}
+                            disabled={isLoading}
+                            className="opacity-70 hover:opacity-100 transition p-1 text-muted-foreground rounded hover:bg-background/60 cursor-pointer"
+                            title={isArabic ? "إعادة المحاولة" : "Retry response"}
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                          </button>
                         )}
-                      </button>
+                        <button
+                          type="button"
+                          onClick={() => handleCopy(m.text, idx)}
+                          className="opacity-60 hover:opacity-100 transition p-1 text-muted-foreground rounded hover:bg-background/60 cursor-pointer"
+                          title={isArabic ? "نسخ الرد" : "Copy text"}
+                        >
+                          {copiedIdx === idx ? (
+                            <Check className="h-3.5 w-3.5 text-emerald-500" />
+                          ) : (
+                            <Copy className="h-3.5 w-3.5" />
+                          )}
+                        </button>
+                      </div>
                     )}
                   </div>
 
@@ -1274,7 +1566,23 @@ export function FloatingAIAssistant() {
                     dir={/[\u0600-\u06FF]/.test(m.text) ? "rtl" : "ltr"}
                     className={m.role === "assistant" ? "space-y-1" : "whitespace-pre-line"}
                   >
-                    {m.role === "assistant" ? <AssistantMarkdown text={m.text} /> : m.text}
+                    {m.role === "assistant" ? (
+                      m.text ? (
+                        <>
+                          <AssistantMarkdown text={m.text} />
+                          {m.streaming && (
+                            <span className="inline-block h-3 w-1.5 animate-pulse bg-primary align-middle ms-1 rounded-xs" />
+                          )}
+                        </>
+                      ) : m.streaming ? (
+                        <div className="flex items-center gap-2 text-muted-foreground">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                          <span>{isArabic ? "جارٍ توليد الرد..." : "Streaming response..."}</span>
+                        </div>
+                      ) : null
+                    ) : (
+                      m.text
+                    )}
                   </div>
 
                   {m.citations && m.citations.length > 0 && (
@@ -1301,17 +1609,6 @@ export function FloatingAIAssistant() {
                   )}
                 </div>
               ))}
-
-              {isLoading && (
-                <div className="flex items-center gap-2.5 text-xs text-muted-foreground p-3 rounded-xl bg-secondary/40 border border-border/40">
-                  <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                  <span>
-                    {isArabic
-                      ? "جاري التفكير العميق وصياغة الإجابة الشاملة..."
-                      : "Synthesizing comprehensive answer..."}
-                  </span>
-                </div>
-              )}
             </div>
 
             {/* Dynamic Quick Suggestions */}
@@ -1319,42 +1616,70 @@ export function FloatingAIAssistant() {
               {suggestions.map((s) => (
                 <button
                   key={s}
+                  type="button"
+                  disabled={isLoading}
                   onClick={() => handleSend(s)}
-                  className="rounded-full border border-border/70 bg-card/60 px-2.5 py-1 text-[11px] text-muted-foreground transition hover:border-primary hover:text-foreground hover:bg-card cursor-pointer"
+                  className="rounded-full border border-border/70 bg-card/60 px-2.5 py-1 text-[11px] text-muted-foreground transition hover:border-primary hover:text-foreground hover:bg-card cursor-pointer disabled:opacity-50"
                 >
                   {s}
                 </button>
               ))}
             </div>
 
-            {/* Input Bar */}
+            {/* Input Bar (Enter sends, Shift+Enter inserts newline) */}
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                handleSend();
+                void handleSend();
               }}
               className="border-t border-border/60 p-2.5 bg-background/70"
             >
-              <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-background px-2.5 py-1.5 focus-within:border-primary/50 transition">
-                <Input
+              <div className="flex items-end gap-2 rounded-xl border border-border/60 bg-background px-2.5 py-1.5 focus-within:border-primary/50 transition">
+                <textarea
+                  ref={inputTextareaRef}
+                  rows={1}
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => {
+                    setInput(e.target.value);
+                    const el = e.currentTarget;
+                    el.style.height = "auto";
+                    el.style.height = `${Math.min(el.scrollHeight, 112)}px`;
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                      e.preventDefault();
+                      void handleSend();
+                    }
+                  }}
                   placeholder={
                     isArabic
-                      ? "اسأل أي سؤال علمي أو تقني أو عن محاضراتك وملفاتك الصوتية..."
-                      : "Ask any question about your recordings or any topic..."
+                      ? "اسأل أي سؤال علمي أو تقني أو عن محاضراتك... (Shift+Enter لسطر جديد)"
+                      : "Ask any question about your recordings or any topic... (Shift+Enter for newline)"
                   }
-                  className="h-8 border-0 bg-transparent px-1 shadow-none focus-visible:ring-0 text-xs"
+                  className="max-h-28 min-h-8 flex-1 resize-none border-0 bg-transparent px-1 py-1.5 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
                   disabled={isLoading}
                 />
-                <Button
-                  type="submit"
-                  size="icon"
-                  disabled={isLoading || !input.trim()}
-                  className="h-8 w-8 gradient-primary text-primary-foreground shrink-0 rounded-lg cursor-pointer shadow-sm"
-                >
-                  <Send className="h-3.5 w-3.5" />
-                </Button>
+                {isLoading ? (
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="destructive"
+                    onClick={handleStopStreaming}
+                    title={isArabic ? "إيقاف التوليد" : "Stop generation"}
+                    className="h-8 w-8 shrink-0 rounded-lg cursor-pointer shadow-sm"
+                  >
+                    <Square className="h-3.5 w-3.5 fill-current" />
+                  </Button>
+                ) : (
+                  <Button
+                    type="submit"
+                    size="icon"
+                    disabled={!input.trim()}
+                    className="h-8 w-8 gradient-primary text-primary-foreground shrink-0 rounded-lg cursor-pointer shadow-sm"
+                  >
+                    <Send className="h-3.5 w-3.5" />
+                  </Button>
+                )}
               </div>
             </form>
           </motion.div>

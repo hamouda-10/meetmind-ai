@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   CheckSquare,
   BarChart3,
@@ -20,7 +20,10 @@ interface AIRadar3DCardProps {
 
 type RadarTab = "tasks" | "analytics" | "study";
 
-export function AIRadar3DCard({ isArabic, className = "" }: AIRadar3DCardProps) {
+export const AIRadar3DCard = memo(function AIRadar3DCard({
+  isArabic,
+  className = "",
+}: AIRadar3DCardProps) {
   const [activeTab, setActiveTab] = useState<RadarTab>("tasks");
   const containerRef = useRef<HTMLDivElement | null>(null);
   const stage3dRef = useRef<HTMLDivElement | null>(null);
@@ -28,6 +31,12 @@ export function AIRadar3DCard({ isArabic, className = "" }: AIRadar3DCardProps) 
 
   const audioSystemMode = useUIStore((s) => s.audioSystemMode);
   const audioJobProgress = useUIStore((s) => s.audioJobProgress);
+  const resolvedTheme = useUIStore((s) => s.resolvedTheme);
+  const themeRef = useRef(resolvedTheme);
+
+  useEffect(() => {
+    themeRef.current = resolvedTheme;
+  }, [resolvedTheme]);
 
   const { data: metrics } = useQuery<DashboardMetrics>({
     queryKey: ["dashboardMetrics"],
@@ -168,6 +177,52 @@ export function AIRadar3DCard({ isArabic, className = "" }: AIRadar3DCardProps) 
     const ro = new ResizeObserver(updateSize);
     ro.observe(container);
 
+    const drawFrameContent = (t: number, dt: number, animate: boolean) => {
+      const curTheme = themeRef.current;
+      const isSkyBlue = curTheme === "sky-blue";
+      const isPureWhite = curTheme === "pure-white";
+      const glowRgb = isSkyBlue ? "2, 132, 199" : isPureWhite ? "17, 17, 17" : "212, 175, 55";
+      const glowEdge = isSkyBlue
+        ? "rgba(244, 250, 255, 0)"
+        : isPureWhite
+          ? "rgba(255, 255, 255, 0)"
+          : "rgba(10, 10, 12, 0)";
+      const starRgb = isSkyBlue ? "2, 132, 199" : isPureWhite ? "75, 85, 99" : "255, 243, 176";
+      const altStarRgb = isSkyBlue ? "6, 182, 212" : starRgb;
+
+      ctx.clearRect(0, 0, width, height);
+      const cx = width * 0.5;
+      const cy = height * 0.5;
+      const glowGrad = ctx.createRadialGradient(cx, cy, 4, cx, cy, 68);
+      glowGrad.addColorStop(
+        0,
+        `rgba(${glowRgb}, ${isPureWhite ? "0.09" : isSkyBlue ? "0.14" : "0.22"})`,
+      );
+      glowGrad.addColorStop(
+        0.55,
+        `rgba(${glowRgb}, ${isPureWhite ? "0.03" : isSkyBlue ? "0.05" : "0.07"})`,
+      );
+      glowGrad.addColorStop(1, glowEdge);
+      ctx.fillStyle = glowGrad;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 68, 0, Math.PI * 2);
+      ctx.fill();
+
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        if (animate) p.angle += p.speed * dt;
+        const px = cx + Math.cos(p.angle) * p.radius * 1.15;
+        const py = cy + Math.sin(p.angle) * p.radius * 0.85;
+        const twinkle = animate ? p.alpha * (0.65 + 0.35 * Math.sin(t * 2.4 + i)) : p.alpha;
+        ctx.fillStyle = `rgba(${i % 2 === 1 ? altStarRgb : starRgb}, ${twinkle.toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(px, py, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    };
+
+    const drawStaticFrame = () => drawFrameContent(0, 0, false);
+
     let rafId = 0;
     let disposed = false;
     let lastTime = performance.now();
@@ -196,36 +251,21 @@ export function AIRadar3DCard({ isArabic, className = "" }: AIRadar3DCardProps) 
         )}deg) rotateY(${curRotY.toFixed(2)}deg)`;
       }
 
-      ctx.clearRect(0, 0, width, height);
-      const cx = width * 0.5;
-      const cy = height * 0.5;
-
-      // Ambient radial gold glow behind the 3D rotating circular frames
-      const glowGrad = ctx.createRadialGradient(cx, cy, 4, cx, cy, 68);
-      glowGrad.addColorStop(0, "rgba(212, 175, 55, 0.22)");
-      glowGrad.addColorStop(0.55, "rgba(212, 175, 55, 0.07)");
-      glowGrad.addColorStop(1, "rgba(10, 10, 12, 0)");
-      ctx.fillStyle = glowGrad;
-      ctx.beginPath();
-      ctx.arc(cx, cy, 68, 0, Math.PI * 2);
-      ctx.fill();
-
-      for (let i = 0; i < particles.length; i++) {
-        const p = particles[i];
-        p.angle += p.speed * dt;
-        const px = cx + Math.cos(p.angle) * p.radius * 1.15;
-        const py = cy + Math.sin(p.angle) * p.radius * 0.85;
-        const twinkle = p.alpha * (0.65 + 0.35 * Math.sin(t * 2.4 + i));
-        ctx.fillStyle = `rgba(255, 243, 176, ${twinkle.toFixed(3)})`;
-        ctx.beginPath();
-        ctx.arc(px, py, p.size, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      drawFrameContent(t, dt, true);
 
       rafId = requestAnimationFrame(tick);
     };
 
-    rafId = requestAnimationFrame(tick);
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (prefersReducedMotion) {
+      drawStaticFrame();
+    } else {
+      rafId = requestAnimationFrame(tick);
+    }
 
     return () => {
       disposed = true;
@@ -408,4 +448,4 @@ export function AIRadar3DCard({ isArabic, className = "" }: AIRadar3DCardProps) 
       </div>
     </div>
   );
-}
+});

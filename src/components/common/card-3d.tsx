@@ -69,11 +69,11 @@ export function Card3D({
             : "rotateX(0deg) rotateY(0deg) scale3d(1, 1, 1)",
           transition: isHovered ? "transform 0.1s ease-out" : "transform 0.5s ease-out",
           transformStyle: "preserve-3d",
+          boxShadow: glow && isHovered ? "0 0 35px var(--color-hover-glow)" : undefined,
         }}
         className={cn(
           "relative rounded-2xl transition-all duration-300",
           goldBorder && "gold-card-animated-border",
-          glow && isHovered && "shadow-[0_0_35px_rgba(212,175,55,0.35)]",
           className,
         )}
         {...props}
@@ -83,7 +83,7 @@ export function Card3D({
           <div
             className="pointer-events-none absolute inset-0 z-30 rounded-2xl opacity-40 transition-opacity"
             style={{
-              background: `radial-gradient(circle 220px at ${glarePos.x}% ${glarePos.y}%, rgba(255, 230, 140, 0.4), transparent 80%)`,
+              background: `radial-gradient(circle 220px at ${glarePos.x}% ${glarePos.y}%, var(--color-glare), transparent 80%)`,
             }}
           />
         )}

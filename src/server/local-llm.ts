@@ -16,9 +16,15 @@ export interface LocalLlmStatus {
 export interface GenerateLocalLlmTextParams {
   systemPrompt: string;
   userPrompt: string;
+  conversationTurns?: Array<{ role: "user" | "assistant"; content: string }>;
   maxNewTokens?: number;
   temperature?: number;
   timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface GenerateLocalLlmStreamParams extends GenerateLocalLlmTextParams {
+  onToken: (chunk: string) => void;
 }
 
 export interface GenerateLocalLlmJsonParams {
@@ -33,12 +39,34 @@ interface ChatMessage {
   content: string;
 }
 
-type TextGenPipelineFn = (
+type TextGenPipelineFn = ((
   input: string | ChatMessage[],
   options?: Record<string, unknown>,
 ) => Promise<
   Array<{ generated_text?: string | ChatMessage[] }> | { generated_text?: string | ChatMessage[] }
->;
+>) & {
+  tokenizer?: unknown;
+};
+
+interface TransformersRuntimeModule {
+  env?: {
+    cacheDir: string;
+    allowLocalModels: boolean;
+    allowRemoteModels: boolean;
+  };
+  pipeline: (task: string, model: string, options?: Record<string, unknown>) => Promise<unknown>;
+  TextStreamer?: new (
+    tokenizer: unknown,
+    options?: {
+      skip_prompt?: boolean;
+      skip_special_tokens?: boolean;
+      callback_function?: (text: string) => void;
+    },
+  ) => unknown;
+  InterruptableStoppingCriteria?: new () => { interrupt: () => void };
+}
+
+let cachedTransformersRuntime: TransformersRuntimeModule | null = null;
 
 const ENGINE_NAME = "transformers.js-onnx";
 const DEFAULT_MODEL_ID = "onnx-community/gemma-3-1b-it-ONNX";
@@ -155,18 +183,8 @@ async function getLocalLlmPipeline(): Promise<TextGenPipelineFn> {
 
   cachedPipelinePromise = (async () => {
     const pkgName = "@huggingface/transformers";
-    const transformers = (await import(/* @vite-ignore */ pkgName)) as {
-      env?: {
-        cacheDir: string;
-        allowLocalModels: boolean;
-        allowRemoteModels: boolean;
-      };
-      pipeline: (
-        task: string,
-        model: string,
-        options?: Record<string, unknown>,
-      ) => Promise<unknown>;
-    };
+    const transformers = (await import(/* @vite-ignore */ pkgName)) as TransformersRuntimeModule;
+    cachedTransformersRuntime = transformers;
 
     const cacheDir = getLocalLlmCacheDir();
     const localModelDir = path.join(cacheDir, ...modelId.split("/"));
@@ -300,7 +318,54 @@ function extractGeneratedReply(output: unknown): string {
 }
 
 const IDENTITY_GUARD_SYSTEM =
-  "Identity rule (never violate): You are MeetMind AI, programmed by a team of Software Engineers from the Computer Science Department at Modern Academy (مبرمجني مجموعة من مهندسين برمجة قسم علوم حاسب مودرن أكاديمي). NEVER claim you were created or trained by Google, Gemma, OpenAI, or any other company.";
+  "Identity rule (never violate): You are MeetMind AI, integrated into the MeetMind AI platform, developed by software engineering students from the Computer Science Department at Modern Academy. NEVER claim Google, Gemma, Gemini, OpenAI, or ChatGPT built you, and never invent individual or company names.";
+
+function buildBoundedConversationMessages(
+  boundedSystem: string,
+  conversationTurns: Array<{ role: "user" | "assistant"; content: string }> | undefined,
+  boundedUser: string,
+  maxHistoryChars = 4200,
+): ChatMessage[] {
+  const historyMsgs: ChatMessage[] = [];
+  if (Array.isArray(conversationTurns) && conversationTurns.length > 0) {
+    let used = 0;
+    const selected: ChatMessage[] = [];
+    // Walk backward from most recent turn so immediate context is always preserved in full
+    for (let i = conversationTurns.length - 1; i >= 0; i--) {
+      const turn = conversationTurns[i];
+      const text = String(turn?.content || "").trim();
+      if (!text) continue;
+      const clipped = text.length > 1300 ? `${text.slice(0, 1290)}...` : text;
+      if (used + clipped.length > maxHistoryChars && selected.length >= 2) break;
+      selected.unshift({ role: turn.role, content: clipped });
+      used += clipped.length;
+      if (selected.length >= 8) break;
+    }
+    // Gemma chat template requires strict user/assistant alternation starting with user
+    while (selected.length > 0 && selected[0].role !== "user") {
+      selected.shift();
+    }
+    for (const msg of selected) {
+      const prev = historyMsgs[historyMsgs.length - 1];
+      if (prev && prev.role === msg.role) {
+        prev.content = `${prev.content}\n${msg.content}`;
+      } else {
+        historyMsgs.push({ ...msg });
+      }
+    }
+    // If history ends with a user message, merge with current user prompt cleanly
+    if (historyMsgs.length > 0 && historyMsgs[historyMsgs.length - 1].role === "user") {
+      const lastUser = historyMsgs.pop()!;
+      boundedUser = `${lastUser.content}\n\n${boundedUser}`;
+    }
+  }
+
+  return [
+    ...(boundedSystem ? [{ role: "system" as const, content: boundedSystem }] : []),
+    ...historyMsgs,
+    { role: "user" as const, content: boundedUser },
+  ];
+}
 
 function trimTruncatedTrailingFragment(text: string): string {
   const trimmed = text.trim();
@@ -347,15 +412,137 @@ function sanitizeLlmOutput(text: string, trimTrailing = true): string {
     .replace(/<\|endoftext\|>/g, "")
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .replace(
-      /(?:I am|I'm)\s+(?:Gemma|a large language model)[^.\n]*(?:trained|created|developed|built)\s+by\s+(?:Google|OpenAI|Meta|Alibaba)[^.\n]*\.?/gi,
-      "I am MeetMind AI, programmed by a team of Software Engineers from the Computer Science Department at Modern Academy.",
+      /(?:I am|I'm)\s+(?:Gemma|Gemini|a large language model)[^.\n]*(?:trained|created|developed|built)\s+by\s+(?:Google|OpenAI|Meta|Alibaba|Anthropic)[^.\n]*\.?/gi,
+      "I was programmed and developed by a group of software engineering students from the Computer Science Department at Modern Academy.",
     )
     .replace(
-      /(?:أنا|انا)\s+(?:نموذج\s+لغوي|جيما|Gemma)[^.\n]*(?:طوّرته|طورته|دربته|أنشأته|صممته)\s*(?:جوجل|غوغل|Google|OpenAI)[^.\n]*\.?/gi,
-      "أنا مساعد MeetMind AI الذكي، مبرمجني مجموعة من مهندسين برمجة قسم علوم حاسب مودرن أكاديمي.",
+      /(?:أنا|انا)\s+(?:نموذج\s+لغوي|جيما|جيميناي|Gemma|Gemini)[^.\n]*(?:طوّرته|طورته|دربته|أنشأته|صممته)\s*(?:جوجل|غوغل|Google|OpenAI)[^.\n]*\.?/gi,
+      "مبرمجني مجموعة من مهندسي البرمجة من قسم علوم الحاسب في Modern Academy.",
     )
     .trim();
   return trimTrailing ? trimTruncatedTrailingFragment(cleaned) : cleaned;
+}
+
+export async function generateLocalLlmTextStream(
+  params: GenerateLocalLlmStreamParams,
+): Promise<string | null> {
+  if (isLocalLlmDisabled()) return null;
+
+  const {
+    systemPrompt,
+    userPrompt,
+    conversationTurns,
+    maxNewTokens = 360,
+    temperature = 0,
+    timeoutMs = 55000,
+    signal,
+    onToken,
+  } = params;
+
+  if (signal?.aborted) return null;
+
+  const rawSystem = String(systemPrompt || "").trim();
+  const isJsonSystem = /STRICT valid JSON/i.test(rawSystem);
+  const effectiveSystem = isJsonSystem
+    ? rawSystem
+    : rawSystem
+      ? `${rawSystem}\n${IDENTITY_GUARD_SYSTEM}`
+      : IDENTITY_GUARD_SYSTEM;
+  const boundedSystem = effectiveSystem.slice(0, 2200);
+  const boundedUser = String(userPrompt || "")
+    .trim()
+    .slice(0, 5000);
+  if (!boundedUser) return null;
+
+  const boundedMaxTokens = Math.min(900, Math.max(32, Math.round(maxNewTokens)));
+  const useSampling = typeof temperature === "number" && temperature > 0.05;
+
+  const runWork = enqueueInference(async () => {
+    if (signal?.aborted) return null;
+    const generator = await getLocalLlmPipeline();
+    if (signal?.aborted) return null;
+
+    const messages = buildBoundedConversationMessages(
+      boundedSystem,
+      conversationTurns,
+      boundedUser,
+    );
+
+    let streamedAccum = "";
+    let emittedAny = false;
+    const runtime = cachedTransformersRuntime;
+
+    const stoppingCriteria = runtime?.InterruptableStoppingCriteria
+      ? new runtime.InterruptableStoppingCriteria()
+      : null;
+
+    const onAbort = () => {
+      try {
+        stoppingCriteria?.interrupt();
+      } catch {
+        // best-effort interrupt
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    // Cleanly interrupt ONNX generation right before external timeout so streamed tokens are preserved
+    // and inferenceQueue is immediately freed for the next turn (zero zombie generations).
+    const softDeadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 4000 ? timeoutMs - 2500 : 0;
+    const deadlineTimer =
+      softDeadlineMs > 0
+        ? setTimeout(() => {
+            onAbort();
+          }, softDeadlineMs)
+        : null;
+
+    let streamer: unknown;
+    if (runtime?.TextStreamer && generator.tokenizer) {
+      streamer = new runtime.TextStreamer(generator.tokenizer, {
+        skip_prompt: true,
+        skip_special_tokens: true,
+        callback_function: (chunk: string) => {
+          if (signal?.aborted) return;
+          const cleanChunk = String(chunk || "")
+            .replace(/<\|im_end\|>/g, "")
+            .replace(/<\|endoftext\|>/g, "");
+          if (!cleanChunk) return;
+          streamedAccum += cleanChunk;
+          emittedAny = true;
+          onToken(cleanChunk);
+        },
+      });
+    }
+
+    try {
+      const out = await generator(messages, {
+        max_new_tokens: boundedMaxTokens,
+        do_sample: useSampling,
+        ...(useSampling ? { temperature: Math.min(1.0, temperature), top_p: 0.9 } : {}),
+        repetition_penalty: 1.03,
+        return_full_text: false,
+        ...(streamer ? { streamer } : {}),
+        ...(stoppingCriteria ? { stopping_criteria: [stoppingCriteria] } : {}),
+      });
+
+      const finalRaw = streamedAccum || extractGeneratedReply(out);
+      const cleaned = sanitizeLlmOutput(finalRaw, !isJsonSystem);
+      if (!emittedAny && cleaned && !signal?.aborted) {
+        onToken(cleaned);
+      }
+      return cleaned || null;
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  });
+
+  try {
+    return await withTimeout(runWork, timeoutMs);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[LocalLLM] Streaming generation notice: ${msg}`);
+    return null;
+  }
 }
 
 export async function generateLocalLlmText(
@@ -366,9 +553,10 @@ export async function generateLocalLlmText(
   const {
     systemPrompt,
     userPrompt,
-    maxNewTokens = 200,
+    conversationTurns,
+    maxNewTokens = 360,
     temperature = 0,
-    timeoutMs = 35000,
+    timeoutMs = 50000,
   } = params;
 
   const rawSystem = String(systemPrompt || "").trim();
@@ -378,21 +566,22 @@ export async function generateLocalLlmText(
     : rawSystem
       ? `${rawSystem}\n${IDENTITY_GUARD_SYSTEM}`
       : IDENTITY_GUARD_SYSTEM;
-  const boundedSystem = effectiveSystem.slice(0, 1800);
+  const boundedSystem = effectiveSystem.slice(0, 2200);
   const boundedUser = String(userPrompt || "")
     .trim()
     .slice(0, 5000);
   if (!boundedUser) return null;
 
-  const boundedMaxTokens = Math.min(640, Math.max(32, Math.round(maxNewTokens)));
+  const boundedMaxTokens = Math.min(900, Math.max(32, Math.round(maxNewTokens)));
   const useSampling = typeof temperature === "number" && temperature > 0.05;
 
   const runWork = enqueueInference(async () => {
     const generator = await getLocalLlmPipeline();
-    const messages: ChatMessage[] = [
-      ...(boundedSystem ? [{ role: "system" as const, content: boundedSystem }] : []),
-      { role: "user" as const, content: boundedUser },
-    ];
+    const messages = buildBoundedConversationMessages(
+      boundedSystem,
+      conversationTurns,
+      boundedUser,
+    );
 
     const out = await generator(messages, {
       max_new_tokens: boundedMaxTokens,

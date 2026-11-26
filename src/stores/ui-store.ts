@@ -1,7 +1,17 @@
 import { create } from "zustand";
 import { useI18nStore, type LanguageCode } from "@/lib/i18n";
+import {
+  DEFAULT_THEME,
+  THEME_STORAGE_KEY,
+  getThemeMeta,
+  normalizeTheme,
+  type ThemeId,
+  type ThemeInput,
+} from "@/lib/theme";
 
-export type Theme = "light" | "dark" | "system";
+export type Theme = ThemeInput;
+export type ResolvedTheme = ThemeId;
+export { THEME_STORAGE_KEY };
 
 export type AudioSystemMode =
   | "Ready"
@@ -41,8 +51,8 @@ type UIState = {
   commandOpen: boolean;
   notificationsOpen: boolean;
   aiDockOpen: boolean;
-  theme: Theme;
-  resolvedTheme: "light" | "dark";
+  theme: ThemeId;
+  resolvedTheme: ResolvedTheme;
   hydrateTheme: () => void;
   recordingDialogOpen: boolean;
   setRecordingDialogOpen: (v: boolean) => void;
@@ -65,18 +75,29 @@ type UIState = {
   setWorkspace: (w: string) => void;
 };
 
-export const THEME_STORAGE_KEY = "meetmind-theme";
-
-function resolve(t: Theme): "light" | "dark" {
-  if (t !== "system") return t;
-  return "dark";
+function resolve(t: Theme): ResolvedTheme {
+  return normalizeTheme(t);
 }
 
-function applyTheme(resolved: "light" | "dark") {
+function applyTheme(resolved: ResolvedTheme) {
   if (typeof document === "undefined") return;
-  document.documentElement.classList.toggle("dark", resolved === "dark");
-  document.documentElement.classList.toggle("light", resolved === "light");
-  document.documentElement.dataset.theme = resolved;
+  const root = document.documentElement;
+  const isBlackGold = resolved === "black-gold";
+  const isPureWhite = resolved === "pure-white";
+  const isSkyBlue = resolved === "sky-blue";
+
+  root.classList.toggle("dark", isBlackGold);
+  root.classList.toggle("light", !isBlackGold);
+  root.classList.toggle("theme-black-gold", isBlackGold);
+  root.classList.toggle("theme-pure-white", isPureWhite);
+  root.classList.toggle("theme-sky-blue", isSkyBlue);
+  root.classList.remove("theme-dark-gold", "theme-light", "theme-ai-neon");
+  root.dataset.theme = resolved;
+
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) {
+    meta.setAttribute("content", getThemeMeta(resolved).metaThemeColor);
+  }
 }
 
 export const useUIStore = create<UIState>((set) => ({
@@ -85,19 +106,18 @@ export const useUIStore = create<UIState>((set) => ({
   commandOpen: false,
   notificationsOpen: false,
   aiDockOpen: false,
-  theme: "dark",
-  resolvedTheme: "dark",
+  theme: DEFAULT_THEME,
+  resolvedTheme: DEFAULT_THEME,
   hydrateTheme: () => {
-    let stored: Theme = "dark";
+    let stored: ResolvedTheme = DEFAULT_THEME;
     try {
       const v = localStorage.getItem(THEME_STORAGE_KEY);
-      if (v === "light" || v === "dark") stored = v;
+      if (v) stored = normalizeTheme(v);
     } catch {
       /* storage unavailable */
     }
-    const resolvedTheme = resolve(stored);
-    applyTheme(resolvedTheme);
-    set({ theme: stored, resolvedTheme });
+    applyTheme(stored);
+    set({ theme: stored, resolvedTheme: stored });
   },
   recordingDialogOpen: false,
   setRecordingDialogOpen: (v) => set({ recordingDialogOpen: v }),
@@ -135,15 +155,14 @@ export const useUIStore = create<UIState>((set) => ({
   setAiDockOpen: (v) => set({ aiDockOpen: v }),
   toggleAiDock: () => set((s) => ({ aiDockOpen: !s.aiDockOpen })),
   setTheme: (theme) => {
+    const resolvedTheme = resolve(theme);
     try {
-      if (theme === "system") localStorage.removeItem(THEME_STORAGE_KEY);
-      else localStorage.setItem(THEME_STORAGE_KEY, theme);
+      localStorage.setItem(THEME_STORAGE_KEY, resolvedTheme);
     } catch {
       /* storage unavailable */
     }
-    const resolvedTheme = resolve(theme);
     applyTheme(resolvedTheme);
-    set({ theme, resolvedTheme });
+    set({ theme: resolvedTheme, resolvedTheme });
   },
   setLanguage: (language) => {
     const code = (language === "AR" ? "AR" : "EN") as LanguageCode;

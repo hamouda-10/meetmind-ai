@@ -82,7 +82,12 @@ async function main() {
   const testFiles =
     process.argv.slice(2).length > 0
       ? process.argv.slice(2)
-      : ["tests/i18n.test.mjs", "tests/auth.test.mjs"];
+      : [
+          "tests/i18n.test.mjs",
+          "tests/auth.test.mjs",
+          "tests/theme.test.mjs",
+          "tests/chat-engine.test.mjs",
+        ];
 
   console.log(`Running tests against ${testUrl}: ${testFiles.join(", ")}`);
 

@@ -21,6 +21,7 @@ import {
   generateAiFlashcards,
   generateAiMindMap,
   askMeetMindAI,
+  askMeetMindAIStream,
 } from "./ai";
 import {
   assembleLiveAudioChunks,
@@ -33,7 +34,12 @@ import {
   runUnifiedPostTranscriptionPipeline,
   validateMediaFile,
 } from "./jobs";
-import { isGeminiConfigured, extractHttpStatus, isRetryableGeminiError } from "./gemini";
+import {
+  isGeminiConfigured,
+  getGeminiConfig,
+  extractHttpStatus,
+  isRetryableGeminiError,
+} from "./gemini";
 import {
   transcribeAudioWithLocalWhisper,
   warmupWhisperModel,
@@ -81,6 +87,62 @@ const escapeHtml = (unsafe: string) =>
 
 function isUserAdmin(user: UserRecord | null): boolean {
   return Boolean(user && !user.isGuest && user.role === "admin");
+}
+
+// Lightweight sliding-window rate limiter for auth & AI endpoints
+const rateLimitBuckets = new Map<string, number[]>();
+
+function getClientIp(req: Request): string {
+  const fwd = (req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || "")
+    .split(",")[0]
+    ?.trim();
+  return fwd || "local";
+}
+
+function checkRateLimit(
+  bucketKey: string,
+  maxRequests: number,
+  windowMs: number,
+): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  const cutoff = now - windowMs;
+  const timestamps = (rateLimitBuckets.get(bucketKey) || []).filter((ts) => ts > cutoff);
+  if (timestamps.length >= maxRequests) {
+    const oldest = timestamps[0] || now;
+    const retryAfterSec = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
+    rateLimitBuckets.set(bucketKey, timestamps);
+    return { allowed: false, retryAfterSec };
+  }
+  timestamps.push(now);
+  rateLimitBuckets.set(bucketKey, timestamps);
+  if (rateLimitBuckets.size > 2000) {
+    for (const [k, arr] of rateLimitBuckets.entries()) {
+      if (arr.length === 0 || arr[arr.length - 1] <= cutoff) {
+        rateLimitBuckets.delete(k);
+      }
+    }
+  }
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function findAuthorizedResource(
+  id: string,
+  user: UserRecord | null,
+  admin: boolean,
+): {
+  meeting?: MeetingRecord;
+  lecture?: LectureRecord;
+  item?: MeetingRecord | LectureRecord;
+  ownerId?: string;
+  authorized: boolean;
+} {
+  const meeting = db.get("meetings").find((m) => m.id === id);
+  const lecture = meeting ? undefined : db.get("lectures").find((l) => l.id === id);
+  const item = meeting || lecture;
+  if (!item) return { authorized: false };
+  const ownerId = meeting ? meeting.hostId : lecture?.instructorId;
+  const authorized = Boolean(admin || (ownerId && user?.id && ownerId === user.id));
+  return { meeting, lecture, item, ownerId, authorized };
 }
 
 const RECORDINGS_DIR = getRecordingsDir();
@@ -429,6 +491,9 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
   const method = req.method;
 
   try {
+    // Hydrate from remote Vercel KV / Upstash Redis once per serverless cold start (0ms no-op locally)
+    await db.ensureHydrated();
+
     // ----------------------------------------------------
     // PUBLIC HEALTH & AUTH CONFIGURATION
     // ----------------------------------------------------
@@ -436,16 +501,30 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       const mediaTools = await checkMediaToolsAvailable();
       const asr = getAsrEngineStatus();
       const llm = getLocalLlmStatus();
+      const geminiCfg = getGeminiConfig();
+      const persistence = db.getPersistenceStatus();
       return Response.json({
         status: "healthy",
         service: "meetmind-api",
         timestamp: new Date().toISOString(),
         aiConfigured: true,
-        aiEngine: isGeminiConfigured() ? "gemini+builtin" : "builtin",
+        aiEngine: isGeminiConfigured() ? "gemini+local-onnx" : "local-onnx",
+        models: {
+          geminiText: geminiCfg.textModel,
+          geminiFallback: geminiCfg.fallbackTextModel,
+          geminiChat: geminiCfg.chatModel,
+          geminiChatFallback: geminiCfg.fallbackChatModel,
+          geminiAsr: geminiCfg.asrModel,
+          geminiAsrFallback: geminiCfg.fallbackAsrModel,
+          localAsr: asr.model,
+          localLlm: llm.model,
+        },
         asrState: asr.state,
         llmState: llm.state,
         ffmpegAvailable: mediaTools.ffmpeg && mediaTools.ffprobe,
         storageWritable: isStorageWritable(),
+        persistenceMode: persistence.mode,
+        remoteKvConfigured: persistence.remoteKvConfigured,
       });
     }
 
@@ -453,6 +532,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       const asr = getAsrEngineStatus();
       const llm = getLocalLlmStatus();
       const cloudGemini = isGeminiConfigured();
+      const geminiCfg = getGeminiConfig();
       const warming = asr.state === "loading" || llm.state === "loading";
       const hasError = asr.state === "error" || llm.state === "error";
       const ready =
@@ -468,6 +548,15 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
           asr,
           llm,
           cloudGemini,
+          streamingSupported: true,
+          geminiModels: {
+            textModel: geminiCfg.textModel,
+            fallbackTextModel: geminiCfg.fallbackTextModel,
+            chatModel: geminiCfg.chatModel,
+            fallbackChatModel: geminiCfg.fallbackChatModel,
+            asrModel: geminiCfg.asrModel,
+            fallbackAsrModel: geminiCfg.fallbackAsrModel,
+          },
         },
         { headers: { "Cache-Control": "no-store" } },
       );
@@ -553,6 +642,13 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     // PUBLIC AUTHENTICATION ENDPOINTS
     // ----------------------------------------------------
     if (pathname === "/api/v1/auth/login" && method === "POST") {
+      const rl = checkRateLimit(`auth_login:${getClientIp(req)}`, 60, 60_000);
+      if (!rl.allowed) {
+        return Response.json(
+          { error: "Too many sign-in attempts. Please wait a moment and try again." },
+          { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+        );
+      }
       const body = await req.json().catch(() => ({}));
       const email = normalizeEmail(body.email);
       const password = typeof body.password === "string" ? body.password : "";
@@ -621,6 +717,13 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     }
 
     if (pathname === "/api/v1/auth/register" && method === "POST") {
+      const rl = checkRateLimit(`auth_register:${getClientIp(req)}`, 40, 60_000);
+      if (!rl.allowed) {
+        return Response.json(
+          { error: "Too many registration attempts. Please wait a moment and try again." },
+          { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+        );
+      }
       const body = await req.json().catch(() => ({}));
       const name = String(body.name || body.fullName || "")
         .replace(/[<>]/g, "")
@@ -1568,6 +1671,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     if (pathname === "/api/v1/dashboard/activity" && method === "GET") {
       const user = getAuthUser(req);
       const admin = isUserAdmin(user);
+      const isArActivity = req.headers.get("x-app-language") === "ar";
       const meetings = admin
         ? db.get("meetings")
         : db.get("meetings").filter((m) => m.hostId === user?.id);
@@ -1585,20 +1689,22 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       for (const m of meetings.slice(0, 3)) {
         activities.push({
           id: `act_${m.id}`,
-          who: m.hostName || "المستخدم",
-          what: "سجل جلسة وتم حفظ التفريغ الصوتي",
+          who: m.hostName || (isArActivity ? "المستخدم" : "User"),
+          what: isArActivity
+            ? "سجل جلسة وتم حفظ التفريغ الصوتي"
+            : "Recorded meeting and saved transcript",
           where: m.title,
-          when: m.date || "اليوم",
+          when: m.date || (isArActivity ? "اليوم" : "Today"),
         });
       }
 
       for (const l of lectures.slice(0, 3)) {
         activities.push({
           id: `act_${l.id}`,
-          who: l.instructorName || "المحاضر",
-          what: "أضاف محاضرة تعليمية جديدة",
+          who: l.instructorName || (isArActivity ? "المحاضر" : "Instructor"),
+          what: isArActivity ? "أضاف محاضرة تعليمية جديدة" : "Added a new lecture recording",
           where: `${l.courseCode} — ${l.title}`,
-          when: l.date || "اليوم",
+          when: l.date || (isArActivity ? "اليوم" : "Today"),
         });
       }
 
@@ -1666,6 +1772,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       db.update("calendarEvents", (events) => [
         {
           id: `ev_${id}`,
+          userId: newMeeting.hostId,
           title: newMeeting.title,
           date: newMeeting.date,
           time: "10:00 AM",
@@ -1853,6 +1960,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       db.update("calendarEvents", (events) => [
         {
           id: `ev_${id}`,
+          userId: newLecture.instructorId,
           title: `${courseCode} — ${title}`,
           date: newLecture.date,
           time: "11:00 AM",
@@ -2013,6 +2121,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
           .find(
             (j) =>
               j.idempotencyKey === idempotencyKey &&
+              (currentIsAdmin || j.userId === currentUser.id) &&
               j.status !== "Failed" &&
               j.status !== "Cancelled",
           );
@@ -2256,6 +2365,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
           .find(
             (j) =>
               j.idempotencyKey === idempotencyKey &&
+              (currentIsAdmin || j.userId === currentUser.id) &&
               j.status !== "Failed" &&
               j.status !== "Cancelled",
           );
@@ -2504,6 +2614,16 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       (method === "GET" || method === "HEAD")
     ) {
       const id = pathname.replace("/api/v1/recordings/audio/", "");
+      const resCheck = findAuthorizedResource(id, currentUser, currentIsAdmin);
+      if (resCheck.item && !resCheck.authorized) {
+        return Response.json(
+          { error: "Forbidden: you do not have access to this recording." },
+          { status: 403 },
+        );
+      }
+      if (!resCheck.item && !currentIsAdmin) {
+        return Response.json({ error: "Recording audio file not found" }, { status: 404 });
+      }
       const fileInfo = findRecordingFile(id);
 
       if (!fileInfo || !fs.existsSync(fileInfo.filePath)) {
@@ -2566,6 +2686,16 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
 
     if (pathname.startsWith("/api/v1/recordings/download/") && method === "GET") {
       const id = pathname.replace("/api/v1/recordings/download/", "");
+      const resCheck = findAuthorizedResource(id, currentUser, currentIsAdmin);
+      if (resCheck.item && !resCheck.authorized) {
+        return Response.json(
+          { error: "Forbidden: you do not have access to this recording." },
+          { status: 403 },
+        );
+      }
+      if (!resCheck.item && !currentIsAdmin) {
+        return Response.json({ error: "Recording audio file not found" }, { status: 404 });
+      }
       const fileInfo = findRecordingFile(id);
 
       if (!fileInfo || !fs.existsSync(fileInfo.filePath)) {
@@ -2611,6 +2741,13 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
 
     if (pathname.startsWith("/api/v1/jobs/") && pathname.endsWith("/retry") && method === "POST") {
       const id = pathname.replace("/api/v1/jobs/", "").replace("/retry", "");
+      const existingJob = db.get("jobs").find((j) => j.id === id);
+      if (!existingJob) {
+        return Response.json({ error: "Job not found" }, { status: 404 });
+      }
+      if (!currentIsAdmin && existingJob.userId !== currentUser.id) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
       try {
         const retried = await retryJob(id);
         return Response.json({ success: true, job: retried });
@@ -2622,6 +2759,13 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
 
     if (pathname.startsWith("/api/v1/jobs/") && pathname.endsWith("/cancel") && method === "POST") {
       const id = pathname.replace("/api/v1/jobs/", "").replace("/cancel", "");
+      const existingJob = db.get("jobs").find((j) => j.id === id);
+      if (!existingJob) {
+        return Response.json({ error: "Job not found" }, { status: 404 });
+      }
+      if (!currentIsAdmin && existingJob.userId !== currentUser.id) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
       try {
         const cancelled = cancelJob(id);
         return Response.json({ success: true, job: cancelled });
@@ -2632,11 +2776,10 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     }
 
     if (pathname.startsWith("/api/v1/jobs/") && method === "GET") {
-      const user = getAuthUser(req);
       const id = pathname.replace("/api/v1/jobs/", "");
       const job = db
         .get("jobs")
-        .find((j) => j.id === id && (isUserAdmin(user) || !j.userId || j.userId === user?.id));
+        .find((j) => j.id === id && (currentIsAdmin || j.userId === currentUser.id));
       if (!job) return Response.json({ error: "Job not found" }, { status: 404 });
 
       const linkedResource =
@@ -2714,12 +2857,13 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     ) {
       const id = pathname.replace("/api/v1/transcripts/", "").replace("/captions", "");
       const format = url.searchParams.get("format") || "vtt";
-      const meeting = db.get("meetings").find((m) => m.id === id);
-      const lecture = db.get("lectures").find((l) => l.id === id);
-      const item = meeting || lecture;
+      const { item, authorized } = findAuthorizedResource(id, currentUser, currentIsAdmin);
 
       if (!item) {
         return Response.json({ error: "Transcript not found" }, { status: 404 });
+      }
+      if (!authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
       }
 
       const segments = item.segments || [];
@@ -2763,6 +2907,13 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       method === "PUT"
     ) {
       const id = pathname.replace("/api/v1/transcripts/", "").replace("/speakers", "");
+      const resCheck = findAuthorizedResource(id, currentUser, currentIsAdmin);
+      if (!resCheck.item) {
+        return Response.json({ error: "Transcript resource not found" }, { status: 404 });
+      }
+      if (!resCheck.authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
       const body = await req.json();
       const rawMap = (body?.speakerMap || {}) as Record<string, string>;
       const speakerMap: Record<string, string> = { ...rawMap };
@@ -2829,10 +2980,9 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     ) {
       const id = pathname.replace("/api/v1/transcripts/", "").replace("/export", "");
       const format = (url.searchParams.get("format") || "html").toLowerCase();
-      const meeting = db.get("meetings").find((m) => m.id === id);
-      const lecture = db.get("lectures").find((l) => l.id === id);
-      const item = meeting || lecture;
+      const { lecture, item, authorized } = findAuthorizedResource(id, currentUser, currentIsAdmin);
       if (!item) return Response.json({ error: "Transcript resource not found" }, { status: 404 });
+      if (!authorized) return Response.json({ error: "Forbidden" }, { status: 403 });
 
       const segments = item.segments || [];
       const summary = item.summary || (lecture ? lecture.studyNotes : "") || "";
@@ -2887,8 +3037,17 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       method === "GET"
     ) {
       const id = pathname.replace("/api/v1/transcripts/", "");
-      const meeting = db.get("meetings").find((m) => m.id === id);
-      const lecture = db.get("lectures").find((l) => l.id === id);
+      const { meeting, lecture, item, authorized } = findAuthorizedResource(
+        id,
+        currentUser,
+        currentIsAdmin,
+      );
+      if (!item) {
+        return Response.json({ error: "Transcript resource not found" }, { status: 404 });
+      }
+      if (!authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
 
       if (meeting) {
         return Response.json({
@@ -2916,6 +3075,13 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
 
     if (pathname.startsWith("/api/v1/transcripts/") && method === "PUT") {
       const id = pathname.replace("/api/v1/transcripts/", "");
+      const { item, authorized } = findAuthorizedResource(id, currentUser, currentIsAdmin);
+      if (!item) {
+        return Response.json({ error: "Transcript resource not found" }, { status: 404 });
+      }
+      if (!authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
       const { segments } = await req.json();
 
       let updated = false;
@@ -2961,7 +3127,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
           s.status === "Recovering";
         if (!isRecoverable) return false;
         if (admin) return true;
-        return !s.userId || s.userId === user?.id;
+        return Boolean(user?.id && s.userId === user.id);
       });
 
       if (!active) {
@@ -4137,17 +4303,30 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     // AI OPERATIONS & GROUNDED Q&A
     // ----------------------------------------------------
     if (pathname === "/api/v1/ai/generate-summary" && method === "POST") {
+      const rl = checkRateLimit(`ai_gen:${currentUser.id}`, 45, 60_000);
+      if (!rl.allowed) {
+        return Response.json(
+          { error: "Too many AI requests. Please wait a moment and try again." },
+          { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+        );
+      }
       const body = await req.json().catch(() => ({}));
       const { resourceId, type = "meeting" } = body;
       if (!resourceId) {
         return Response.json({ error: "resourceId is required" }, { status: 400 });
       }
-      const meeting = db.get("meetings").find((m) => m.id === resourceId);
-      const lecture = db.get("lectures").find((l) => l.id === resourceId);
-      const target = meeting || lecture;
+      const {
+        meeting,
+        lecture,
+        item: target,
+        authorized,
+      } = findAuthorizedResource(String(resourceId), currentUser, currentIsAdmin);
 
       if (!target) {
         return Response.json({ error: "Recording or lecture not found" }, { status: 404 });
+      }
+      if (!authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
       }
 
       const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
@@ -4169,38 +4348,29 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
 
       try {
         const activeSegments = await ensureRealSegments(target, effectiveType);
-        let summaryText = "";
-        let executiveSummary = "";
-        let detailedSummary = "";
-        let keyPoints: string[] = [];
-        let decisions: string[] = [];
-
-        try {
-          const summaryResult = await generateAiSummary(
-            target.title,
-            activeSegments,
-            effectiveType,
-            courseCode,
-            appLanguage,
+        if (!activeSegments || activeSegments.length === 0) {
+          return Response.json(
+            {
+              error:
+                appLanguage === "ar"
+                  ? "لا توجد مقاطع نصية مفرغة في هذا التسجيل لإنشاء ملخص."
+                  : "No real transcript segments available for summary generation.",
+            },
+            { status: 400 },
           );
-          summaryText = summaryResult.summary || summaryResult.detailedSummary || "";
-          executiveSummary = summaryResult.executiveSummary || summaryText;
-          detailedSummary = summaryResult.detailedSummary || summaryText;
-          keyPoints = summaryResult.keyPoints || [];
-          decisions = summaryResult.decisions || [];
-        } catch {
-          const fallback = generateAnalysisFromTranscript(
-            target.title,
-            activeSegments,
-            effectiveType,
-            courseCode,
-          );
-          summaryText = fallback.lectureNotes || fallback.summary;
-          executiveSummary = fallback.summary;
-          detailedSummary = summaryText;
-          keyPoints = fallback.keyPoints || [];
-          decisions = fallback.decisions || [];
         }
+        const summaryResult = await generateAiSummary(
+          target.title,
+          activeSegments,
+          effectiveType,
+          courseCode,
+          appLanguage,
+        );
+        const summaryText = summaryResult.summary || summaryResult.detailedSummary || "";
+        const executiveSummary = summaryResult.executiveSummary || summaryText;
+        const detailedSummary = summaryResult.detailedSummary || summaryText;
+        const keyPoints = summaryResult.keyPoints || [];
+        const decisions = summaryResult.decisions || [];
 
         const nowIso = new Date().toISOString();
         if (meeting) {
@@ -4269,17 +4439,30 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     if (pathname === "/api/v1/ai/generate-quiz" && method === "POST") {
+      const rl = checkRateLimit(`ai_gen:${currentUser.id}`, 45, 60_000);
+      if (!rl.allowed) {
+        return Response.json(
+          { error: "Too many AI requests. Please wait a moment and try again." },
+          { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+        );
+      }
       const body = await req.json().catch(() => ({}));
       const { resourceId, type = "lecture" } = body;
       if (!resourceId) {
         return Response.json({ error: "resourceId is required" }, { status: 400 });
       }
-      const meeting = db.get("meetings").find((m) => m.id === resourceId);
-      const lecture = db.get("lectures").find((l) => l.id === resourceId);
-      const target = meeting || lecture;
+      const {
+        meeting,
+        lecture,
+        item: target,
+        authorized,
+      } = findAuthorizedResource(String(resourceId), currentUser, currentIsAdmin);
 
       if (!target) {
         return Response.json({ error: "Recording or lecture not found" }, { status: 404 });
+      }
+      if (!authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
       }
 
       const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
@@ -4299,6 +4482,10 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         typeof body.variant === "number" && Number.isFinite(body.variant)
           ? body.variant
           : undefined;
+      const difficulty =
+        body.difficulty === "easy" || body.difficulty === "medium" || body.difficulty === "hard"
+          ? (body.difficulty as "easy" | "medium" | "hard")
+          : ("all" as const);
       const avoidQuestionTitles = Array.isArray(body.avoidQuestionTitles)
         ? body.avoidQuestionTitles.map((x: unknown) => String(x))
         : undefined;
@@ -4315,6 +4502,12 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
 
       try {
         const activeSegments = await ensureRealSegments(target, effectiveType);
+        if (!activeSegments || activeSegments.length === 0) {
+          return Response.json(
+            { error: "No real transcript segments available for quiz generation." },
+            { status: 400 },
+          );
+        }
         const quizResult = await generateAiQuiz(
           target.title,
           activeSegments,
@@ -4324,6 +4517,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             appLanguage,
             numQuestions,
             variant,
+            difficulty,
             avoidQuestionTitles,
           },
         );
@@ -4334,7 +4528,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         const quizId = `quiz_${resourceId}_${Date.now()}`;
         const newQuiz = {
           id: quizId,
-          lectureId: effectiveType === "lecture" ? resourceId : resourceId,
+          lectureId: effectiveType === "lecture" ? resourceId : undefined,
           meetingId: effectiveType === "meeting" ? resourceId : undefined,
           title:
             quizResult.title ||
@@ -4381,17 +4575,30 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     }
 
     if (pathname === "/api/v1/ai/generate-analysis" && method === "POST") {
+      const rl = checkRateLimit(`ai_gen:${currentUser.id}`, 45, 60_000);
+      if (!rl.allowed) {
+        return Response.json(
+          { error: "Too many AI requests. Please wait a moment and try again." },
+          { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+        );
+      }
       const body = await req.json().catch(() => ({}));
       const { resourceId, type = "lecture" } = body;
       if (!resourceId) {
         return Response.json({ error: "resourceId is required" }, { status: 400 });
       }
-      const meeting = db.get("meetings").find((m) => m.id === resourceId);
-      const lecture = db.get("lectures").find((l) => l.id === resourceId);
-      const target = meeting || lecture;
+      const {
+        meeting,
+        lecture,
+        item: target,
+        authorized,
+      } = findAuthorizedResource(String(resourceId), currentUser, currentIsAdmin);
 
       if (!target) {
         return Response.json({ error: "Recording or lecture not found" }, { status: 404 });
+      }
+      if (!authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
       }
 
       const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
@@ -4413,6 +4620,17 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
 
       try {
         const activeSegments = await ensureRealSegments(target, effectiveType);
+        if (!activeSegments || activeSegments.length === 0) {
+          return Response.json(
+            {
+              error:
+                appLanguage === "ar"
+                  ? "لا توجد مقاطع نصية مفرغة في هذا التسجيل لإجراء التحليل."
+                  : "No real transcript segments available for analysis.",
+            },
+            { status: 400 },
+          );
+        }
         const analysis = await generateAiLectureAnalysis(
           target.title,
           activeSegments,
@@ -4482,11 +4700,122 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       }
     }
 
-    if (pathname === "/api/v1/ai/ask" && method === "POST") {
-      const user = getAuthUser(req);
-      const admin = isUserAdmin(user);
+    if (pathname === "/api/v1/ai/ask/stream" && method === "POST") {
+      const rl = checkRateLimit(`ai_chat:${currentUser.id}`, 45, 60_000);
+      if (!rl.allowed) {
+        return Response.json(
+          { error: "Too many AI chat requests. Please wait a moment and try again." },
+          { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+        );
+      }
+
       const body = await req.json().catch(() => ({}));
-      const { question, resourceId, recordingId, history } = body;
+      const { question, resourceId, recordingId, scope, history } = body;
+      if (!question || typeof question !== "string" || !question.trim()) {
+        return Response.json({ error: "Question is required" }, { status: 400 });
+      }
+
+      const targetId = (resourceId || recordingId || "").trim() || undefined;
+      const chatScope: "general" | "all-recordings" | "recording" = targetId
+        ? "recording"
+        : scope === "general"
+          ? "general"
+          : "all-recordings";
+      if (targetId) {
+        const resCheck = findAuthorizedResource(targetId, currentUser, currentIsAdmin);
+        if (resCheck.item && !resCheck.authorized) {
+          return Response.json(
+            { error: "You do not have permission to query this recording." },
+            { status: 403 },
+          );
+        }
+      }
+
+      const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
+      const appLanguage: "en" | "ar" | undefined =
+        rawAppLang === "ar" ? "ar" : rawAppLang === "en" ? "en" : undefined;
+      const isArPrompt = appLanguage === "ar" || /[\u0600-\u06FF]/.test(question);
+
+      const encoder = new TextEncoder();
+      const abortCtrl = new AbortController();
+      req.signal.addEventListener("abort", () => abortCtrl.abort(), { once: true });
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          const sendEvent = (eventName: string, data: unknown) => {
+            if (abortCtrl.signal.aborted) return;
+            try {
+              controller.enqueue(
+                encoder.encode(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`),
+              );
+            } catch {
+              abortCtrl.abort();
+            }
+          };
+
+          try {
+            const outcome = await askMeetMindAIStream(
+              {
+                question: question.trim(),
+                resourceId: targetId,
+                scope: chatScope,
+                history: Array.isArray(history) ? history : undefined,
+                userId: currentUser.id,
+                isAdmin: currentIsAdmin,
+                appLanguage,
+              },
+              {
+                onMeta: (meta) => sendEvent("meta", meta),
+                onToken: (token) => sendEvent("token", { token }),
+                onDone: (done) => sendEvent("done", done),
+              },
+              abortCtrl.signal,
+            );
+            if (outcome.forbidden) {
+              sendEvent("error", { error: "Forbidden: access denied to this recording." });
+            }
+          } catch (err) {
+            console.warn("[AI Ask Stream Error]:", err instanceof Error ? err.message : "unknown");
+            sendEvent("error", {
+              error: isArPrompt
+                ? "تعذر الوصول إلى الذكاء الاصطناعي حاليًا. حاول مرة أخرى بعد لحظات."
+                : "Unable to reach the AI right now. Please try again in a moment.",
+              retryable: true,
+            });
+          } finally {
+            try {
+              controller.close();
+            } catch {
+              // stream already closed
+            }
+          }
+        },
+        cancel() {
+          abortCtrl.abort();
+        },
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+        },
+      });
+    }
+
+    if (pathname === "/api/v1/ai/ask" && method === "POST") {
+      const rl = checkRateLimit(`ai_chat:${currentUser.id}`, 45, 60_000);
+      if (!rl.allowed) {
+        return Response.json(
+          { error: "Too many AI chat requests. Please wait a moment and try again." },
+          { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+        );
+      }
+      const body = await req.json().catch(() => ({}));
+      const { question, resourceId, recordingId, scope, history } = body;
 
       if (!question || typeof question !== "string" || !question.trim()) {
         return Response.json({ error: "Question is required" }, { status: 400 });
@@ -4495,14 +4824,21 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       const rawAppLang = req.headers.get("x-app-language") || body.appLanguage;
       const appLanguage: "en" | "ar" | undefined =
         rawAppLang === "ar" ? "ar" : rawAppLang === "en" ? "en" : undefined;
+      const targetId = (resourceId || recordingId || "").trim() || undefined;
+      const chatScope: "general" | "all-recordings" | "recording" = targetId
+        ? "recording"
+        : scope === "general"
+          ? "general"
+          : "all-recordings";
 
       try {
         const result = await askMeetMindAI({
           question: question.trim(),
-          resourceId: resourceId || recordingId,
-          history: Array.isArray(history) ? history : [],
-          userId: user?.id || "usr_admin",
-          isAdmin: admin,
+          resourceId: targetId,
+          scope: chatScope,
+          history: Array.isArray(history) ? history : undefined,
+          userId: currentUser.id,
+          isAdmin: currentIsAdmin,
           appLanguage,
         });
 
@@ -4515,56 +4851,96 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
 
         return Response.json(result);
       } catch (err) {
-        console.warn("[AI Ask Fallback]:", err instanceof Error ? err.message : err);
-        const targetId = resourceId || recordingId;
-        const target = targetId
-          ? db.get("meetings").find((m) => m.id === targetId) ||
-            db.get("lectures").find((l) => l.id === targetId)
-          : undefined;
-        if (target && target.segments?.length) {
-          return Response.json(
-            answerGroundedQuestion(target.title, target.segments, question.trim()),
-          );
+        console.warn("[AI Ask Error]:", err instanceof Error ? err.message : err);
+        if (targetId) {
+          const resCheck = findAuthorizedResource(String(targetId), currentUser, currentIsAdmin);
+          if (resCheck.item && !resCheck.authorized) {
+            return Response.json(
+              { error: "You do not have permission to query this recording." },
+              { status: 403 },
+            );
+          }
+          if (resCheck.item && resCheck.item.segments?.length) {
+            return Response.json(
+              answerGroundedQuestion(question.trim(), resCheck.item.segments, resCheck.item.title),
+            );
+          }
         }
-        return Response.json({
-          answer:
-            appLanguage === "ar" || /[\u0600-\u06FF]/.test(question)
-              ? "تعذر إتمام الإجابة حالياً. يرجى إعادة صياغة السؤال أو المحاولة مرة أخرى بعد لحظات."
-              : "Unable to complete the response right now. Please try rephrasing or ask again shortly.",
-          evidenceFound: false,
-          citations: [],
-        });
+        return Response.json(
+          {
+            error:
+              appLanguage === "ar" || /[\u0600-\u06FF]/.test(question)
+                ? "تعذر الوصول إلى الذكاء الاصطناعي حاليًا. حاول مرة أخرى بعد لحظات."
+                : "Unable to reach the AI right now. Please try again in a moment.",
+            retryable: true,
+          },
+          { status: 503 },
+        );
       }
     }
 
     if (pathname === "/api/v1/ai/chat-history" && method === "GET") {
-      const user = getAuthUser(req);
-      const admin = isUserAdmin(user);
       const resourceId = url.searchParams.get("resourceId");
-      const messages = (db.get("chatMessages") || []).filter(
-        (m) => (admin || m.userId === user?.id) && (!resourceId || m.resourceId === resourceId),
+      const scopeParam = url.searchParams.get("scope");
+      const messages = (db.get("chatMessages") || []).filter((m) => {
+        if (!currentIsAdmin && m.userId !== currentUser.id) return false;
+        if (scopeParam === "general") return !m.resourceId;
+        if (resourceId) return m.resourceId === resourceId;
+        return m.userId === currentUser.id;
+      });
+      return Response.json(messages.slice(-60), {
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+
+    if (pathname === "/api/v1/ai/chat-history" && method === "DELETE") {
+      const resourceId = url.searchParams.get("resourceId");
+      const scopeParam = url.searchParams.get("scope");
+      let deletedCount = 0;
+      db.update("chatMessages", (msgs = []) =>
+        msgs.filter((m) => {
+          if (m.userId !== currentUser.id) return true;
+          if (scopeParam === "general") {
+            if (!m.resourceId) {
+              deletedCount++;
+              return false;
+            }
+            return true;
+          }
+          if (resourceId) {
+            if (m.resourceId === resourceId) {
+              deletedCount++;
+              return false;
+            }
+            return true;
+          }
+          deletedCount++;
+          return false;
+        }),
       );
-      return Response.json(messages.slice(-50));
+      return Response.json({ success: true, deletedCount });
     }
 
     if (pathname === "/api/v1/ai/analyze" && method === "POST") {
       const body = await req.json();
       const { resourceId, type } = body;
-
-      const meeting =
-        type === "meeting" ? db.get("meetings").find((m) => m.id === resourceId) : null;
-      const lecture =
-        type === "lecture" ? db.get("lectures").find((l) => l.id === resourceId) : null;
-      const target = meeting || lecture;
+      const {
+        lecture,
+        item: target,
+        authorized,
+      } = findAuthorizedResource(String(resourceId || ""), currentUser, currentIsAdmin);
 
       if (!target) {
         return Response.json({ error: "Resource not found for analysis" }, { status: 404 });
+      }
+      if (!authorized) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
       }
 
       const analysis = generateAnalysisFromTranscript(
         target.title,
         target.segments,
-        type || "meeting",
+        type || (lecture ? "lecture" : "meeting"),
         lecture?.courseCode,
       );
 
@@ -4575,10 +4951,14 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
     // ACTION ITEMS / TASKS
     // ----------------------------------------------------
     if (pathname === "/api/v1/tasks" && method === "GET") {
-      const user = getAuthUser(req);
       const tasks = db.get("actionItems");
+      const ownedIds = getScopedResourceIds(currentUser);
       return Response.json(
-        isUserAdmin(user) ? tasks : tasks.filter((t) => !t.userId || t.userId === user?.id),
+        currentIsAdmin
+          ? tasks
+          : tasks.filter(
+              (t) => t.userId === currentUser.id || ownedIds.has(t.meetingId || t.lectureId || ""),
+            ),
       );
     }
 
@@ -4700,6 +5080,10 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       const summaryContext =
         resource.summary || ("studyNotes" in resource ? resource.studyNotes : undefined);
 
+      const difficulty =
+        body.difficulty === "easy" || body.difficulty === "medium" || body.difficulty === "hard"
+          ? (body.difficulty as "easy" | "medium" | "hard")
+          : ("all" as const);
       const generated = await generateAiQuiz(
         resource.title,
         activeSegments,
@@ -4708,6 +5092,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         {
           avoidQuestionTitles: Array.isArray(avoidQuestionTitles) ? avoidQuestionTitles : [],
           variant,
+          difficulty,
           appLanguage,
           numQuestions,
         },
@@ -4812,9 +5197,30 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
               accepted.includes(userText) ||
               correctText.includes(userText));
         } else if (q.type === "short_answer") {
-          const userText = String(rawAnswer || "").trim();
-          // Short answer is considered answered and reviewed if non-empty
-          isCorrect = userText.length >= 8;
+          const userNorm = normalizeAr(String(rawAnswer || ""));
+          const refTexts = [
+            q.correctAnswerText || "",
+            ...(q.acceptableAnswers || []),
+            q.explanation || "",
+          ]
+            .map(normalizeAr)
+            .filter(Boolean);
+          const refTokens = Array.from(
+            new Set(
+              refTexts
+                .join(" ")
+                .split(/\s+/)
+                .filter((tok) => tok.length >= 3 || /\d/.test(tok)),
+            ),
+          );
+          const matchedTokens = refTokens.filter((tok) => userNorm.includes(tok));
+          const directHit = (q.acceptableAnswers || [])
+            .map(normalizeAr)
+            .some((acc) => acc.length >= 2 && userNorm.includes(acc));
+          isCorrect =
+            userNorm.length >= 2 &&
+            (directHit ||
+              matchedTokens.length >= Math.min(2, Math.max(1, Math.ceil(refTokens.length * 0.25))));
         }
 
         if (isCorrect) correctCount++;
@@ -5120,6 +5526,13 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       method === "PUT"
     ) {
       const id = pathname.replace("/api/v1/notifications/", "").replace("/read", "");
+      const existingNotif = (db.get("notifications") || []).find((n) => n.id === id);
+      if (!existingNotif) {
+        return Response.json({ error: "Notification not found" }, { status: 404 });
+      }
+      if (!currentIsAdmin && existingNotif.userId && existingNotif.userId !== currentUser.id) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
       db.update("notifications", (notifs) =>
         notifs.map((n) => (n.id === id ? { ...n, read: true } : n)),
       );

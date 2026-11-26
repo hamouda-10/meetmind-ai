@@ -283,6 +283,12 @@ export interface GroundedAnswer {
   evidenceFound?: boolean;
   citations: { speaker: string; timestamp: string; quote: string }[];
   suggestedFollowUps?: string[];
+  telemetry?: {
+    ttftMs: number;
+    totalMs: number;
+    engine: string;
+    model: string;
+  };
 }
 
 export interface AuthUser {
@@ -1342,11 +1348,195 @@ class ApiClient {
     question: string,
     resourceId?: string,
     history?: Array<{ role: "user" | "model"; text: string }>,
+    scope?: "general" | "all-recordings" | "recording",
   ): Promise<GroundedAnswer> {
     return this.request<GroundedAnswer>("/api/v1/ai/ask", {
       method: "POST",
-      body: JSON.stringify({ question, resourceId, history }),
+      body: JSON.stringify({ question, resourceId, scope, history }),
       timeoutMs: 120000,
+    });
+  }
+
+  async askQuestionStream(
+    params: {
+      question: string;
+      resourceId?: string;
+      scope?: "general" | "all-recordings" | "recording";
+      history?: Array<{ role: "user" | "model"; text: string }>;
+    },
+    callbacks: {
+      onMeta?: (meta: {
+        engine: string;
+        model: string;
+        citations: { speaker: string; timestamp: string; quote: string }[];
+        evidenceFound: boolean;
+      }) => void;
+      onToken: (token: string) => void;
+      onDone?: (done: GroundedAnswer & { aborted?: boolean }) => void;
+    },
+    signal?: AbortSignal,
+  ): Promise<GroundedAnswer & { aborted?: boolean }> {
+    const resolvedUrl = resolveApiEndpoint("/api/v1/ai/ask/stream");
+    const fetchStream = () =>
+      fetch(resolvedUrl, {
+        method: "POST",
+        credentials: "include",
+        headers: this.buildHeaders({ Accept: "text/event-stream" }),
+        body: JSON.stringify(params),
+        signal,
+      });
+
+    let res = await fetchStream();
+    if (res.status === 401) {
+      const renewed = await this.tryRefreshSession();
+      if (renewed) {
+        res = await fetchStream();
+      }
+    }
+
+    if (!res.ok) {
+      let msg = `HTTP error ${res.status}`;
+      try {
+        const errJson = await res.json();
+        if (errJson?.error) msg = String(errJson.error);
+      } catch {
+        // fallback to status message
+      }
+      throw new Error(msg);
+    }
+
+    if (!res.body) {
+      throw new Error("Streaming response body is unavailable.");
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let accumulated = "";
+    let finalDone: (GroundedAnswer & { aborted?: boolean }) | null = null;
+    let latestCitations: { speaker: string; timestamp: string; quote: string }[] = [];
+    let latestEvidence = true;
+
+    const processEventBlock = (block: string) => {
+      const lines = block.split(/\r?\n/);
+      let eventType = "message";
+      const dataLines: string[] = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        }
+      }
+      if (dataLines.length === 0) return;
+      const rawData = dataLines.join("\n");
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(rawData) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+
+      if (eventType === "meta") {
+        const cits = Array.isArray(parsed.citations)
+          ? (parsed.citations as { speaker: string; timestamp: string; quote: string }[])
+          : [];
+        latestCitations = cits;
+        latestEvidence = Boolean(parsed.evidenceFound);
+        callbacks.onMeta?.({
+          engine: String(parsed.engine || "ai"),
+          model: String(parsed.model || ""),
+          citations: cits,
+          evidenceFound: latestEvidence,
+        });
+      } else if (eventType === "token") {
+        const tok = typeof parsed.token === "string" ? parsed.token : "";
+        if (tok) {
+          accumulated += tok;
+          callbacks.onToken(tok);
+        }
+      } else if (eventType === "done") {
+        finalDone = {
+          answer: typeof parsed.answer === "string" ? parsed.answer : accumulated,
+          evidenceFound:
+            typeof parsed.evidenceFound === "boolean" ? parsed.evidenceFound : latestEvidence,
+          citations: Array.isArray(parsed.citations)
+            ? (parsed.citations as { speaker: string; timestamp: string; quote: string }[])
+            : latestCitations,
+          suggestedFollowUps: Array.isArray(parsed.suggestedFollowUps)
+            ? (parsed.suggestedFollowUps as string[])
+            : undefined,
+          telemetry:
+            parsed.telemetry && typeof parsed.telemetry === "object"
+              ? (parsed.telemetry as GroundedAnswer["telemetry"])
+              : undefined,
+          aborted: Boolean(parsed.aborted),
+        };
+        callbacks.onDone?.(finalDone);
+      } else if (eventType === "error") {
+        throw new Error(String(parsed.error || "AI streaming error."));
+      }
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+        for (const part of parts) {
+          if (part.trim()) processEventBlock(part);
+        }
+      }
+      if (buffer.trim()) {
+        processEventBlock(buffer);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    if (finalDone) return finalDone;
+    const fallbackResult: GroundedAnswer & { aborted?: boolean } = {
+      answer: accumulated,
+      evidenceFound: latestEvidence,
+      citations: latestCitations,
+      aborted: Boolean(signal?.aborted),
+    };
+    callbacks.onDone?.(fallbackResult);
+    return fallbackResult;
+  }
+
+  async getChatHistory(options?: { resourceId?: string; scope?: "general" }): Promise<
+    Array<{
+      id: string;
+      userId: string;
+      resourceId?: string;
+      role: "user" | "assistant";
+      content: string;
+      evidenceFound?: boolean;
+      citations?: { speaker: string; timestamp: string; quote: string }[];
+      createdAt: string;
+    }>
+  > {
+    const params = new URLSearchParams();
+    if (options?.resourceId) params.set("resourceId", options.resourceId);
+    if (options?.scope) params.set("scope", options.scope);
+    const qs = params.toString();
+    return this.request(`/api/v1/ai/chat-history${qs ? `?${qs}` : ""}`, { retries: 0 });
+  }
+
+  async clearChatHistory(options?: {
+    resourceId?: string;
+    scope?: "general";
+  }): Promise<{ success: boolean; deletedCount: number }> {
+    const params = new URLSearchParams();
+    if (options?.resourceId) params.set("resourceId", options.resourceId);
+    if (options?.scope) params.set("scope", options.scope);
+    const qs = params.toString();
+    return this.request(`/api/v1/ai/chat-history${qs ? `?${qs}` : ""}`, {
+      method: "DELETE",
+      retries: 0,
     });
   }
 
@@ -1394,11 +1584,17 @@ class ApiClient {
 
   async generateNewQuiz(
     lectureId: string,
-    options?: { avoidQuestionTitles?: string[]; variant?: number },
+    options?: {
+      avoidQuestionTitles?: string[];
+      variant?: number;
+      difficulty?: "all" | "easy" | "medium" | "hard";
+      numQuestions?: number;
+    },
   ): Promise<Quiz> {
     return this.request<Quiz>("/api/v1/quizzes/generate", {
       method: "POST",
       body: JSON.stringify({ lectureId, ...options }),
+      timeoutMs: 120000,
     });
   }
 
@@ -1576,10 +1772,11 @@ class ApiClient {
     resourceId: string,
     type: "meeting" | "lecture" = "lecture",
     numQuestions: number = 5,
+    difficulty?: "all" | "easy" | "medium" | "hard",
   ): Promise<{ success: boolean; quiz: Quiz }> {
     return this.request<{ success: boolean; quiz: Quiz }>("/api/v1/ai/generate-quiz", {
       method: "POST",
-      body: JSON.stringify({ resourceId, type, numQuestions }),
+      body: JSON.stringify({ resourceId, type, numQuestions, difficulty }),
       timeoutMs: 120000,
     });
   }

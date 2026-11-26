@@ -32,8 +32,20 @@ const AMBIENT_PARTICLES = [
  * - Desktop: ~188px–204px
  * Uses the exact official MeetMind AI logo asset with subtle GPU-only continuous motion.
  */
-function AuthHeroLogo({ variant }: { variant: "desktop" | "compact-hero" }) {
+function AuthHeroLogo({
+  variant,
+  theme = "black-gold",
+}: {
+  variant: "desktop" | "compact-hero";
+  theme?: "black-gold" | "pure-white" | "sky-blue";
+}) {
   const isDesktop = variant === "desktop";
+  const auraBackground =
+    theme === "sky-blue"
+      ? "radial-gradient(circle, rgba(2, 132, 199, 0.22) 0%, rgba(56, 189, 248, 0.1) 48%, transparent 72%)"
+      : theme === "pure-white"
+        ? "radial-gradient(circle, rgba(17, 17, 17, 0.08) 0%, rgba(75, 85, 99, 0.03) 48%, transparent 72%)"
+        : "radial-gradient(circle, rgba(212, 175, 55, 0.34) 0%, rgba(212, 175, 55, 0.1) 46%, transparent 72%)";
 
   return (
     <div
@@ -47,13 +59,12 @@ function AuthHeroLogo({ variant }: { variant: "desktop" | "compact-hero" }) {
         className="relative flex items-center justify-center p-4 sm:p-5"
         style={{ perspective: "900px" }}
       >
-        {/* Soft pulsing golden ambient glow */}
+        {/* Soft pulsing theme-adaptive ambient glow */}
         <div
           aria-hidden="true"
           className="auth-hero-logo-aura pointer-events-none absolute -inset-4 rounded-full"
           style={{
-            background:
-              "radial-gradient(circle, rgba(212, 175, 55, 0.34) 0%, rgba(212, 175, 55, 0.1) 46%, transparent 72%)",
+            background: auraBackground,
           }}
         />
 
@@ -146,7 +157,8 @@ export function AuthShell({ title, subtitle, children, footer }: AuthShellProps)
   const { language, setLanguage, isRtl } = useTranslation();
   const setUiLanguage = useUIStore((s) => s.setLanguage);
   const resolvedTheme = useUIStore((s) => s.resolvedTheme);
-  const isLight = resolvedTheme === "light";
+  const isPureWhite = resolvedTheme === "pure-white";
+  const isSkyBlue = resolvedTheme === "sky-blue";
 
   const toggleLanguage = () => {
     const next = language === "AR" ? "EN" : "AR";
@@ -196,12 +208,116 @@ export function AuthShell({ title, subtitle, children, footer }: AuthShellProps)
       dir={isRtl ? "rtl" : "ltr"}
       className="relative min-h-screen w-full overflow-x-hidden bg-[#050507] text-zinc-100 selection:bg-amber-500/30 selection:text-amber-100"
     >
-      {/* Atmospheric Background (Obsidian Gold in Dark Mode / Crisp White Grid in Light Mode) */}
+      {/* Atmospheric Background (Black & Gold / Pure White / Light Sky Blue) */}
       <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
-        {isLight ? (
+        {isPureWhite ? (
           <>
-            <div className="absolute inset-0 bg-white" />
-            <div className="auth-bg-grid absolute inset-0 opacity-70" />
+            <div className="absolute inset-0 bg-gradient-to-b from-[#FFFFFF] via-[#FFFFFF] to-[#F7F8FA]" />
+            <div className="auth-bg-grid absolute inset-0 opacity-75" />
+          </>
+        ) : isSkyBlue ? (
+          <>
+            <div className="absolute inset-0 bg-gradient-to-br from-[#F4FAFF] via-[#F8FCFF] to-[#EAF6FF]" />
+            <div
+              className="absolute inset-0"
+              style={{
+                background:
+                  "radial-gradient(circle at 20% 24%, rgba(56, 189, 248, 0.18), transparent 48%), radial-gradient(circle at 80% 74%, rgba(6, 182, 212, 0.12), transparent 46%)",
+              }}
+            />
+            <div className="auth-bg-grid absolute inset-0 opacity-85" />
+            <svg
+              viewBox="0 0 1440 900"
+              preserveAspectRatio="xMidYMid slice"
+              className="absolute inset-0 h-full w-full opacity-55"
+            >
+              <defs>
+                <linearGradient id="authSkyArc" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stopColor="#0284C7" stopOpacity="0" />
+                  <stop offset="50%" stopColor="#0284C7" stopOpacity="0.28" />
+                  <stop offset="100%" stopColor="#38BDF8" stopOpacity="0" />
+                </linearGradient>
+                <linearGradient id="authSkyLine" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.1" />
+                  <stop offset="50%" stopColor="#0284C7" stopOpacity="0.25" />
+                  <stop offset="100%" stopColor="#06B6D4" stopOpacity="0.1" />
+                </linearGradient>
+              </defs>
+              <ellipse
+                cx="360"
+                cy="390"
+                rx="420"
+                ry="230"
+                fill="none"
+                stroke="url(#authSkyArc)"
+                strokeWidth="1"
+                transform="rotate(-14 360 390)"
+              />
+              <ellipse
+                cx="1120"
+                cy="520"
+                rx="380"
+                ry="210"
+                fill="none"
+                stroke="url(#authSkyArc)"
+                strokeWidth="0.9"
+                transform="rotate(18 1120 520)"
+              />
+              <g stroke="url(#authSkyLine)" strokeWidth="0.9">
+                <line x1="140" y1="180" x2="310" y2="260" />
+                <line x1="310" y1="260" x2="210" y2="490" />
+                <line x1="210" y1="490" x2="430" y2="620" />
+                <line x1="1140" y1="170" x2="1280" y2="330" />
+                <line x1="1280" y1="330" x2="1180" y2="590" />
+                <line x1="1180" y1="590" x2="1320" y2="760" />
+              </g>
+              <g fill="#0284C7">
+                <circle cx="140" cy="180" r="2.2" className="auth-bg-node" />
+                <circle
+                  cx="310"
+                  cy="260"
+                  r="2.6"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "1.1s" }}
+                />
+                <circle
+                  cx="210"
+                  cy="490"
+                  r="2"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "2.2s" }}
+                />
+                <circle
+                  cx="430"
+                  cy="620"
+                  r="2.4"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "0.7s" }}
+                />
+                <circle
+                  cx="1140"
+                  cy="170"
+                  r="2.2"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "1.8s" }}
+                />
+                <circle
+                  cx="1280"
+                  cy="330"
+                  r="2.6"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "2.9s" }}
+                />
+                <circle
+                  cx="1180"
+                  cy="590"
+                  r="2.2"
+                  className="auth-bg-node"
+                  style={{ animationDelay: "0.4s" }}
+                />
+                <circle cx="1320" cy="760" r="2" className="auth-bg-node" />
+              </g>
+            </svg>
           </>
         ) : (
           <>
@@ -387,7 +503,7 @@ export function AuthShell({ title, subtitle, children, footer }: AuthShellProps)
           className="hidden lg:col-span-6 lg:flex lg:flex-col lg:items-start lg:pe-6"
         >
           <div className="mb-7">
-            <AuthHeroLogo variant="desktop" />
+            <AuthHeroLogo variant="desktop" theme={resolvedTheme} />
           </div>
 
           <h1 className="font-display text-4xl font-extrabold tracking-tight text-white text-balance xl:text-[2.65rem] xl:leading-[1.12]">
@@ -441,7 +557,7 @@ export function AuthShell({ title, subtitle, children, footer }: AuthShellProps)
             transition={{ duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
             className="mb-5 lg:hidden"
           >
-            <AuthHeroLogo variant="compact-hero" />
+            <AuthHeroLogo variant="compact-hero" theme={resolvedTheme} />
           </motion.div>
 
           {/* Animated Auth Card */}

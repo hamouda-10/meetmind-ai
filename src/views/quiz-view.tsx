@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { useNavigate, useRouterState } from "@tanstack/react-router";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BrainCircuit,
@@ -60,6 +60,9 @@ export default function QuizView() {
 
   const [selectedQuizId, setSelectedQuizId] = useState<string>(() => urlQuizId);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<string, string | number>>({});
+  const [selectedDifficulty, setSelectedDifficulty] = useState<"all" | "easy" | "medium" | "hard">(
+    "all",
+  );
   const [historyOpen, setHistoryOpen] = useState(false);
   const [submittedResults, setSubmittedResults] = useState<{
     scorePercent: number;
@@ -155,7 +158,7 @@ export default function QuizView() {
         throw new Error(isArabic ? "لم يتم تحديد محاضرة" : "No lecture selected");
       }
       const resType = requestedResource?.type || "lecture";
-      const res = await api.generateQuiz(urlResourceId, resType, 5);
+      const res = await api.generateQuiz(urlResourceId, resType, 6, selectedDifficulty);
       return res.quiz;
     },
     onSuccess: (newQuiz) => {
@@ -199,13 +202,19 @@ export default function QuizView() {
 
   const generateNewQuizMutation = useMutation({
     mutationFn: async () => {
-      if (!activeQuiz?.lectureId) {
-        throw new Error("لا توجد محاضرة مرتبطة بهذا الاختبار لتوليد نموذج جديد");
+      const sourceResourceId = activeQuiz?.lectureId || activeQuiz?.meetingId;
+      if (!sourceResourceId) {
+        throw new Error(
+          isArabic
+            ? "لا يوجد تسجيل أو محاضرة مرتبطة بهذا الاختبار لتوليد نموذج جديد"
+            : "No linked lecture or meeting found for generating fresh questions",
+        );
       }
       const avoidTitles = activeQuiz.questions.map((q) => q.question);
-      return api.generateNewQuiz(activeQuiz.lectureId, {
+      return api.generateNewQuiz(sourceResourceId, {
         avoidQuestionTitles: avoidTitles,
         variant: (activeQuiz.attemptsCount || 0) + 2,
+        difficulty: selectedDifficulty,
       });
     },
     onSuccess: (newQuiz) => {
@@ -293,6 +302,41 @@ export default function QuizView() {
         actions={
           activeQuiz ? (
             <div className="flex flex-wrap items-center gap-2">
+              <div
+                className="inline-flex items-center rounded-lg border border-border/60 bg-secondary/40 p-0.5 text-[11px]"
+                role="group"
+                aria-label={isArabic ? "مستوى الصعوبة" : "Quiz Difficulty"}
+              >
+                {(["all", "easy", "medium", "hard"] as const).map((lvl) => (
+                  <button
+                    key={lvl}
+                    type="button"
+                    onClick={() => setSelectedDifficulty(lvl)}
+                    className={`rounded-md px-2 py-1 font-medium transition-colors cursor-pointer ${
+                      selectedDifficulty === lvl
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {lvl === "all"
+                      ? isArabic
+                        ? "الكل"
+                        : "All"
+                      : lvl === "easy"
+                        ? isArabic
+                          ? "سهل"
+                          : "Easy"
+                        : lvl === "medium"
+                          ? isArabic
+                            ? "متوسط"
+                            : "Medium"
+                          : isArabic
+                            ? "صعب"
+                            : "Hard"}
+                  </button>
+                ))}
+              </div>
+
               <Button
                 variant="outline"
                 size="sm"
@@ -528,8 +572,14 @@ export default function QuizView() {
                               </Badge>
                               {getDifficultyBadge(q.difficulty)}
                               {(q.timestampRef || q.sectionRef) && (
-                                <a
-                                  href={`/transcript?id=${encodeURIComponent(activeQuiz.lectureId || "")}&time=${encodeURIComponent(parseTimestampToSeconds(q.timestampRef || q.sectionRef))}`}
+                                <Link
+                                  to="/transcript"
+                                  search={{
+                                    id: activeQuiz.lectureId || activeQuiz.meetingId || undefined,
+                                    time: String(
+                                      parseTimestampToSeconds(q.timestampRef || q.sectionRef),
+                                    ),
+                                  }}
                                   className="inline-flex items-center gap-1 text-[11px] text-primary hover:underline font-mono bg-primary/10 px-2 py-0.5 rounded border border-primary/25 cursor-pointer"
                                   title={
                                     isQuestionArabic
@@ -539,7 +589,7 @@ export default function QuizView() {
                                 >
                                   <Clock className="h-3 w-3" />
                                   <span>{q.timestampRef || q.sectionRef}</span>
-                                </a>
+                                </Link>
                               )}
                             </div>
                             <span

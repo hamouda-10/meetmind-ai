@@ -21,8 +21,6 @@ import {
   CheckSquare,
   Video,
   GraduationCap,
-  Moon,
-  Sun,
 } from "lucide-react";
 
 export function CommandPalette() {
@@ -160,10 +158,54 @@ export function CommandPalette() {
         </CommandGroup>
 
         <CommandSeparator />
-        <CommandGroup heading="Preferences">
-          <CommandItem onSelect={() => setTheme(theme === "dark" ? "light" : "dark")}>
-            {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-            Toggle theme
+        <CommandGroup heading="Color Theme">
+          <CommandItem
+            onSelect={() => {
+              setTheme("black-gold");
+              setOpen(false);
+            }}
+          >
+            <span
+              data-theme-swatch="true"
+              className="h-3.5 w-3.5 rounded-full border-2"
+              style={{ backgroundColor: "#D4AF37", borderColor: "#070709" }}
+            />
+            <span>Black &amp; Gold</span>
+            {theme === "black-gold" && (
+              <span className="ml-auto text-xs text-primary font-medium">Active</span>
+            )}
+          </CommandItem>
+          <CommandItem
+            onSelect={() => {
+              setTheme("pure-white");
+              setOpen(false);
+            }}
+          >
+            <span
+              data-theme-swatch="true"
+              className="h-3.5 w-3.5 rounded-full border-2"
+              style={{ backgroundColor: "#FFFFFF", borderColor: "#111111" }}
+            />
+            <span>Pure White</span>
+            {theme === "pure-white" && (
+              <span className="ml-auto text-xs text-primary font-medium">Active</span>
+            )}
+          </CommandItem>
+          <CommandItem
+            onSelect={() => {
+              setTheme("sky-blue");
+              setOpen(false);
+            }}
+          >
+            <span
+              data-theme-swatch="true"
+              className="h-3.5 w-3.5 rounded-full border-2"
+              style={{ backgroundColor: "#0284C7", borderColor: "#BAE6FD" }}
+            />
+            <span>Sky Blue</span>
+            {theme === "sky-blue" && (
+              <span className="ml-auto text-xs text-primary font-medium">Active</span>
+            )}
           </CommandItem>
         </CommandGroup>
       </CommandList>

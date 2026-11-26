@@ -28,7 +28,6 @@ try {
 
 import { ThinkingLevel } from "@google/genai";
 import { db, JobRecord, TranscriptSegment } from "./db";
-import { buildBuiltInAudioFallbackSegments } from "./builtin-ai";
 import { transcribeAudioWithLocalWhisper } from "./whisper-asr";
 import {
   extractHighlightsFromSegments,
@@ -1398,33 +1397,24 @@ export async function processRecordingJob(
       }
     }
 
-    // Last-resort fallback ONLY when all real ASR engines (Gemini, ONNX Whisper, Python Whisper) could not execute
-    // (e.g. missing native ONNX/FFmpeg binary in a restricted serverless container). Never overwrites real speech.
+    // Strict Zero-Fake-Transcript Policy: NEVER fabricate placeholder transcript text when all real ASR engines fail.
     if (segments.length === 0) {
       if (localWhisperSilent || (geminiObservedSilence && !geminiErrorMsg)) {
-        throw new Error("No audible speech detected in the recording.");
+        throw new Error(
+          "No audible speech detected in the recording. Please check the audio file and try again.",
+        );
       }
-      logPipelineEvent("warn", "asr_last_resort_fallback_triggered", {
+      logPipelineEvent("error", "all_real_asr_engines_failed", {
         jobId,
         resourceId,
-        localWhisperError: localWhisperError?.slice(0, 200),
-        geminiError: geminiErrorMsg?.slice(0, 200),
+        localWhisperError: localWhisperError?.slice(0, 240),
+        geminiError: geminiErrorMsg?.slice(0, 240),
       });
-      const fallbackTitle =
-        resourceType === "meeting"
-          ? db.get("meetings").find((m) => m.id === resourceId)?.title || originalFilename
-          : db.get("lectures").find((l) => l.id === resourceId)?.title || originalFilename;
-      const jobMeta = db.get("jobs").find((j) => j.id === jobId);
-      segments = buildBuiltInAudioFallbackSegments({
-        filePath: activeAudioFile,
-        originalFilename,
-        title: fallbackTitle,
-        resourceType,
-        durationSeconds,
-        language,
-        appLanguage: jobMeta?.appLanguage,
-        jobId,
-      });
+      const detail =
+        localWhisperError ||
+        geminiErrorMsg ||
+        "All speech-to-text engines failed to extract speech from this audio file.";
+      throw new Error(`Real speech-to-text transcription failed: ${detail}`);
     }
 
     assertNotCancelled(jobId);
@@ -2012,8 +2002,28 @@ export async function runUnifiedPostTranscriptionPipeline(
     );
   }
 
-  // STEP 2: Concurrently execute AI operations with bounded concurrency (max 3 concurrent) to protect rate limits
-  // Partial failures (e.g. 503 on deep analysis or quiz) will NEVER discard the other successful results!
+  // STEP 2: Concurrently execute independent AI operations with bounded concurrency + per-task timeouts
+  // Partial failures (e.g. 503 or timeout on one stage) will NEVER discard the other successful results!
+  async function withStageTimeout<T>(
+    task: () => Promise<T>,
+    label: string,
+    timeoutMs = 60000,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        task(),
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`AI pipeline stage "${label}" timed out after ${timeoutMs}ms.`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async function runControlledConcurrency<T extends readonly (() => Promise<unknown>)[]>(
     tasks: T,
     maxConcurrency = 3,
@@ -2041,11 +2051,36 @@ export async function runUnifiedPostTranscriptionPipeline(
   const [summarySettled, deepSettled, quizSettled, cardsSettled, mindMapSettled] =
     (await runControlledConcurrency(
       [
-        () => generateAiSummary(title, segments, resourceType, courseCode, appLanguage),
-        () => generateAiLectureAnalysis(title, segments, resourceType, courseCode, appLanguage),
-        () => generateAiQuiz(title, segments, undefined, courseCode, { appLanguage }),
-        () => generateAiFlashcards(title, segments, undefined, courseCode, appLanguage),
-        () => generateAiMindMap(title, segments, undefined, courseCode, appLanguage),
+        () =>
+          withStageTimeout(
+            () => generateAiSummary(title, segments, resourceType, courseCode, appLanguage),
+            "summary",
+            60000,
+          ),
+        () =>
+          withStageTimeout(
+            () => generateAiLectureAnalysis(title, segments, resourceType, courseCode, appLanguage),
+            "deep_analysis",
+            45000,
+          ),
+        () =>
+          withStageTimeout(
+            () => generateAiQuiz(title, segments, undefined, courseCode, { appLanguage }),
+            "quiz",
+            55000,
+          ),
+        () =>
+          withStageTimeout(
+            () => generateAiFlashcards(title, segments, undefined, courseCode, appLanguage),
+            "flashcards",
+            45000,
+          ),
+        () =>
+          withStageTimeout(
+            () => generateAiMindMap(title, segments, undefined, courseCode, appLanguage),
+            "mindmap",
+            45000,
+          ),
       ],
       3,
     )) as [
@@ -2224,12 +2259,14 @@ export async function runUnifiedPostTranscriptionPipeline(
           highlights,
           analysis: deepAnalysis
             ? {
+                overview: deepAnalysis.overview,
                 topics: deepAnalysis.topics,
                 keywords: deepAnalysis.keywords,
                 definitions: deepAnalysis.definitions,
                 questionsAsked: deepAnalysis.questionsAsked,
                 actionItems: deepAnalysis.actionItems,
                 emphasizedPoints: deepAnalysis.emphasizedPoints,
+                importantSentences: deepAnalysis.importantSentences,
                 reviewAreas: deepAnalysis.reviewAreas,
               }
             : undefined,
@@ -2360,12 +2397,14 @@ export async function runUnifiedPostTranscriptionPipeline(
           highlights,
           analysis: deepAnalysis
             ? {
+                overview: deepAnalysis.overview,
                 topics: deepAnalysis.topics,
                 keywords: deepAnalysis.keywords,
                 definitions: deepAnalysis.definitions,
                 questionsAsked: deepAnalysis.questionsAsked,
                 actionItems: deepAnalysis.actionItems,
                 emphasizedPoints: deepAnalysis.emphasizedPoints,
+                importantSentences: deepAnalysis.importantSentences,
                 reviewAreas: deepAnalysis.reviewAreas,
               }
             : undefined,

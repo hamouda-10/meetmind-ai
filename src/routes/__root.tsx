@@ -51,7 +51,7 @@ function NotFoundComponent() {
   );
 }
 
-const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem("${THEME_STORAGE_KEY}");var isLight=t==="light";document.documentElement.classList.toggle("dark",!isLight);document.documentElement.classList.toggle("light",isLight);document.documentElement.dataset.theme=isLight?"light":"dark";var l=localStorage.getItem("meetmind-lang");if(l==="AR"){document.documentElement.dir="rtl";document.documentElement.lang="ar";}}catch(e){document.documentElement.classList.add("dark");document.documentElement.classList.remove("light");}})();`;
+const THEME_INIT_SCRIPT = `(function(){try{var raw=localStorage.getItem("${THEME_STORAGE_KEY}");var t=(raw==="pure-white"||raw==="light")?"pure-white":(raw==="sky-blue"||raw==="ai-neon")?"sky-blue":"black-gold";var r=document.documentElement;var isDark=t==="black-gold";r.classList.toggle("dark",isDark);r.classList.toggle("light",!isDark);r.classList.toggle("theme-black-gold",isDark);r.classList.toggle("theme-pure-white",t==="pure-white");r.classList.toggle("theme-sky-blue",t==="sky-blue");r.dataset.theme=t;var l=localStorage.getItem("meetmind-lang");if(l==="AR"){r.dir="rtl";r.lang="ar";}}catch(e){var r=document.documentElement;r.classList.add("dark","theme-black-gold");r.classList.remove("light","theme-pure-white","theme-sky-blue");r.dataset.theme="black-gold";}})();`;
 
 function ErrorComponent({ error: rawError, reset }: { error: unknown; reset: () => void }) {
   const router = useRouter();
@@ -202,15 +202,15 @@ function DataSyncListener() {
 function SessionLoadingScreen({ message }: { message: string }) {
   return (
     <div
-      className="flex min-h-screen w-full flex-col items-center justify-center bg-[#060608] px-4 text-zinc-100"
+      className="flex min-h-screen w-full flex-col items-center justify-center bg-background px-4 text-foreground"
       role="status"
       aria-live="polite"
     >
       <div className="flex flex-col items-center gap-5">
         <Logo />
-        <div className="flex items-center gap-2.5 text-xs font-medium tracking-wide text-zinc-400">
+        <div className="flex items-center gap-2.5 text-xs font-medium tracking-wide text-muted-foreground">
           <span
-            className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-amber-400/30 border-t-amber-400"
+            className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary/30 border-t-primary"
             aria-hidden="true"
           />
           <span>{message}</span>
@@ -299,6 +299,7 @@ function RootComponent() {
     }
   }, [authStatus, isAuthPublicPath, isGuestRestrictedPath, pathname, searchStr, navigate]);
 
+  const toasterTheme = resolvedTheme === "black-gold" ? "dark" : "light";
   const loadingText = language === "AR" ? "جارٍ التحقق من الجلسة..." : "Restoring session...";
 
   // Public authentication routes (/login, /register)
@@ -311,7 +312,7 @@ function RootComponent() {
           ) : (
             <Outlet />
           )}
-          <Toaster position="top-right" richColors theme={resolvedTheme} />
+          <Toaster position="top-right" richColors theme={toasterTheme} />
         </TooltipProvider>
       </QueryClientProvider>
     );
@@ -336,7 +337,7 @@ function RootComponent() {
                   : "Redirecting to sign in..."
             }
           />
-          <Toaster position="top-right" richColors theme={resolvedTheme} />
+          <Toaster position="top-right" richColors theme={toasterTheme} />
         </TooltipProvider>
       </QueryClientProvider>
     );
@@ -354,7 +355,7 @@ function RootComponent() {
           <NotificationCenter />
           <FloatingAIAssistant />
         </Suspense>
-        <Toaster position="top-right" richColors theme={resolvedTheme} />
+        <Toaster position="top-right" richColors theme={toasterTheme} />
         {recordingDialogOpen && (
           <Suspense fallback={null}>
             <UploadRecordingDialog

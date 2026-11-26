@@ -172,12 +172,14 @@ export interface MeetingRecord {
   keywords?: KeywordItem[];
   highlights?: HighlightItem[];
   analysis?: {
+    overview?: string;
     topics: string[];
     keywords: string[];
     definitions: Array<{ term: string; definition: string; timestamp?: string }>;
     questionsAsked: Array<{ question: string; answer?: string; timestamp?: string }>;
     actionItems: Array<{ task: string; owner?: string; deadline?: string }>;
     emphasizedPoints: string[];
+    importantSentences?: string[];
     reviewAreas: string[];
   };
   fullText?: string;
@@ -219,12 +221,14 @@ export interface LectureRecord {
   keywords?: KeywordItem[];
   highlights?: HighlightItem[];
   analysis?: {
+    overview?: string;
     topics: string[];
     keywords: string[];
     definitions: Array<{ term: string; definition: string; timestamp?: string }>;
     questionsAsked: Array<{ question: string; answer?: string; timestamp?: string }>;
     actionItems: Array<{ task: string; owner?: string; deadline?: string }>;
     emphasizedPoints: string[];
+    importantSentences?: string[];
     reviewAreas: string[];
   };
   fullText?: string;
@@ -350,6 +354,7 @@ export interface NotificationRecord {
 
 export interface CalendarEventRecord {
   id: string;
+  userId?: string;
   title: string;
   date: string; // ISO format or YYYY-MM-DD
   time: string;
@@ -512,9 +517,98 @@ function getInitialData(): DatabaseSchema {
 
 class DatabaseManager {
   private data: DatabaseSchema;
+  private remoteHydrationPromise: Promise<void> | null = null;
+  private remoteHydrated = false;
+  private pendingRemoteSync: Promise<void> | null = null;
 
   constructor() {
     this.data = this.load();
+  }
+
+  private getRemoteKvConfig(): { url: string; token: string } | null {
+    const url = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
+    const token = (
+      process.env.KV_REST_API_TOKEN ||
+      process.env.UPSTASH_REDIS_REST_TOKEN ||
+      ""
+    ).trim();
+    if (!url || !token) return null;
+    return { url: url.replace(/\/$/, ""), token };
+  }
+
+  public getPersistenceStatus(): {
+    mode: "remote-kv" | "local-fs" | "ephemeral-tmp";
+    remoteKvConfigured: boolean;
+    remoteKvHydrated: boolean;
+    dbPath: string;
+  } {
+    const kv = this.getRemoteKvConfig();
+    const isTmp = Boolean(process.env.VERCEL) || DB_FILE.includes(path.sep + "tmp");
+    return {
+      mode: kv ? "remote-kv" : isTmp ? "ephemeral-tmp" : "local-fs",
+      remoteKvConfigured: Boolean(kv),
+      remoteKvHydrated: this.remoteHydrated,
+      dbPath: DB_FILE,
+    };
+  }
+
+  public async ensureHydrated(): Promise<void> {
+    if (this.remoteHydrated) return;
+    const kv = this.getRemoteKvConfig();
+    if (!kv) {
+      this.remoteHydrated = true;
+      return;
+    }
+
+    if (!this.remoteHydrationPromise) {
+      this.remoteHydrationPromise = (async () => {
+        try {
+          const resp = await fetch(kv.url, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${kv.token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(["GET", "meetmind_db"]),
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!resp.ok) return;
+          const payload = (await resp.json()) as { result?: unknown };
+          const raw =
+            typeof payload?.result === "string"
+              ? payload.result
+              : payload?.result && typeof payload.result === "object"
+                ? JSON.stringify(payload.result)
+                : "";
+          if (raw && raw.length > 20) {
+            const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
+            if (Array.isArray(parsed.users) && parsed.users.length > 0) {
+              this.data = this.ensureSchemaArrays(parsed);
+              this.writeLocalAtomic(this.data);
+            }
+          }
+        } catch (err) {
+          console.warn(
+            "[DB] Remote KV cold-start hydration notice:",
+            err instanceof Error ? err.message : err,
+          );
+        } finally {
+          this.remoteHydrated = true;
+        }
+      })();
+    }
+
+    await this.remoteHydrationPromise;
+  }
+
+  public async flushRemoteSync(): Promise<void> {
+    if (this.pendingRemoteSync) {
+      try {
+        await this.pendingRemoteSync;
+      } catch {
+        // already logged inside syncRemoteKV
+      }
+    }
   }
 
   private ensureSchemaArrays(parsed: Partial<DatabaseSchema>): DatabaseSchema {
@@ -584,7 +678,7 @@ class DatabaseManager {
           const parsed: Partial<DatabaseSchema> = JSON.parse(raw);
           if (Array.isArray(parsed.users) && parsed.users.length > 0) {
             const verified = this.ensureSchemaArrays(parsed);
-            this.saveData(verified);
+            this.writeLocalAtomic(verified);
             return verified;
           }
         }
@@ -595,46 +689,68 @@ class DatabaseManager {
 
     // 3. Fallback to rich embedded initial schema with verified scrypt hashes
     const initial = getInitialData();
-    this.saveData(initial);
+    this.writeLocalAtomic(initial);
     return initial;
   }
 
-  private syncRemoteKV(data: DatabaseSchema): void {
-    const url = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
-    const token = (
-      process.env.KV_REST_API_TOKEN ||
-      process.env.UPSTASH_REDIS_REST_TOKEN ||
-      ""
-    ).trim();
-    if (!url || !token) return;
-
-    try {
-      const endpoint = `${url.replace(/\/$/, "")}/set/meetmind_db`;
-      void fetch(endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(JSON.stringify(data)),
-      }).catch((err) => {
-        console.warn("Vercel KV async sync warning:", err);
-      });
-    } catch {
-      // ignore sync errors
-    }
-  }
-
-  private saveData(data: DatabaseSchema) {
+  private writeLocalAtomic(data: DatabaseSchema): void {
     try {
       const dir = path.dirname(DB_FILE);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+      const serialized = JSON.stringify(data, null, 2);
+      const tmpPath = `${DB_FILE}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 7)}`;
+      try {
+        fs.writeFileSync(tmpPath, serialized, "utf-8");
+        fs.renameSync(tmpPath, DB_FILE);
+      } catch {
+        try {
+          if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+        } catch {
+          // best-effort temp cleanup
+        }
+        fs.writeFileSync(DB_FILE, serialized, "utf-8");
+      }
     } catch (err) {
       console.error("Failed to persist database file", err);
     }
+  }
+
+  private syncRemoteKV(data: DatabaseSchema): void {
+    const kv = this.getRemoteKvConfig();
+    if (!kv) return;
+
+    try {
+      const serialized = JSON.stringify(data);
+      const syncPromise = fetch(kv.url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${kv.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(["SET", "meetmind_db", serialized]),
+        signal: AbortSignal.timeout(5000),
+      })
+        .then((res) => {
+          if (!res.ok) {
+            console.warn(`[DB] Remote KV sync returned HTTP ${res.status}`);
+          }
+        })
+        .catch((err) => {
+          console.warn("[DB] Remote KV sync warning:", err instanceof Error ? err.message : err);
+        });
+      this.pendingRemoteSync = syncPromise;
+    } catch (err) {
+      console.warn(
+        "[DB] Remote KV sync dispatch failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  private saveData(data: DatabaseSchema) {
+    this.writeLocalAtomic(data);
     this.syncRemoteKV(data);
   }
 

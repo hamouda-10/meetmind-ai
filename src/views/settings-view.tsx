@@ -12,8 +12,6 @@ import {
   AlertTriangle,
   Download,
   RotateCcw,
-  Moon,
-  Sun,
 } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
 import { GlassCard } from "@/components/common/glass-card";
@@ -42,6 +40,7 @@ import { api } from "@/lib/api-client";
 import { useAuthStore } from "@/stores/auth-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useTranslation } from "@/lib/i18n";
+import { THEME_OPTIONS } from "@/lib/theme";
 import { toast } from "sonner";
 
 export default function SettingsView() {
@@ -229,54 +228,57 @@ export default function SettingsView() {
                 {isRtl ? "المظهر والتخطيط" : "Appearance & Layout"}
               </div>
               <div className="space-y-4">
-                <div className="space-y-2">
-                  <Label>{isRtl ? "وضع المظهر (الليلي / النهاري)" : "Color Theme"}</Label>
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <button
-                      type="button"
-                      onClick={() => setTheme("dark")}
-                      className={`flex items-center gap-3 rounded-xl border p-3.5 text-start transition cursor-pointer ${
-                        resolvedTheme === "dark"
-                          ? "border-primary bg-primary/10 ring-1 ring-primary"
-                          : "border-border hover:bg-secondary/60"
-                      }`}
-                    >
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#09090d] border border-amber-500/40 text-amber-400">
-                        <Moon className="h-5 w-5" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold">
-                          {isRtl ? "الوضع الليلي" : "Dark Mode"}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {isRtl ? "داكن فاخر بالذهبي (الحالي)" : "Matte dark obsidian & gold"}
-                        </div>
-                      </div>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setTheme("light")}
-                      className={`flex items-center gap-3 rounded-xl border p-3.5 text-start transition cursor-pointer ${
-                        resolvedTheme === "light"
-                          ? "border-primary bg-primary/10 ring-1 ring-primary"
-                          : "border-border hover:bg-secondary/60"
-                      }`}
-                    >
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white border border-zinc-300 text-zinc-950">
-                        <Sun className="h-5 w-5" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold">
-                          {isRtl ? "الوضع النهاري (أبيض وأسود)" : "Light Mode (White & Black)"}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {isRtl
-                            ? "أبيض ناصع وأسود عالي الوضوح"
-                            : "Pure crisp monochrome white & black"}
-                        </div>
-                      </div>
-                    </button>
+                <div className="space-y-2.5">
+                  <Label>{isRtl ? "ألوان المنصة" : "Color Theme"}</Label>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    {THEME_OPTIONS.map((opt) => {
+                      const isActive = resolvedTheme === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setTheme(opt.id)}
+                          aria-pressed={isActive}
+                          data-settings-theme={opt.id}
+                          className={`relative flex flex-col justify-between gap-3 rounded-xl border p-3.5 text-start transition cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                            isActive
+                              ? "border-primary bg-primary/10 ring-1 ring-primary shadow-sm"
+                              : "border-border hover:bg-secondary/60"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span
+                              data-theme-swatch="true"
+                              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-2"
+                              style={{
+                                backgroundColor: opt.dotColor,
+                                borderColor: opt.dotBorder,
+                              }}
+                              aria-hidden="true"
+                            />
+                            <div className="flex items-center gap-1.5" aria-hidden="true">
+                              {opt.swatches.map((hex, i) => (
+                                <span
+                                  key={i}
+                                  data-theme-swatch="true"
+                                  className="h-3.5 w-3.5 rounded-full border border-black/15"
+                                  style={{ backgroundColor: hex }}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span className="text-sm font-semibold truncate">{opt.label}</span>
+                              {isActive && <Check className="h-4 w-4 shrink-0 text-primary" />}
+                            </div>
+                            <div className="text-[11px] leading-relaxed text-muted-foreground">
+                              {isRtl ? opt.descAr : opt.descEn}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
                 <div className="flex items-center justify-between gap-4">

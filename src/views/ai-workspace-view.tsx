@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, lazy, Suspense, type ReactNode } from "react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Sparkles,
   Wand2,
@@ -16,11 +16,15 @@ import {
   Quote,
   Clock,
   AlertCircle,
+  Square,
+  RotateCcw,
+  Trash2,
+  Copy,
+  Check,
 } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
 import { GlassCard } from "@/components/common/glass-card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
   Select,
@@ -29,17 +33,234 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { api, Meeting, Lecture, GroundedAnswer } from "@/lib/api-client";
+import { api, Meeting, Lecture } from "@/lib/api-client";
 import { useTranslation } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { AudioOrb3D } from "@/components/3d/audio-orb-3d";
+
+const AudioOrb3D = lazy(() =>
+  import("@/components/3d/audio-orb-3d").then((m) => ({ default: m.AudioOrb3D })),
+);
+
+function WorkspaceMarkdown({ content }: { content: string }) {
+  const [copiedCodeIdx, setCopiedCodeIdx] = useState<number | null>(null);
+  const blocks = useMemo(() => {
+    const parts: Array<{ type: "text" | "code"; lang?: string; value: string }> = [];
+    const regex = /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g;
+    let last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(content)) !== null) {
+      if (m.index > last) {
+        parts.push({ type: "text", value: content.slice(last, m.index) });
+      }
+      parts.push({ type: "code", lang: m[1] || "code", value: m[2].replace(/\n$/, "") });
+      last = regex.lastIndex;
+    }
+    if (last < content.length) {
+      parts.push({ type: "text", value: content.slice(last) });
+    }
+    return parts;
+  }, [content]);
+
+  const renderInline = (line: string): ReactNode[] => {
+    const out: ReactNode[] = [];
+    const tokenRegex = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+    let idx = 0;
+    let m: RegExpExecArray | null;
+    let k = 0;
+    while ((m = tokenRegex.exec(line)) !== null) {
+      if (m.index > idx) out.push(line.slice(idx, m.index));
+      const tok = m[0];
+      if (tok.startsWith("**") && tok.endsWith("**")) {
+        out.push(
+          <strong key={k++} className="font-semibold text-foreground">
+            {tok.slice(2, -2)}
+          </strong>,
+        );
+      } else if (tok.startsWith("`") && tok.endsWith("`")) {
+        out.push(
+          <code
+            key={k++}
+            dir="ltr"
+            className="inline-block rounded bg-secondary/80 px-1.5 py-0.5 font-mono text-[12px] text-primary"
+          >
+            {tok.slice(1, -1)}
+          </code>,
+        );
+      }
+      idx = tokenRegex.lastIndex;
+    }
+    if (idx < line.length) out.push(line.slice(idx));
+    return out;
+  };
+
+  return (
+    <div className="space-y-2 text-sm text-foreground/90 leading-relaxed">
+      {blocks.map((block, bIdx) => {
+        if (block.type === "code") {
+          return (
+            <div
+              key={bIdx}
+              dir="ltr"
+              className="rounded-lg border border-border/70 bg-zinc-950 text-zinc-100 overflow-hidden my-1.5"
+            >
+              <div className="flex items-center justify-between px-3 py-1 bg-zinc-900/90 border-b border-zinc-800 text-[10px] font-mono text-zinc-400">
+                <span>{block.lang || "code"}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(block.value);
+                    setCopiedCodeIdx(bIdx);
+                    setTimeout(() => setCopiedCodeIdx(null), 1500);
+                  }}
+                  className="inline-flex items-center gap-1 hover:text-zinc-100 cursor-pointer"
+                >
+                  {copiedCodeIdx === bIdx ? (
+                    <>
+                      <Check className="h-3 w-3 text-emerald-400" />
+                      <span>Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3 w-3" />
+                      <span>Copy</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <pre className="p-3 text-xs font-mono overflow-x-auto leading-relaxed">
+                <code>{block.value}</code>
+              </pre>
+            </div>
+          );
+        }
+        const lines = block.value.split(/\r?\n/);
+        const nodes: ReactNode[] = [];
+        let li = 0;
+        while (li < lines.length) {
+          const line = lines[li];
+          const trimmed = line.trim();
+          if (!trimmed) {
+            nodes.push(<div key={`sp-${li}`} className="h-1" />);
+            li++;
+            continue;
+          }
+          if (
+            trimmed.includes("|") &&
+            li + 1 < lines.length &&
+            /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[li + 1].trim())
+          ) {
+            const splitRow = (raw: string): string[] =>
+              raw
+                .trim()
+                .replace(/^\|/, "")
+                .replace(/\|$/, "")
+                .split("|")
+                .map((c) => c.trim());
+            const headers = splitRow(trimmed);
+            li += 2;
+            const rows: string[][] = [];
+            while (li < lines.length && lines[li].trim().includes("|") && lines[li].trim()) {
+              rows.push(splitRow(lines[li]));
+              li++;
+            }
+            nodes.push(
+              <div
+                key={`tbl-${li}`}
+                className="my-2 overflow-x-auto rounded-lg border border-border/60 bg-background/70"
+              >
+                <table className="w-full border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-border/60 bg-secondary/50">
+                      {headers.map((h, hIdx) => (
+                        <th
+                          key={hIdx}
+                          className="px-3 py-1.5 text-start font-semibold text-foreground"
+                        >
+                          {renderInline(h)}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((row, rIdx) => (
+                      <tr
+                        key={rIdx}
+                        className="border-b border-border/40 last:border-b-0 even:bg-secondary/20"
+                      >
+                        {headers.map((_, cIdx) => (
+                          <td key={cIdx} className="px-3 py-1.5 align-top text-foreground/90">
+                            {renderInline(row[cIdx] || "")}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>,
+            );
+            continue;
+          }
+          const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+          if (headingMatch) {
+            nodes.push(
+              <h4 key={`h-${li}`} className="mt-2 font-semibold text-primary">
+                {renderInline(headingMatch[2])}
+              </h4>,
+            );
+            li++;
+            continue;
+          }
+          if (/^[-*•]\s+/.test(trimmed)) {
+            nodes.push(
+              <div key={`ul-${li}`} className="flex items-start gap-2">
+                <span className="text-primary mt-0.5">•</span>
+                <span>{renderInline(trimmed.replace(/^[-*•]\s+/, ""))}</span>
+              </div>,
+            );
+            li++;
+            continue;
+          }
+          const numMatch = trimmed.match(/^(\d+[.)])\s+(.+)$/);
+          if (numMatch) {
+            nodes.push(
+              <div key={`ol-${li}`} className="flex items-start gap-2">
+                <span className="text-primary font-mono text-xs mt-0.5">{numMatch[1]}</span>
+                <span>{renderInline(numMatch[2])}</span>
+              </div>,
+            );
+            li++;
+            continue;
+          }
+          nodes.push(<p key={`p-${li}`}>{renderInline(line)}</p>);
+          li++;
+        }
+        return (
+          <div key={bIdx} className="space-y-1 break-words">
+            {nodes}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+interface WorkspaceChatEntry {
+  id: string;
+  question: string;
+  answer: string;
+  evidenceFound?: boolean;
+  isStreaming?: boolean;
+  isError?: boolean;
+  citations: { speaker: string; timestamp: string; quote: string }[];
+}
 
 export default function AIWorkspaceView() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { t, isRtl } = useTranslation();
-  const questionInputRef = useRef<HTMLInputElement | null>(null);
+  const questionInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const locationSearchStr = useRouterState({ select: (r) => r.location.searchStr });
   const urlId = useMemo(
     () => new URLSearchParams(locationSearchStr || "").get("id")?.trim() || "",
@@ -47,16 +268,9 @@ export default function AIWorkspaceView() {
   );
   const [selectedResourceId, setSelectedResourceId] = useState<string>(() => urlId);
   const [question, setQuestion] = useState("");
+  const [isStreaming, setIsStreaming] = useState(false);
   const [runningOp, setRunningOp] = useState<string | null>(null);
-  const [chatLog, setChatLog] = useState<
-    {
-      id: string;
-      question: string;
-      answer: string;
-      evidenceFound?: boolean;
-      citations: { speaker: string; timestamp: string; quote: string }[];
-    }[]
-  >([]);
+  const [chatLog, setChatLog] = useState<WorkspaceChatEntry[]>([]);
   const [activeAnalysis, setActiveAnalysis] = useState<{
     type: string;
     content: string | object;
@@ -104,7 +318,56 @@ export default function AIWorkspaceView() {
     matchedResource ||
     (requestedId && (loadingMeetings || loadingLectures) ? undefined : allResources[0]);
 
+  // Load persisted Q&A history for the active resource
+  useEffect(() => {
+    let cancelled = false;
+    const resourceId = currentResource?.id;
+    if (!resourceId) return;
+    api
+      .getChatHistory({ resourceId })
+      .then((records) => {
+        if (cancelled) return;
+        // Records arrive chronological (role: "user" | "assistant") — pair each user question with its assistant answer
+        const paired: WorkspaceChatEntry[] = [];
+        for (let i = 0; i < records.length; i++) {
+          const rec = records[i];
+          if (rec.role === "user") {
+            const next = records[i + 1];
+            if (next && next.role === "assistant") {
+              const answerText = next.content || "";
+              paired.push({
+                id: next.id || rec.id,
+                question: rec.content,
+                answer: answerText,
+                evidenceFound:
+                  next.evidenceFound !== false &&
+                  answerText.trim() !== "Not mentioned in this recording." &&
+                  answerText.trim() !== "لم يرد ذكر هذا في التسجيل.",
+                citations: next.citations || [],
+              });
+              i++;
+            }
+          }
+        }
+        setChatLog(paired.reverse());
+      })
+      .catch(() => {
+        // Keep current chatLog on transient error
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentResource?.id]);
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
+
   const handleSelectResource = (nextId: string) => {
+    abortControllerRef.current?.abort();
+    setIsStreaming(false);
     setSelectedResourceId(nextId);
     setActiveAnalysis(null);
     setChatLog([]);
@@ -115,40 +378,138 @@ export default function AIWorkspaceView() {
     });
   };
 
-  const askMutation = useMutation({
-    mutationFn: (q: string) => api.askQuestion(q, currentResource?.id),
-    onSuccess: (data: GroundedAnswer, askedQuestion: string) => {
-      const notMentioned =
-        data.evidenceFound === false ||
-        data.answer.trim() === "Not mentioned in this recording." ||
-        data.answer.trim() === "لم يرد ذكر هذا في التسجيل.";
-      setChatLog((prev) => [
-        {
-          id: `chat_${Date.now()}`,
-          question: askedQuestion,
-          answer: data.answer,
-          evidenceFound: !notMentioned,
-          citations: data.citations || [],
-        },
-        ...prev,
-      ]);
-      setQuestion("");
-    },
-    onError: (err) => {
-      toast.error(
-        err instanceof Error
-          ? err.message
-          : isRtl
-            ? "تعذر الإجابة على السؤال"
-            : "Failed to answer question",
+  const handleStopStream = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsStreaming(false);
+    setChatLog((prev) =>
+      prev.map((item) => (item.isStreaming ? { ...item, isStreaming: false } : item)),
+    );
+  };
+
+  const handleClearChat = async () => {
+    handleStopStream();
+    try {
+      await api.clearChatHistory({ resourceId: currentResource?.id });
+      setChatLog([]);
+      toast.success(isRtl ? "تم مسح سجل المحادثة" : "Chat history cleared");
+    } catch {
+      toast.error(isRtl ? "تعذر مسح السجل" : "Failed to clear history");
+    }
+  };
+
+  const askStreaming = async (askedQuestion: string) => {
+    const trimmed = askedQuestion.trim();
+    if (!trimmed || isStreaming) return;
+
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const priorHistory: Array<{ role: "user" | "model"; text: string }> = chatLog
+      .slice(0, 5)
+      .reverse()
+      .flatMap((entry) =>
+        entry.isError || !entry.answer
+          ? []
+          : [
+              { role: "user" as const, text: entry.question },
+              { role: "model" as const, text: entry.answer },
+            ],
       );
-    },
-  });
+
+    const entryId = `chat_${Date.now()}`;
+    setQuestion("");
+    setIsStreaming(true);
+    setChatLog((prev) => [
+      {
+        id: entryId,
+        question: trimmed,
+        answer: "",
+        evidenceFound: true,
+        isStreaming: true,
+        citations: [],
+      },
+      ...prev,
+    ]);
+
+    try {
+      const result = await api.askQuestionStream(
+        {
+          question: trimmed,
+          resourceId: currentResource?.id,
+          scope: currentResource ? "recording" : "all-recordings",
+          history: priorHistory,
+        },
+        {
+          onToken: (token: string) => {
+            setChatLog((prev) =>
+              prev.map((item) =>
+                item.id === entryId ? { ...item, answer: item.answer + token } : item,
+              ),
+            );
+          },
+        },
+        controller.signal,
+      );
+      const notMentioned =
+        result.evidenceFound === false ||
+        /(not mentioned in (?:this|the available) recording|لم يرد ذكر هذا في التسجيل|المعلومة دي غير موجودة في التسجيل المتاح|غير مذكور في هذا التسجيل)/i.test(
+          result.answer.trim(),
+        );
+      setChatLog((prev) =>
+        prev.map((item) =>
+          item.id === entryId
+            ? {
+                ...item,
+                answer: result.answer || item.answer,
+                evidenceFound: !notMentioned,
+                citations: result.citations || [],
+                isStreaming: false,
+                isError: false,
+              }
+            : item,
+        ),
+      );
+    } catch (err) {
+      if ((err as Error)?.name === "AbortError") {
+        setChatLog((prev) =>
+          prev.map((item) => (item.id === entryId ? { ...item, isStreaming: false } : item)),
+        );
+      } else {
+        const errMsg =
+          err instanceof Error
+            ? err.message
+            : isRtl
+              ? "تعذر الإجابة على السؤال"
+              : "Failed to answer question";
+        setChatLog((prev) =>
+          prev.map((item) =>
+            item.id === entryId
+              ? {
+                  ...item,
+                  answer: errMsg,
+                  isStreaming: false,
+                  isError: true,
+                  evidenceFound: false,
+                }
+              : item,
+          ),
+        );
+        toast.error(errMsg);
+      }
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+      setIsStreaming(false);
+    }
+  };
 
   const handleAsk = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!question.trim()) return;
-    askMutation.mutate(question.trim());
+    if (!question.trim() || isStreaming) return;
+    void askStreaming(question);
   };
 
   const runOperation = async (toolKey: string) => {
@@ -306,42 +667,76 @@ export default function AIWorkspaceView() {
         <GlassCard className="relative overflow-hidden p-6 space-y-4 gold-card-animated-border shadow-2xl">
           <div className="pointer-events-none absolute inset-0 gradient-primary opacity-10" />
           <div className="relative">
-            <div className="font-display text-lg font-semibold tracking-tight">
-              {isRtl ? "اسأل MeetMind أسئلة استدلالية موثقة" : "Ask MeetMind Grounded Questions"}
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-display text-lg font-semibold tracking-tight">
+                {isRtl ? "اسأل MeetMind أسئلة استدلالية موثقة" : "Ask MeetMind Grounded Questions"}
+              </div>
+              {chatLog.length > 0 && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void handleClearChat()}
+                  className="h-7 px-2 text-xs text-muted-foreground hover:text-destructive gap-1 cursor-pointer"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>{isRtl ? "مسح السجل" : "Clear"}</span>
+                </Button>
+              )}
             </div>
             <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
               {isRtl
-                ? 'تخضع جميع الإجابات للتحقق الدقيق من نص التسجيل الفعلي. إذا لم يتوفر دليل في النص، يجيب MeetMind بـ "لم يرد ذكر هذا في التسجيل."'
-                : 'All answers are strictly verified against the actual recording transcript. If evidence is not present in the transcript, MeetMind responds with "Not mentioned in this recording."'}
+                ? 'تخضع جميع الإجابات للتحقق الدقيق من نص التسجيل الفعلي مع بث لحظي فوري. إذا لم يتوفر دليل في النص، يجيب MeetMind بـ "لم يرد ذكر هذا في التسجيل."'
+                : 'All answers are strictly verified against the actual recording transcript with live token streaming. If evidence is not present in the transcript, MeetMind responds with "Not mentioned in this recording."'}
             </p>
 
-            <form onSubmit={handleAsk} className="mt-4 flex gap-2">
-              <Input
+            <form onSubmit={handleAsk} className="mt-4 flex items-end gap-2">
+              <textarea
                 ref={questionInputRef}
+                rows={1}
                 placeholder={
                   isRtl
-                    ? `اسأل أي سؤال حول ${currentResource?.title || "هذه الجلسة"}...`
-                    : `Ask anything about ${currentResource?.title || "this session"}...`
+                    ? `اسأل أي سؤال حول ${currentResource?.title || "هذه الجلسة"}... (Shift+Enter لسطر جديد)`
+                    : `Ask anything about ${currentResource?.title || "this session"}... (Shift+Enter for newline)`
                 }
                 value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                className="bg-background/80"
-                disabled={askMutation.isPending}
+                onChange={(e) => {
+                  setQuestion(e.target.value);
+                  const el = e.currentTarget;
+                  el.style.height = "auto";
+                  el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    if (question.trim() && !isStreaming) {
+                      void askStreaming(question);
+                    }
+                  }
+                }}
+                className="max-h-32 min-h-10 flex-1 resize-none rounded-md border border-input bg-background/80 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={isStreaming}
               />
-              <Button
-                type="submit"
-                disabled={askMutation.isPending || !question.trim()}
-                className="gradient-primary text-primary-foreground shadow-glow shrink-0 cursor-pointer gap-1.5"
-              >
-                {askMutation.isPending ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <>
-                    <span>{isRtl ? "اسأل" : "Ask"}</span>
-                    <Send className={cn("h-3.5 w-3.5", isRtl && "rotate-180")} />
-                  </>
-                )}
-              </Button>
+              {isStreaming ? (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  onClick={handleStopStream}
+                  className="shrink-0 cursor-pointer gap-1.5"
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                  <span>{isRtl ? "إيقاف" : "Stop"}</span>
+                </Button>
+              ) : (
+                <Button
+                  type="submit"
+                  disabled={!question.trim()}
+                  className="gradient-primary text-primary-foreground shadow-glow shrink-0 cursor-pointer gap-1.5"
+                >
+                  <span>{isRtl ? "اسأل" : "Ask"}</span>
+                  <Send className={cn("h-3.5 w-3.5", isRtl && "rotate-180")} />
+                </Button>
+              )}
             </form>
 
             {chatLog.length > 0 && (
@@ -355,25 +750,55 @@ export default function AIWorkspaceView() {
                       <div className="text-sm font-semibold text-primary">
                         {isRtl ? "س:" : "Q:"} {item.question}
                       </div>
-                      {item.evidenceFound === false ? (
-                        <Badge
-                          variant="outline"
-                          className="border-amber-500/40 bg-amber-500/10 text-amber-400 text-[10px] gap-1"
-                        >
-                          <AlertCircle className="h-3 w-3" />
-                          <span>{isRtl ? "غير موجود في النص" : "Not in transcript"}</span>
-                        </Badge>
-                      ) : (
-                        <Badge
-                          variant="outline"
-                          className="border-emerald-500/40 bg-emerald-500/10 text-emerald-400 text-[10px] gap-1"
-                        >
-                          <CheckCircle2 className="h-3 w-3" />
-                          <span>{isRtl ? "موثق بالأدلة" : "Grounded"}</span>
-                        </Badge>
-                      )}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {item.isStreaming ? (
+                          <Badge
+                            variant="outline"
+                            className="border-primary/40 bg-primary/10 text-primary text-[10px] gap-1"
+                          >
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            <span>{isRtl ? "جاري البث..." : "Streaming"}</span>
+                          </Badge>
+                        ) : item.isError ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void askStreaming(item.question)}
+                            className="h-6 px-2 text-[10px] border-destructive/40 text-destructive hover:bg-destructive/10 gap-1 cursor-pointer"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>{isRtl ? "إعادة المحاولة" : "Retry"}</span>
+                          </Button>
+                        ) : item.evidenceFound === false ? (
+                          <Badge
+                            variant="outline"
+                            className="border-amber-500/40 bg-amber-500/10 text-amber-400 text-[10px] gap-1"
+                          >
+                            <AlertCircle className="h-3 w-3" />
+                            <span>{isRtl ? "غير موجود في النص" : "Not in transcript"}</span>
+                          </Badge>
+                        ) : (
+                          <Badge
+                            variant="outline"
+                            className="border-emerald-500/40 bg-emerald-500/10 text-emerald-400 text-[10px] gap-1"
+                          >
+                            <CheckCircle2 className="h-3 w-3" />
+                            <span>{isRtl ? "موثق بالأدلة" : "Grounded"}</span>
+                          </Badge>
+                        )}
+                      </div>
                     </div>
-                    <div className="text-sm text-foreground/90 leading-relaxed">{item.answer}</div>
+                    {item.isStreaming && !item.answer ? (
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground py-1">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                        <span>
+                          {isRtl ? "جارٍ تحليل النص وصياغة الإجابة..." : "Analyzing transcript..."}
+                        </span>
+                      </div>
+                    ) : (
+                      <WorkspaceMarkdown content={item.answer} />
+                    )}
 
                     {item.citations && item.citations.length > 0 && (
                       <div className="mt-3 pt-3 border-t border-border/40 space-y-2">
@@ -410,16 +835,25 @@ export default function AIWorkspaceView() {
           </div>
         </GlassCard>
 
-        {/* 3D Holographic Visualizer */}
+        {/* 3D Holographic Visualizer (Lazy-loaded to keep Three.js off critical path) */}
         <div className="space-y-4">
-          <AudioOrb3D
-            isPlaying={askMutation.isPending || runningOp !== null}
-            size="md"
-            title={
-              isRtl ? "المجسم الصوتي 3D · Neural Hologram" : "3D Audio Hologram · Neural Hologram"
+          <Suspense
+            fallback={
+              <div className="h-80 w-full rounded-2xl border border-primary/20 bg-secondary/30 flex items-center justify-center text-xs text-muted-foreground gap-2">
+                <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                <span>{isRtl ? "تحميل المجسم ثلاثي الأبعاد..." : "Loading 3D Visualizer..."}</span>
+              </div>
             }
-            className="w-full shadow-2xl"
-          />
+          >
+            <AudioOrb3D
+              isPlaying={isStreaming || runningOp !== null}
+              size="md"
+              title={
+                isRtl ? "المجسم الصوتي 3D · Neural Hologram" : "3D Audio Hologram · Neural Hologram"
+              }
+              className="w-full shadow-2xl"
+            />
+          </Suspense>
           <div className="p-3.5 rounded-2xl border border-primary/20 bg-secondary/30 text-xs text-muted-foreground space-y-1.5">
             <div className="text-primary font-semibold flex items-center gap-1.5">
               <Sparkles className="h-3.5 w-3.5" />

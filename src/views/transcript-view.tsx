@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, type ReactNode } from "react";
+import { useState, useRef, useEffect, useMemo, lazy, Suspense, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
@@ -65,8 +65,11 @@ import { api, Meeting, Lecture, Quiz } from "@/lib/api-client";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { matchesArabicQuery } from "@/lib/arabic";
-import { AudioOrb3D } from "@/components/3d/audio-orb-3d";
 import { useTranslation } from "@/lib/i18n";
+
+const AudioOrb3D = lazy(() =>
+  import("@/components/3d/audio-orb-3d").then((m) => ({ default: m.AudioOrb3D })),
+);
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || isNaN(seconds) || seconds < 0) return "00:00";
@@ -1337,19 +1340,30 @@ export default function TranscriptView() {
             </GlassCard>
           )}
 
-          {/* 3D Neural Soundwave Visualizer */}
+          {/* 3D Neural Soundwave Visualizer (Lazy-loaded) */}
           {show3DVisualizer && currentSelection && (
             <div className="animate-in fade-in zoom-in-95 duration-300">
-              <AudioOrb3D
-                isPlaying={isPlaying}
-                size="md"
-                title={
-                  isArabic
-                    ? `الموجات الصوتية ثلاثية الأبعاد: ${currentSelection.rawTitle}`
-                    : `3D Soundwave Orb: ${currentSelection.rawTitle}`
+              <Suspense
+                fallback={
+                  <div className="h-72 w-full rounded-2xl border border-primary/20 bg-secondary/30 flex items-center justify-center text-xs text-muted-foreground gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                    <span>
+                      {isArabic ? "تحميل المجسم ثلاثي الأبعاد..." : "Loading 3D Soundwave Orb..."}
+                    </span>
+                  </div>
                 }
-                className="w-full shadow-2xl"
-              />
+              >
+                <AudioOrb3D
+                  isPlaying={isPlaying}
+                  size="md"
+                  title={
+                    isArabic
+                      ? `الموجات الصوتية ثلاثية الأبعاد: ${currentSelection.rawTitle}`
+                      : `3D Soundwave Orb: ${currentSelection.rawTitle}`
+                  }
+                  className="w-full shadow-2xl"
+                />
+              </Suspense>
             </div>
           )}
 
