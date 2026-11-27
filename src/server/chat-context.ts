@@ -458,10 +458,10 @@ export function buildSmartChatContext(params: {
   const groundingDirective =
     scope === "recording" && targetItem
       ? intent.isArabic
-        ? `نطاق التسجيل المحدد: "${targetItem.title}".
+        ? `نطاق التسجيل المحدد: "${targetItem.title}" (transcriptLanguage: ${targetItem.transcriptLanguage || "ar"}).
 - إذا سأل المستخدم عما ذُكر أو تقرر أو أُسند في هذا التسجيل، اعتمد حصرياً على النص المرفق مع ذكر اسم المتحدث والتوقيت [MM:SS].
 - إذا لم تكن المعلومة موجودة في النص المرفق، قل بوضوح: "المعلومة دي غير موجودة في التسجيل المتاح." ولا تختلق أي تفاصيل.`
-        : `Selected Recording Scope: "${targetItem.title}".
+        : `Selected Recording Scope: "${targetItem.title}" (transcriptLanguage: ${targetItem.transcriptLanguage || "en"}).
 - For questions about what was said, decided, or assigned in this recording, rely STRICTLY on the provided transcript with speaker & [MM:SS] citations.
 - If the detail is absent from the transcript, clearly state: "This information is not mentioned in the available recording." Never invent facts.`
       : scope === "all-recordings" && recordingContextBlock

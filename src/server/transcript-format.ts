@@ -1,11 +1,89 @@
 import type { TranscriptSegment } from "./db";
 
+export type TranscriptLanguage = "ar" | "en" | "mixed";
+
 export interface FormattedTranscriptArtifacts {
   rawTranscript: string;
   processedTranscript: string;
   rawSegments: TranscriptSegment[];
   processedSegments: TranscriptSegment[];
+  transcriptLanguage: TranscriptLanguage;
   averageConfidence?: number;
+}
+
+/**
+ * Single centralized transcript language resolver (`ar` | `en` | `mixed`).
+ * Reuses persisted `existing` value when already computed so downstream features
+ * (Quiz, Summary, Flashcards, Notes, AI Chat) never independently guess the language.
+ */
+export function resolveTranscriptLanguage(params: {
+  existing?: string | null;
+  segments?: Pick<TranscriptSegment, "text">[];
+  rawTranscript?: string;
+  title?: string;
+  languageHint?: string;
+}): TranscriptLanguage {
+  const existingNorm = String(params.existing || "")
+    .trim()
+    .toLowerCase();
+  if (existingNorm === "ar" || existingNorm === "en" || existingNorm === "mixed") {
+    return existingNorm;
+  }
+
+  const spokenBody =
+    (params.segments && params.segments.length > 0
+      ? params.segments.map((s) => String(s.text || "")).join(" ")
+      : "") ||
+    String(params.rawTranscript || "") ||
+    String(params.title || "");
+
+  const arChars = (spokenBody.match(/[\u0600-\u06FF]/g) || []).length;
+  const enChars = (spokenBody.match(/[A-Za-z]/g) || []).length;
+  const totalLetters = arChars + enChars;
+
+  if (totalLetters > 0) {
+    const minRatio = Math.min(arChars, enChars) / totalLetters;
+    if (arChars >= 24 && enChars >= 24 && minRatio >= 0.25) {
+      return "mixed";
+    }
+    if (arChars > 0 && arChars >= enChars * 0.3) {
+      return "ar";
+    }
+    if (enChars > 0) {
+      return "en";
+    }
+  }
+
+  const hint = String(params.languageHint || "")
+    .trim()
+    .toLowerCase();
+  if (hint === "mixed") return "mixed";
+  if (hint.startsWith("ar") || hint === "arabic") return "ar";
+  if (hint.startsWith("en") || hint === "english") return "en";
+  return "en";
+}
+
+/**
+ * Maps centralized `transcriptLanguage` (`ar` | `en` | `mixed`) to the primary
+ * output language (`ar` | `en`) while preserving technical terms on `mixed` recordings.
+ * Never translates an English transcript into Arabic or an Arabic transcript into English.
+ */
+export function resolveOutputLanguageFromTranscript(
+  transcriptLanguage: TranscriptLanguage,
+  segments?: Pick<TranscriptSegment, "text">[],
+  fallbackAppLang?: "en" | "ar",
+): "ar" | "en" {
+  if (transcriptLanguage === "ar") return "ar";
+  if (transcriptLanguage === "en") return "en";
+
+  // For "mixed": preserve the dominant spoken language while retaining technical terms
+  const spoken = (segments || []).map((s) => String(s.text || "")).join(" ");
+  const arChars = (spoken.match(/[\u0600-\u06FF]/g) || []).length;
+  const enChars = (spoken.match(/[A-Za-z]/g) || []).length;
+  if (arChars > 0 || enChars > 0) {
+    return arChars >= enChars ? "ar" : "en";
+  }
+  return fallbackAppLang === "ar" ? "ar" : "en";
 }
 
 /**
@@ -136,12 +214,17 @@ export function buildTranscriptArtifacts(params: {
       : formatTranscriptNonDestructive(rawTranscript);
 
   const averageConfidence = computeAverageConfidence(rawSegments, params.wordConfidences);
+  const transcriptLanguage = resolveTranscriptLanguage({
+    segments: processedSegments,
+    rawTranscript,
+  });
 
   return {
     rawTranscript,
     processedTranscript,
     rawSegments,
     processedSegments,
+    transcriptLanguage,
     averageConfidence,
   };
 }

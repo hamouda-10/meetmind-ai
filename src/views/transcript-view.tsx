@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, lazy, Suspense, type ReactNode } from "react";
+import { useState, useRef, useEffect, useMemo, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
@@ -32,7 +32,6 @@ import {
   Quote,
   CheckSquare,
   FileDown,
-  Boxes,
   Loader2,
 } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
@@ -66,10 +65,6 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { matchesArabicQuery } from "@/lib/arabic";
 import { useTranslation } from "@/lib/i18n";
-
-const AudioOrb3D = lazy(() =>
-  import("@/components/3d/audio-orb-3d").then((m) => ({ default: m.AudioOrb3D })),
-);
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || isNaN(seconds) || seconds < 0) return "00:00";
@@ -125,7 +120,6 @@ export default function TranscriptView() {
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [audioAvailable, setAudioAvailable] = useState(true);
-  const [show3DVisualizer, setShow3DVisualizer] = useState(false);
 
   // AI Generation States
   const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
@@ -135,7 +129,7 @@ export default function TranscriptView() {
   const [isRetranscribing, setIsRetranscribing] = useState(false);
   const [retranscribeProgress, setRetranscribeProgress] = useState<number | null>(null);
   const retranscribePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [quizQuestionCount, setQuizQuestionCount] = useState<number>(5);
+  const [quizQuestionCount, setQuizQuestionCount] = useState<number>(10);
 
   useEffect(() => {
     return () => {
@@ -1052,19 +1046,6 @@ export default function TranscriptView() {
               <UploadCloud className="h-4 w-4 text-primary" />
               {isArabic ? "رفع ملف صوتي" : "Upload Audio File"}
             </Button>
-            <Button
-              variant={show3DVisualizer ? "default" : "outline"}
-              size="sm"
-              onClick={() => setShow3DVisualizer(!show3DVisualizer)}
-              className={`cursor-pointer text-xs gap-1.5 ${
-                show3DVisualizer
-                  ? "gradient-primary text-primary-foreground shadow-glow"
-                  : "border-primary/40 text-primary hover:bg-primary/10"
-              }`}
-            >
-              <Boxes className="h-4 w-4" />
-              <span>{isArabic ? "مجسم 3D للموجات" : "3D Audio Orb"}</span>
-            </Button>
           </div>
         }
       />
@@ -1214,19 +1195,19 @@ export default function TranscriptView() {
             )}
           </GlassCard>
 
-          {/* Full Audio Player with Timeline Seeking, Speeds, and Download */}
+          {/* Clean Static Audio Player with Timeline Seeking, Volume, Speeds, Sync, and Download */}
           {currentSelection && (
-            <GlassCard className="p-4 bg-secondary/30 space-y-3 gold-card-animated-border shadow-2xl">
+            <GlassCard className="p-4 sm:p-5 bg-card/90 border border-border/70 shadow-elegant space-y-3.5">
               <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
                 {/* Track Info */}
-                <div className={`w-full sm:w-auto ${isRtl ? "text-right" : "text-left"}`}>
-                  <div className="text-sm font-semibold truncate max-w-md">
+                <div className={`w-full sm:w-auto min-w-0 ${isRtl ? "text-right" : "text-left"}`}>
+                  <div className="text-sm font-semibold truncate max-w-md text-foreground">
                     {currentSelection.rawTitle}
                   </div>
-                  <div className="text-xs text-muted-foreground flex items-center gap-2 mt-0.5">
+                  <div className="text-xs text-muted-foreground flex flex-wrap items-center gap-2 mt-0.5">
                     {audioAvailable ? (
-                      <span className="text-emerald-500 font-medium flex items-center gap-1 text-[11px]">
-                        <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                      <span className="text-emerald-500 font-medium inline-flex items-center gap-1.5 text-[11px]">
+                        <span className="h-2 w-2 rounded-full bg-emerald-500" />
                         {isArabic
                           ? "الملف الصوتي جاهز للبث والمزامنة"
                           : "Audio ready for playback & sync"}
@@ -1248,12 +1229,14 @@ export default function TranscriptView() {
                 </div>
 
                 {/* Primary Playback & Controls */}
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
                   {/* Download Audio */}
                   <a
                     href={`/api/v1/recordings/download/${currentSelection.id}`}
-                    download={`${currentSelection.rawTitle}.webm`}
-                    className="inline-flex items-center justify-center h-8 px-2.5 rounded-lg border border-border/60 bg-background/50 hover:bg-background text-xs font-medium transition cursor-pointer gap-1"
+                    download={
+                      currentSelection.item.recordingFileName || `${currentSelection.rawTitle}.m4a`
+                    }
+                    className="inline-flex items-center justify-center h-9 px-3 rounded-lg border border-border/70 bg-background/70 hover:bg-secondary/60 text-xs font-medium transition-colors cursor-pointer gap-1.5"
                     title={isArabic ? "تنزيل الملف الصوتي الأصلي" : "Download original audio"}
                   >
                     <Download className="h-3.5 w-3.5" />
@@ -1267,7 +1250,10 @@ export default function TranscriptView() {
                     value={String(playbackSpeed)}
                     onValueChange={(val) => handleSpeedChange(parseFloat(val))}
                   >
-                    <SelectTrigger className="h-8 w-20 bg-background/50 text-xs font-mono">
+                    <SelectTrigger
+                      aria-label={isArabic ? "سرعة التشغيل" : "Playback speed"}
+                      className="h-9 w-20 bg-background/70 border-border/70 text-xs font-mono"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -1280,9 +1266,19 @@ export default function TranscriptView() {
                   </Select>
 
                   {/* Volume Control */}
-                  <div className="hidden lg:flex items-center gap-1.5 bg-background/40 px-2 py-1 rounded-lg">
+                  <div className="flex items-center gap-1.5 bg-background/70 border border-border/70 px-2.5 h-9 rounded-lg">
                     <button
+                      type="button"
                       onClick={toggleMute}
+                      aria-label={
+                        isMuted
+                          ? isArabic
+                            ? "إلغاء كتم الصوت"
+                            : "Unmute"
+                          : isArabic
+                            ? "كتم الصوت"
+                            : "Mute"
+                      }
                       className="text-muted-foreground hover:text-foreground cursor-pointer"
                     >
                       {isMuted ? (
@@ -1296,16 +1292,27 @@ export default function TranscriptView() {
                       min={0}
                       max={1}
                       step={0.05}
+                      aria-label={isArabic ? "مستوى الصوت" : "Volume"}
                       value={isMuted ? 0 : volume}
                       onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
-                      className="w-16 h-1 accent-primary cursor-pointer"
+                      className="w-16 h-1.5 accent-primary cursor-pointer"
                     />
                   </div>
 
                   {/* Play/Pause Button */}
                   <Button
+                    type="button"
                     size="icon"
-                    className="h-10 w-10 rounded-full gradient-primary text-primary-foreground shadow-glow cursor-pointer shrink-0"
+                    aria-label={
+                      isPlaying
+                        ? isArabic
+                          ? "إيقاف مؤقت"
+                          : "Pause audio"
+                        : isArabic
+                          ? "تشغيل الصوت"
+                          : "Play audio"
+                    }
+                    className="h-10 w-10 rounded-full gradient-primary text-primary-foreground shadow-sm cursor-pointer shrink-0"
                     onClick={togglePlay}
                   >
                     {isPlaying ? (
@@ -1317,9 +1324,9 @@ export default function TranscriptView() {
                 </div>
               </div>
 
-              {/* Seeker Bar with Timers */}
-              <div className="flex items-center gap-3 pt-1">
-                <span className="text-xs font-mono text-muted-foreground shrink-0 w-11 text-left">
+              {/* Static Seeker Bar with Current Time & Duration */}
+              <div className="flex items-center gap-3 pt-0.5" dir="ltr">
+                <span className="text-xs font-mono text-muted-foreground shrink-0 w-12 text-left tabular-nums">
                   {formatTime(currentTime)}
                 </span>
 
@@ -1328,43 +1335,17 @@ export default function TranscriptView() {
                   min={0}
                   max={effectiveDuration || 100}
                   step={0.5}
+                  aria-label={isArabic ? "شريط التقدم الصوتي" : "Audio seek bar"}
                   value={currentTime}
                   onChange={(e) => handleSeek(parseFloat(e.target.value))}
                   className="flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer accent-primary"
                 />
 
-                <span className="text-xs font-mono text-muted-foreground shrink-0 w-11 text-right">
+                <span className="text-xs font-mono text-muted-foreground shrink-0 w-12 text-right tabular-nums">
                   {formatTime(effectiveDuration)}
                 </span>
               </div>
             </GlassCard>
-          )}
-
-          {/* 3D Neural Soundwave Visualizer (Lazy-loaded) */}
-          {show3DVisualizer && currentSelection && (
-            <div className="animate-in fade-in zoom-in-95 duration-300">
-              <Suspense
-                fallback={
-                  <div className="h-72 w-full rounded-2xl border border-primary/20 bg-secondary/30 flex items-center justify-center text-xs text-muted-foreground gap-2">
-                    <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                    <span>
-                      {isArabic ? "تحميل المجسم ثلاثي الأبعاد..." : "Loading 3D Soundwave Orb..."}
-                    </span>
-                  </div>
-                }
-              >
-                <AudioOrb3D
-                  isPlaying={isPlaying}
-                  size="md"
-                  title={
-                    isArabic
-                      ? `الموجات الصوتية ثلاثية الأبعاد: ${currentSelection.rawTitle}`
-                      : `3D Soundwave Orb: ${currentSelection.rawTitle}`
-                  }
-                  className="w-full shadow-2xl"
-                />
-              </Suspense>
-            </div>
           )}
 
           {/* Analysis Status Banners */}
@@ -2082,22 +2063,57 @@ export default function TranscriptView() {
                     filteredSegments.map((seg) => {
                       const isEditing = editingSegId === seg.id;
                       const isActive = currentTime >= seg.startTime && currentTime <= seg.endTime;
+                      const isSegArabic = /[\u0600-\u06FF]/.test(seg.text || "");
 
                       return (
                         <GlassCard
                           key={seg.id}
+                          dir={isSegArabic ? "rtl" : "ltr"}
                           ref={
                             isActive
                               ? (activeSegmentRef as React.RefObject<HTMLDivElement>)
                               : undefined
                           }
-                          className={`p-4 transition-all relative group text-right ${
+                          className={`p-4 transition-all relative group ${
+                            isSegArabic ? "text-right" : "text-left"
+                          } ${
                             isActive
                               ? "border-primary/60 bg-primary/5 shadow-sm"
                               : "hover:border-primary/30"
                           }`}
                         >
                           <div className="flex items-start justify-between gap-3 mb-2">
+                            <div className="flex items-center gap-2">
+                              <Badge
+                                variant="outline"
+                                onClick={() => {
+                                  setRenamingSpeaker(seg.speaker);
+                                  setNewSpeakerName(seg.speaker);
+                                }}
+                                className="font-mono text-xs flex items-center gap-1 font-semibold text-primary cursor-pointer hover:border-primary"
+                                title={
+                                  isArabic ? "انقر لإعادة تسمية المتحدث" : "Click to rename speaker"
+                                }
+                              >
+                                <User className="h-3 w-3" />
+                                <span>{seg.speaker}</span>
+                              </Badge>
+                              <button
+                                onClick={() => jumpToTimestamp(seg.startTime)}
+                                className="inline-flex items-center gap-1.5 text-xs font-mono text-muted-foreground hover:text-primary transition-colors cursor-pointer bg-background/60 px-2 py-0.5 rounded border border-border/40"
+                                title={
+                                  isArabic
+                                    ? "انقر للاستماع فورياً من هذه اللحظة"
+                                    : "Click to play from this timestamp"
+                                }
+                              >
+                                <Clock className="h-3 w-3" />
+                                <span dir="ltr">
+                                  [{formatTime(seg.startTime)} - {formatTime(seg.endTime)}]
+                                </span>
+                              </button>
+                            </div>
+
                             {!isEditing && (
                               <Button
                                 variant="ghost"
@@ -2108,42 +2124,21 @@ export default function TranscriptView() {
                                   setEditedText(seg.text);
                                 }}
                               >
-                                <Edit2 className="h-3 w-3 mr-1" /> تعديل النص
+                                <Edit2 className="h-3 w-3 me-1" />{" "}
+                                {isArabic ? "تعديل النص" : "Edit"}
                               </Button>
                             )}
-
-                            <div className="flex items-center gap-2">
-                              <button
-                                onClick={() => jumpToTimestamp(seg.startTime)}
-                                className="inline-flex items-center gap-1.5 text-xs font-mono text-muted-foreground hover:text-primary transition-colors cursor-pointer bg-background/60 px-2 py-0.5 rounded border border-border/40"
-                                title="انقر للاستماع فورياً من هذه اللحظة"
-                              >
-                                <span>
-                                  [{formatTime(seg.startTime)} - {formatTime(seg.endTime)}]
-                                </span>
-                                <Clock className="h-3 w-3" />
-                              </button>
-                              <Badge
-                                variant="outline"
-                                onClick={() => {
-                                  setRenamingSpeaker(seg.speaker);
-                                  setNewSpeakerName(seg.speaker);
-                                }}
-                                className="font-mono text-xs flex items-center gap-1 font-semibold text-primary cursor-pointer hover:border-primary"
-                                title="انقر لإعادة تسمية المتحدث"
-                              >
-                                <span>{seg.speaker}</span>
-                                <User className="h-3 w-3 ml-1" />
-                              </Badge>
-                            </div>
                           </div>
 
                           {isEditing ? (
                             <div className="space-y-2 mt-2">
                               <Input
+                                dir={isSegArabic ? "rtl" : "ltr"}
                                 value={editedText}
                                 onChange={(e) => setEditedText(e.target.value)}
-                                className="bg-background/80 text-right text-sm"
+                                className={`bg-background/80 text-sm ${
+                                  isSegArabic ? "text-right" : "text-left"
+                                }`}
                                 autoFocus
                               />
                               <div className="flex gap-2 justify-end">
@@ -2153,19 +2148,25 @@ export default function TranscriptView() {
                                   onClick={() => setEditingSegId(null)}
                                   className="cursor-pointer text-xs"
                                 >
-                                  <X className="h-3.5 w-3.5 mr-1" /> إلغاء
+                                  <X className="h-3.5 w-3.5 me-1" /> {isArabic ? "إلغاء" : "Cancel"}
                                 </Button>
                                 <Button
                                   size="sm"
                                   className="gradient-primary text-primary-foreground cursor-pointer text-xs"
                                   onClick={() => handleSaveEdit(seg.id)}
                                 >
-                                  <Check className="h-3.5 w-3.5 mr-1" /> حفظ التعديل
+                                  <Check className="h-3.5 w-3.5 me-1" />{" "}
+                                  {isArabic ? "حفظ التعديل" : "Save"}
                                 </Button>
                               </div>
                             </div>
                           ) : (
-                            <p className="text-sm text-foreground/90 leading-relaxed font-sans text-right select-text font-medium">
+                            <p
+                              dir={isSegArabic ? "rtl" : "ltr"}
+                              className={`text-sm text-foreground/90 leading-relaxed font-sans select-text font-medium ${
+                                isSegArabic ? "text-right" : "text-left"
+                              }`}
+                            >
                               {searchQuery ? highlightQuery(seg.text, searchQuery) : seg.text}
                             </p>
                           )}
@@ -2254,27 +2255,34 @@ export default function TranscriptView() {
                 <div>
                   <h3 className="font-display text-base font-semibold flex items-center gap-2">
                     <Brain className="h-4 w-4 text-pink-500" />
-                    كويز تقييمي تفاعلي من المحاضرة
+                    {isArabic
+                      ? "اختبار أكاديمي تفاعلي من المحاضرة"
+                      : "Interactive Lecture Assessment Quiz"}
                   </h3>
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    أسئلة اختيار من متعدد، صواب وخطأ، وتفكير مفاهيمي مصاغة مباشرة من مضمون الشرح
+                    {isArabic
+                      ? "أسئلة جامعية موثقة (اختيار من متعدد وصح/خطأ) موزعة على كامل محاور الشرح"
+                      : "University-grade grounded MCQ and True/False questions across all lecture sections"}
                   </p>
                 </div>
 
                 <div className="flex items-center gap-3">
                   <div className="flex items-center gap-1.5">
-                    <span className="text-xs text-muted-foreground">عدد الأسئلة:</span>
+                    <span className="text-xs text-muted-foreground">
+                      {isArabic ? "عدد الأسئلة:" : "Questions:"}
+                    </span>
                     <Select
                       value={String(quizQuestionCount)}
                       onValueChange={(val) => setQuizQuestionCount(parseInt(val, 10))}
                     >
-                      <SelectTrigger className="h-8 w-16 bg-background/50 text-xs">
+                      <SelectTrigger className="h-8 w-20 bg-background/50 text-xs">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="3">3</SelectItem>
                         <SelectItem value="5">5</SelectItem>
-                        <SelectItem value="8">8</SelectItem>
+                        <SelectItem value="10">10</SelectItem>
+                        <SelectItem value="15">15</SelectItem>
+                        <SelectItem value="20">20</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -2287,7 +2295,13 @@ export default function TranscriptView() {
                     <RefreshCw
                       className={`h-3.5 w-3.5 ${isGeneratingQuiz ? "animate-spin" : ""}`}
                     />
-                    {currentQuiz ? "إنشاء كويز جديد" : "إنشاء كويز من المحاضرة"}
+                    {currentQuiz
+                      ? isArabic
+                        ? "إنشاء اختبار جديد"
+                        : "Generate Fresh Quiz"
+                      : isArabic
+                        ? "إنشاء اختبار من المحاضرة"
+                        : "Generate Lecture Quiz"}
                   </Button>
                 </div>
               </GlassCard>
@@ -2297,10 +2311,15 @@ export default function TranscriptView() {
                   <div className="grid h-12 w-12 place-items-center rounded-2xl bg-pink-500/10 text-pink-500 mx-auto">
                     <RefreshCw className="h-6 w-6 animate-spin" />
                   </div>
-                  <h4 className="font-semibold text-base">جاري إنشاء أسئلة الكويز التقييمي...</h4>
+                  <h4 className="font-semibold text-base">
+                    {isArabic
+                      ? "جاري بناء الاختبار الأكاديمي الموثق..."
+                      : "Generating grounded academic exam..."}
+                  </h4>
                   <p className="text-xs text-muted-foreground max-w-md mx-auto">
-                    يقوم الذكاء الاصطناعي بصياغة خيارات ذكية وتوضيحات تفصيلية لكل سؤال مستندة إلى
-                    الشرح الوارد في الجلسة.
+                    {isArabic
+                      ? "يقوم النظام بتقسيم المحاضرة وصياغة أسئلة متدرجة الصعوبة مع خيارات دقيقة وشرح علمي لكل سؤال."
+                      : "Partitioning the lecture into sections and crafting multi-level questions with plausible distractors and explanations."}
                   </p>
                 </GlassCard>
               ) : currentQuiz && currentQuiz.questions.length > 0 ? (
@@ -2315,21 +2334,29 @@ export default function TranscriptView() {
                           onClick={() => {
                             setUserAnswers({});
                             setQuizSubmitted(false);
-                            toast.info("تمت إعادة تعيين إجابات الكويز للمحاولة مرة أخرى");
+                            toast.info(
+                              isArabic
+                                ? "تمت إعادة تعيين إجابات الاختبار للمحاولة مرة أخرى"
+                                : "Quiz answers reset for a fresh attempt",
+                            );
                           }}
                           className="cursor-pointer text-xs gap-1"
                         >
-                          <RotateCcw className="h-3.5 w-3.5" /> إعادة المحاولة
+                          <RotateCcw className="h-3.5 w-3.5" />{" "}
+                          {isArabic ? "إعادة المحاولة" : "Retake Quiz"}
                         </Button>
                       </div>
 
-                      <div className="text-right">
+                      <div className={isArabic ? "text-right" : "text-left"}>
                         <div className="text-base font-bold text-foreground">
-                          النتيجة المحققة: {calculateQuizScore().percent}%
+                          {isArabic
+                            ? `النتيجة المحققة: ${calculateQuizScore().percent}%`
+                            : `Final Score: ${calculateQuizScore().percent}%`}
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          أجبت بشكل صحيح على {calculateQuizScore().score} من أصل{" "}
-                          {calculateQuizScore().total} أسئلة
+                          {isArabic
+                            ? `أجبت بشكل صحيح على ${calculateQuizScore().score} من أصل ${calculateQuizScore().total} أسئلة`
+                            : `Answered ${calculateQuizScore().score} of ${calculateQuizScore().total} questions correctly`}
                         </div>
                       </div>
                     </GlassCard>
@@ -2338,13 +2365,34 @@ export default function TranscriptView() {
                   {/* Question cards */}
                   {currentQuiz.questions.map((q, idx) => {
                     const chosen = userAnswers[q.id];
-                    const isAnswered = chosen !== undefined;
                     const isCorrect = chosen === q.correctOptionIndex;
+                    const isQuestionAr =
+                      currentQuiz.language === "ar"
+                        ? true
+                        : currentQuiz.language === "en"
+                          ? false
+                          : /[\u0600-\u06FF]/.test(q.question);
+                    const totalQ = currentQuiz.questions.length;
+                    const diffLabel =
+                      q.difficulty === "hard"
+                        ? isQuestionAr
+                          ? "المستوى: صعب"
+                          : "Difficulty: Hard"
+                        : q.difficulty === "easy"
+                          ? isQuestionAr
+                            ? "المستوى: سهل"
+                            : "Difficulty: Easy"
+                          : isQuestionAr
+                            ? "المستوى: متوسط"
+                            : "Difficulty: Medium";
 
                     return (
                       <GlassCard
                         key={q.id}
-                        className={`p-5 space-y-4 text-right transition-all ${
+                        dir={isQuestionAr ? "rtl" : "ltr"}
+                        className={`p-5 space-y-4 transition-all ${
+                          isQuestionAr ? "text-right" : "text-left"
+                        } ${
                           quizSubmitted
                             ? isCorrect
                               ? "border-emerald-500/50 bg-emerald-500/5"
@@ -2352,44 +2400,68 @@ export default function TranscriptView() {
                             : ""
                         }`}
                       >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="flex items-center gap-2">
-                            {quizSubmitted && (
-                              <Badge
-                                variant={isCorrect ? "default" : "destructive"}
-                                className="text-xs gap-1 font-semibold"
-                              >
-                                {isCorrect ? (
-                                  <>
-                                    <CheckCircle2 className="h-3 w-3" /> إجابة صحيحة
-                                  </>
-                                ) : (
-                                  <>
-                                    <XCircle className="h-3 w-3" /> إجابة خاطئة
-                                  </>
-                                )}
-                              </Badge>
-                            )}
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="flex items-start gap-3 flex-1">
+                            <span className="inline-flex items-center justify-center px-2.5 py-1 rounded-lg text-xs font-mono font-bold border border-rose-500/50 bg-rose-500/15 text-rose-600 dark:text-rose-300 shrink-0 mt-0.5">
+                              {isQuestionAr
+                                ? `السؤال ${idx + 1} / ${totalQ}`
+                                : `Question ${idx + 1} / ${totalQ}`}
+                            </span>
+                            <div className="space-y-1.5 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge variant="outline" className="text-[10px] bg-secondary/50">
+                                  {diffLabel}
+                                </Badge>
+                                <Badge variant="outline" className="text-[10px] bg-secondary/50">
+                                  {q.type === "true_false"
+                                    ? isQuestionAr
+                                      ? "صح / خطأ"
+                                      : "True / False"
+                                    : isQuestionAr
+                                      ? "اختيار من متعدد (MCQ)"
+                                      : "Multiple Choice (MCQ)"}
+                                </Badge>
+                              </div>
+                              <p className="text-sm font-semibold text-foreground leading-relaxed">
+                                {q.question}
+                              </p>
+                            </div>
                           </div>
 
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-sm text-foreground">
-                              السؤال {idx + 1}:
-                            </span>
-                            <span className="text-sm font-medium text-foreground leading-relaxed">
-                              {q.question}
-                            </span>
-                          </div>
+                          {quizSubmitted && (
+                            <Badge
+                              variant={isCorrect ? "default" : "destructive"}
+                              className="text-xs gap-1 font-semibold shrink-0"
+                            >
+                              {isCorrect ? (
+                                <>
+                                  <CheckCircle2 className="h-3 w-3" />{" "}
+                                  {isQuestionAr ? "إجابة صحيحة" : "Correct"}
+                                </>
+                              ) : (
+                                <>
+                                  <XCircle className="h-3 w-3" />{" "}
+                                  {isQuestionAr ? "إجابة غير صحيحة" : "Incorrect"}
+                                </>
+                              )}
+                            </Badge>
+                          )}
                         </div>
 
                         {/* Options */}
                         <div className="space-y-2 pt-1">
+                          <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                            {isQuestionAr ? "الخيارات" : "Options"}
+                          </div>
                           {q.options.map((opt, optIdx) => {
                             const isSelected = chosen === optIdx;
                             const isThisCorrect = q.correctOptionIndex === optIdx;
+                            const optionLetter = isQuestionAr
+                              ? ["أ", "ب", "ج", "د"][optIdx] || String.fromCharCode(65 + optIdx)
+                              : String.fromCharCode(65 + optIdx);
 
                             let optClasses =
-                              "flex items-center justify-between p-3 rounded-xl border text-sm transition cursor-pointer ";
+                              "flex items-center justify-between gap-3 p-3 rounded-xl border text-sm transition cursor-pointer ";
                             if (quizSubmitted) {
                               if (isThisCorrect) {
                                 optClasses +=
@@ -2400,13 +2472,10 @@ export default function TranscriptView() {
                               } else {
                                 optClasses += "border-border/40 opacity-60";
                               }
+                            } else if (isSelected) {
+                              optClasses += "border-primary bg-primary/10 text-primary font-medium";
                             } else {
-                              if (isSelected) {
-                                optClasses +=
-                                  "border-primary bg-primary/10 text-primary font-medium";
-                              } else {
-                                optClasses += "border-border/60 hover:bg-secondary/40";
-                              }
+                              optClasses += "border-border/60 hover:bg-secondary/40";
                             }
 
                             return (
@@ -2419,7 +2488,13 @@ export default function TranscriptView() {
                                 }}
                                 className={optClasses}
                               >
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-2.5 flex-1">
+                                  <span className="h-5 w-5 rounded-full border border-border/70 grid place-items-center text-xs font-mono shrink-0">
+                                    {optionLetter}
+                                  </span>
+                                  <span className="flex-1">{opt}</span>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
                                   {quizSubmitted && isThisCorrect && (
                                     <CheckCircle2 className="h-4 w-4 text-emerald-500" />
                                   )}
@@ -2427,25 +2502,33 @@ export default function TranscriptView() {
                                     <XCircle className="h-4 w-4 text-destructive" />
                                   )}
                                 </div>
-                                <div className="flex items-center gap-2">
-                                  <span>{opt}</span>
-                                  <span className="h-5 w-5 rounded-full border border-border/70 grid place-items-center text-xs font-mono">
-                                    {String.fromCharCode(65 + optIdx)}
-                                  </span>
-                                </div>
                               </div>
                             );
                           })}
                         </div>
 
                         {/* Explanation box on submit */}
-                        {quizSubmitted && q.explanation && (
-                          <div className="rounded-xl border border-primary/20 bg-primary/5 p-3 text-xs space-y-1">
-                            <span className="font-semibold text-primary flex items-center gap-1 justify-end">
-                              الشرح والتوثيق من المحاضرة:
-                              <HelpCircle className="h-3.5 w-3.5" />
-                            </span>
-                            <p className="text-muted-foreground leading-relaxed">{q.explanation}</p>
+                        {quizSubmitted && (
+                          <div className="rounded-xl border border-primary/20 bg-primary/5 p-3 text-xs space-y-1.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-semibold text-emerald-500">
+                                {isQuestionAr ? "الإجابة الصحيحة:" : "Correct Answer:"}
+                              </span>
+                              <span className="font-semibold text-foreground">
+                                {q.options[q.correctOptionIndex]}
+                              </span>
+                            </div>
+                            {q.explanation && (
+                              <div className="pt-1 border-t border-border/40 space-y-1">
+                                <span className="font-semibold text-primary flex items-center gap-1">
+                                  <HelpCircle className="h-3.5 w-3.5" />
+                                  {isQuestionAr ? "الشرح:" : "Explanation:"}
+                                </span>
+                                <p className="text-muted-foreground leading-relaxed">
+                                  {q.explanation}
+                                </p>
+                              </div>
+                            )}
                           </div>
                         )}
                       </GlassCard>
@@ -2459,16 +2542,24 @@ export default function TranscriptView() {
                         onClick={() => {
                           const answeredCount = Object.keys(userAnswers).length;
                           if (answeredCount === 0) {
-                            toast.warning("يرجى الإجابة على الأسئلة أولاً قبل تسليم الكويز");
+                            toast.warning(
+                              isArabic
+                                ? "يرجى الإجابة على الأسئلة أولاً قبل تسليم الاختبار"
+                                : "Please answer at least one question before submitting",
+                            );
                             return;
                           }
                           setQuizSubmitted(true);
                           const { percent } = calculateQuizScore();
-                          toast.success(`تم تقييم الكويز بنجاح! النتيجة: ${percent}%`);
+                          toast.success(
+                            isArabic
+                              ? `تم تقييم الاختبار بنجاح! النتيجة: ${percent}%`
+                              : `Quiz graded! Score: ${percent}%`,
+                          );
                         }}
                         className="gradient-primary text-primary-foreground shadow-glow px-6 py-2 text-sm font-semibold cursor-pointer"
                       >
-                        تصحيح الإجابات وتقييم النتيجة
+                        {isArabic ? "تصحيح الإجابات وتقييم النتيجة" : "Submit & Grade Quiz"}
                       </Button>
                     </div>
                   )}
@@ -2476,17 +2567,22 @@ export default function TranscriptView() {
               ) : (
                 <GlassCard className="p-12 text-center space-y-3">
                   <Brain className="h-10 w-10 text-muted-foreground mx-auto" />
-                  <h4 className="font-semibold text-base">لا يوجد كويز متاح لهذه المحاضرة بعد</h4>
+                  <h4 className="font-semibold text-base">
+                    {isArabic
+                      ? "لا يوجد اختبار متاح لهذه المحاضرة بعد"
+                      : "No quiz generated for this session yet"}
+                  </h4>
                   <p className="text-xs text-muted-foreground max-w-md mx-auto">
-                    اضغط على "إنشاء كويز من المحاضرة" ليقوم الذكاء الاصطناعي بصياغة أسئلة تفاعلية
-                    ذكية تقيس مدى استيعابك للمفاهيم المشروحة.
+                    {isArabic
+                      ? 'اضغط على "إنشاء اختبار من المحاضرة" ليقوم الذكاء الاصطناعي بصياغة أسئلة أكاديمية موثقة تقيس مدى استيعابك.'
+                      : 'Click "Generate Lecture Quiz" to create a grounded university-level assessment from this transcript.'}
                   </p>
                   <Button
                     onClick={handleGenerateQuiz}
                     className="gradient-primary text-primary-foreground mt-2 cursor-pointer text-xs"
                   >
                     <Sparkles className="h-3.5 w-3.5 mr-1.5" />
-                    إنشاء الكويز الآن
+                    {isArabic ? "إنشاء الاختبار الآن" : "Generate Quiz Now"}
                   </Button>
                 </GlassCard>
               )}

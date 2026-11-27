@@ -23,7 +23,6 @@ dist-ssr
 # Vercel
 .vercel/
 
-
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -39,10 +38,16 @@ dist-ssr
 .env
 .env.*
 !.env.example
+firebase-applet-config.json
 data/.jwt_secret
 data/.provider_secrets.json
 data/audio_transcript_cache.json
+data/ai_analysis_cache.json
 data/*.tmp.*
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
 
 # Runtime data & AI models
 data/recordings/*
@@ -56,7 +61,4 @@ data/llm-models/
 services/ai_service/packages/
 services/ai_service/models/
 
-.antigravity/
-.antigravity/
-.env
 .antigravity/

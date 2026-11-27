@@ -72,6 +72,7 @@ export interface Meeting {
   analysisRetryable?: boolean;
   analyzedAt?: string;
   language?: string;
+  transcriptLanguage?: "ar" | "en" | "mixed";
   recordingPath?: string;
   recordingFileName?: string;
   audioUrl?: string;
@@ -113,6 +114,7 @@ export interface Lecture {
   analysisRetryable?: boolean;
   analyzedAt?: string;
   language?: string;
+  transcriptLanguage?: "ar" | "en" | "mixed";
   recordingPath?: string;
   recordingFileName?: string;
   audioUrl?: string;
@@ -147,10 +149,14 @@ export interface ActionItem {
 
 export interface QuizQuestion {
   id: string;
+  questionNumber?: number;
   question: string;
   type?: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
+  schemaType?: "mcq" | "true_false";
+  cognitiveLevel?: "direct" | "conceptual" | "comparison" | "application" | "analysis" | "deep";
   options: string[];
   correctOptionIndex: number;
+  correctAnswer?: string | boolean;
   correctAnswerText?: string;
   acceptableAnswers?: string[];
   explanation: string;
@@ -159,6 +165,7 @@ export interface QuizQuestion {
   timestampRef?: string;
   sourceReference?: string;
   sourceTranscriptSegment?: string;
+  sourceSegmentIds?: string[];
   groundingVerified?: boolean;
 }
 
@@ -180,6 +187,8 @@ export interface Quiz {
   meetingId?: string;
   title: string;
   courseCode?: string;
+  language?: "ar" | "en";
+  transcriptLanguage?: "ar" | "en" | "mixed";
   questions: QuizQuestion[];
   attemptsCount: number;
   lastScore?: number;

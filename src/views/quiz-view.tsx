@@ -278,39 +278,39 @@ export default function QuizView() {
     setSubmittedResults(null);
   };
 
-  const getDifficultyBadge = (difficulty?: string) => {
+  const getDifficultyBadge = (difficulty?: string, inArabic = isArabic) => {
     switch (difficulty) {
       case "easy":
         return (
           <Badge className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]">
-            {isArabic ? "سهل" : "Easy"}
+            {inArabic ? "المستوى: سهل" : "Difficulty: Easy"}
           </Badge>
         );
       case "hard":
         return (
           <Badge className="bg-purple-500/15 text-purple-400 border-purple-500/30 text-[10px]">
-            {isArabic ? "متقدم" : "Hard"}
+            {inArabic ? "المستوى: صعب" : "Difficulty: Hard"}
           </Badge>
         );
       default:
         return (
           <Badge className="bg-amber-500/15 text-amber-400 border-amber-500/30 text-[10px]">
-            {isArabic ? "متوسط" : "Medium"}
+            {inArabic ? "المستوى: متوسط" : "Difficulty: Medium"}
           </Badge>
         );
     }
   };
 
-  const getTypeLabel = (type?: string) => {
+  const getTypeLabel = (type?: string, inArabic = isArabic) => {
     switch (type) {
       case "true_false":
-        return isArabic ? "صح / خطأ" : "True / False";
+        return inArabic ? "صح / خطأ" : "True / False";
       case "fill_in_the_blank":
-        return isArabic ? "أكمل الفراغ" : "Fill in the Blank";
+        return inArabic ? "أكمل الفراغ" : "Fill in the Blank";
       case "short_answer":
-        return isArabic ? "سؤال مقالي واستنتاجي" : "Conceptual / Short Answer";
+        return inArabic ? "سؤال استنتاجي" : "Conceptual Answer";
       default:
-        return isArabic ? "اختيار من متعدد (MCQ)" : "Multiple Choice (MCQ)";
+        return inArabic ? "اختيار من متعدد (MCQ)" : "Multiple Choice (MCQ)";
     }
   };
 
@@ -318,11 +318,11 @@ export default function QuizView() {
     <div className="space-y-6" dir={isArabic ? "rtl" : "ltr"}>
       <PageHeader
         eyebrow={isArabic ? "التقييم الأكاديمي الذكي" : "Academic Self-Assessment"}
-        title={isArabic ? "مولد الاختبارات والتقييم الذكي" : "AI Quiz & Self-Assessment"}
+        title={isArabic ? "مولد الاختبارات الأكاديمية الذكي" : "AI University Quiz & Exam Studio"}
         description={
           isArabic
-            ? "اختبارات استنتاجية وتقييمية شاملة تغطي كامل محاور المحاضرة (MCQ، صح وخطأ، أكمل الفراغ، وأسئلة مقالية) مع تصحيح تلقائي وتوثيق استدلالي."
-            : "Comprehensive AI quizzes covering the entire lecture (MCQ, True/False, Fill in blanks, Short answers) with automatic grading and source explanations."
+            ? "اختبارات جامعية موثقة تغطي كامل محاور المحاضرة (اختيار من متعدد MCQ وصح/خطأ) بمستويات معرفية متدرجة وتصحيح فوري وتوثيق استدلالي."
+            : "University-grade grounded exams covering all lecture sections (MCQ & True/False) across cognitive levels with instant grading and source explanations."
         }
         actions={
           activeQuiz ? (
@@ -586,7 +586,13 @@ export default function QuizView() {
                   const resultItem = submittedResults?.results.find((r) => r.questionId === q.id);
                   const qType = q.type || "multiple_choice";
                   const chosenOption = selectedAnswers[q.id];
-                  const isQuestionArabic = /[\u0600-\u06FF]/.test(q.question);
+                  const isQuestionArabic =
+                    activeQuiz.language === "ar"
+                      ? true
+                      : activeQuiz.language === "en"
+                        ? false
+                        : /[\u0600-\u06FF]/.test(q.question);
+                  const totalCount = activeQuiz.questions.length;
 
                   return (
                     <GlassCard
@@ -599,19 +605,16 @@ export default function QuizView() {
                         <div className="font-medium text-sm sm:text-base text-foreground flex items-start gap-3">
                           {/* Distinct Red/Rose Highlight Badge with Crisp Contrast across All Themes */}
                           <span className="inline-flex items-center justify-center px-2.5 py-1 rounded-lg text-xs font-mono font-bold border border-rose-500/50 bg-rose-500/15 text-rose-600 dark:text-rose-300 shadow-[0_0_12px_rgba(244,63,94,0.28)] shrink-0 mt-0.5">
-                            {isQuestionArabic ? `السؤال ${qIndex + 1}` : `Question ${qIndex + 1}`}
+                            {isQuestionArabic
+                              ? `السؤال ${qIndex + 1} / ${totalCount}`
+                              : `Question ${qIndex + 1} / ${totalCount}`}
                           </span>
                           <div className="space-y-1">
                             <div className="flex flex-wrap items-center gap-2 mb-1">
-                              <span className="text-[11px] font-mono text-muted-foreground bg-secondary/50 px-2 py-0.5 rounded border border-border/40">
-                                {isQuestionArabic
-                                  ? `${qIndex + 1} من ${activeQuiz.questions.length}`
-                                  : `${qIndex + 1} of ${activeQuiz.questions.length}`}
-                              </span>
                               <Badge variant="outline" className="text-[10px] bg-secondary/60">
-                                {getTypeLabel(qType)}
+                                {getTypeLabel(qType, isQuestionArabic)}
                               </Badge>
-                              {getDifficultyBadge(q.difficulty)}
+                              {getDifficultyBadge(q.difficulty, isQuestionArabic)}
                               {(q.timestampRef || q.sectionRef) && (
                                 <Link
                                   to="/transcript"
@@ -646,21 +649,28 @@ export default function QuizView() {
                             {resultItem.isCorrect ? (
                               <Badge className="border-emerald-500/30 bg-emerald-500/15 text-emerald-400 gap-1 px-2.5 py-1">
                                 <CheckCircle2 className="h-3.5 w-3.5" />{" "}
-                                {isArabic ? "صحيح" : "Correct"}
+                                {isQuestionArabic ? "إجابة صحيحة" : "Correct"}
                               </Badge>
                             ) : (
                               <Badge className="border-destructive/30 bg-destructive/15 text-destructive gap-1 px-2.5 py-1">
                                 <XCircle className="h-3.5 w-3.5" />{" "}
-                                {isArabic ? "إجابة تحتاج مراجعة" : "Needs Review"}
+                                {isQuestionArabic ? "إجابة غير صحيحة" : "Incorrect"}
                               </Badge>
                             )}
                           </div>
                         )}
                       </div>
 
+                      {/* Options Header */}
+                      {(qType === "multiple_choice" || qType === "true_false") && (
+                        <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                          {isQuestionArabic ? "الخيارات" : "Options"}
+                        </div>
+                      )}
+
                       {/* Question Interaction Based on Type */}
                       {qType === "multiple_choice" && (
-                        <div className="space-y-2 pt-1">
+                        <div className="space-y-2 pt-0.5">
                           {q.options.map((opt, optIdx) => {
                             const isSelected = chosenOption === optIdx;
                             let optionClass = "border-border/60 hover:bg-secondary/40";
@@ -702,7 +712,7 @@ export default function QuizView() {
                       )}
 
                       {qType === "true_false" && (
-                        <div className="grid grid-cols-2 gap-3 pt-1">
+                        <div className="grid grid-cols-2 gap-3 pt-0.5">
                           {q.options.slice(0, 2).map((opt, optIdx) => {
                             const isSelected = chosenOption === optIdx;
                             let btnVariant = "border-border/60 hover:bg-secondary/40";
@@ -738,7 +748,7 @@ export default function QuizView() {
                         <div className="space-y-2 pt-1">
                           <Input
                             placeholder={
-                              isArabic
+                              isQuestionArabic
                                 ? "اكتب الإجابة أو المصطلح الناقص هنا..."
                                 : "Type the missing answer or term here..."
                             }
@@ -750,7 +760,7 @@ export default function QuizView() {
                           {submittedResults && (
                             <div className="text-xs text-muted-foreground flex items-center gap-2 pt-1">
                               <span className="font-semibold text-primary">
-                                {isArabic ? "الإجابة المعتمدة:" : "Approved Answer:"}
+                                {isQuestionArabic ? "الإجابة الصحيحة:" : "Correct Answer:"}
                               </span>
                               <span className="font-mono bg-secondary px-2 py-0.5 rounded border border-border">
                                 {q.correctAnswerText || q.options[q.correctOptionIndex || 0]}
@@ -764,7 +774,7 @@ export default function QuizView() {
                         <div className="space-y-2 pt-1">
                           <Textarea
                             placeholder={
-                              isArabic
+                              isQuestionArabic
                                 ? "اكتب استنتاجك أو إجابتك التحليلية استناداً إلى شرح المحاضر..."
                                 : "Write your analytical answer based on lecture explanation..."
                             }
@@ -778,7 +788,7 @@ export default function QuizView() {
                             <div className="p-3 rounded-xl bg-secondary/30 border border-border/60 text-xs space-y-1">
                               <div className="font-semibold text-primary flex items-center gap-1.5">
                                 <PenTool className="h-3.5 w-3.5" />{" "}
-                                {isArabic ? "نموذج الإجابة الأكاديمي:" : "Model Answer:"}
+                                {isQuestionArabic ? "الإجابة الصحيحة:" : "Correct Answer:"}
                               </div>
                               <p className="text-foreground leading-relaxed">
                                 {q.correctAnswerText || q.explanation}
@@ -788,17 +798,25 @@ export default function QuizView() {
                         </div>
                       )}
 
-                      {/* Explanation (Revealed upon submission) */}
+                      {/* Correct Answer + Explanation (Revealed upon submission) */}
                       {resultItem && (
-                        <div className="mt-3 rounded-xl border border-primary/20 bg-primary/5 p-3.5 text-xs space-y-1">
-                          <div className="font-semibold text-primary flex items-center gap-1.5">
-                            <Sparkles className="h-3.5 w-3.5" />{" "}
-                            {isArabic
-                              ? "التوثيق الاستدلالي من نص المحاضرة:"
-                              : "Grounded Lecture Citation:"}
+                        <div className="mt-3 rounded-xl border border-primary/20 bg-primary/5 p-3.5 text-xs space-y-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-semibold text-emerald-500">
+                              {isQuestionArabic ? "الإجابة الصحيحة:" : "Correct Answer:"}
+                            </span>
+                            <span className="font-semibold text-foreground">
+                              {q.options?.[q.correctOptionIndex] || q.correctAnswerText}
+                            </span>
                           </div>
-                          <div className="text-foreground/90 leading-relaxed">
-                            {resultItem.explanation}
+                          <div className="space-y-1 pt-1 border-t border-border/40">
+                            <div className="font-semibold text-primary flex items-center gap-1.5">
+                              <Sparkles className="h-3.5 w-3.5" />{" "}
+                              {isQuestionArabic ? "الشرح:" : "Explanation:"}
+                            </div>
+                            <div className="text-foreground/90 leading-relaxed">
+                              {resultItem.explanation}
+                            </div>
                           </div>
                         </div>
                       )}

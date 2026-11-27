@@ -62,6 +62,7 @@ import {
   type SupportedProviderSecretKey,
 } from "./provider-secrets";
 import { computeFileSha256 } from "./pipeline-cache";
+import { resolveTranscriptLanguage } from "./transcript-format";
 import {
   deleteStoredAvatarFile,
   getAvatarsDir,
@@ -4911,12 +4912,20 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             { status: 400 },
           );
         }
+        const transcriptLanguage = resolveTranscriptLanguage({
+          existing: target.transcriptLanguage,
+          segments: activeSegments,
+          rawTranscript: target.rawTranscript || target.fullText,
+          title: target.title,
+          languageHint: target.language,
+        });
         const summaryResult = await generateAiSummary(
           target.title,
           activeSegments,
           effectiveType,
           courseCode,
           appLanguage,
+          { transcriptLanguage },
         );
         const summaryText = summaryResult.summary || summaryResult.detailedSummary || "";
         const executiveSummary = summaryResult.executiveSummary || summaryText;
@@ -5060,6 +5069,13 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             { status: 400 },
           );
         }
+        const transcriptLanguage = resolveTranscriptLanguage({
+          existing: target.transcriptLanguage,
+          segments: activeSegments,
+          rawTranscript: target.rawTranscript || target.fullText,
+          title: target.title,
+          languageHint: target.language,
+        });
         const quizResult = await generateAiQuiz(
           target.title,
           activeSegments,
@@ -5067,6 +5083,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
           courseCode,
           {
             appLanguage,
+            transcriptLanguage,
             numQuestions,
             variant,
             difficulty,
@@ -5076,24 +5093,36 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
 
         const rawQuestions = Array.isArray(quizResult.questions) ? quizResult.questions : [];
         const slicedQuestions = numQuestions ? rawQuestions.slice(0, numQuestions) : rawQuestions;
+        const quizLang = quizResult.language || (transcriptLanguage === "en" ? "en" : "ar");
 
         const quizId = `quiz_${resourceId}_${Date.now()}`;
         const newQuiz = {
           id: quizId,
           lectureId: effectiveType === "lecture" ? resourceId : undefined,
           meetingId: effectiveType === "meeting" ? resourceId : undefined,
+          language: quizLang,
+          transcriptLanguage,
           title:
             quizResult.title ||
-            (appLanguage === "ar"
-              ? `اختبار تقييمي شامل: ${target.title}`
-              : `Assessment Quiz: ${target.title}`),
+            (quizLang === "ar"
+              ? `اختبار الفهم الأكاديمي الشامل: ${target.title}`
+              : `Comprehensive Academic Exam: ${target.title}`),
           courseCode,
           questions: slicedQuestions.map((q, idx) => ({
             id: q.id || `q_${resourceId}_${idx + 1}`,
+            questionNumber: idx + 1,
             question: q.question,
             type: q.type || "multiple_choice",
+            schemaType: q.schemaType || (q.type === "true_false" ? "true_false" : "mcq"),
+            cognitiveLevel: q.cognitiveLevel,
             options: q.options,
             correctOptionIndex: q.correctOptionIndex,
+            correctAnswer:
+              q.correctAnswer !== undefined
+                ? q.correctAnswer
+                : q.type === "true_false"
+                  ? q.correctOptionIndex === 0
+                  : q.options[q.correctOptionIndex],
             correctAnswerText: q.correctAnswerText ?? q.options[q.correctOptionIndex],
             acceptableAnswers: q.acceptableAnswers ?? [q.options[q.correctOptionIndex]],
             explanation: q.explanation,
@@ -5102,6 +5131,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             timestampRef: q.timestampRef,
             sourceReference: q.sourceReference,
             sourceTranscriptSegment: q.sourceTranscriptSegment,
+            sourceSegmentIds: q.sourceSegmentIds || [],
             groundingVerified: q.groundingVerified ?? true,
           })),
           attemptsCount: 0,
@@ -5183,12 +5213,20 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
             { status: 400 },
           );
         }
+        const transcriptLanguage = resolveTranscriptLanguage({
+          existing: target.transcriptLanguage,
+          segments: activeSegments,
+          rawTranscript: target.rawTranscript || target.fullText,
+          title: target.title,
+          languageHint: target.language,
+        });
         const analysis = await generateAiLectureAnalysis(
           target.title,
           activeSegments,
           effectiveType,
           courseCode,
           appLanguage,
+          transcriptLanguage,
         );
         const extractedKeywords = extractKeywordsWithFrequency(activeSegments);
         const extractedHighlights = extractHighlightsFromSegments(activeSegments);
@@ -5632,6 +5670,13 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       const summaryContext =
         resource.summary || ("studyNotes" in resource ? resource.studyNotes : undefined);
 
+      const transcriptLanguage = resolveTranscriptLanguage({
+        existing: resource.transcriptLanguage,
+        segments: activeSegments,
+        rawTranscript: resource.rawTranscript || resource.fullText,
+        title: resource.title,
+        languageHint: resource.language,
+      });
       const difficulty =
         body.difficulty === "easy" || body.difficulty === "medium" || body.difficulty === "hard"
           ? (body.difficulty as "easy" | "medium" | "hard")
@@ -5646,6 +5691,7 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
           variant,
           difficulty,
           appLanguage,
+          transcriptLanguage,
           numQuestions,
         },
       );
@@ -5659,6 +5705,8 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         id: newQuizId,
         lectureId: lecture ? resource.id : undefined,
         meetingId: !lecture ? resource.id : undefined,
+        language: generated.language,
+        transcriptLanguage,
         title: generated.title,
         courseCode: generated.courseCode,
         questions: finalQuestions,
@@ -5738,7 +5786,17 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         let isCorrect = false;
 
         if (q.type === "true_false" || q.type === "multiple_choice" || !q.type) {
-          isCorrect = Number(rawAnswer) === q.correctOptionIndex;
+          if (typeof rawAnswer === "boolean") {
+            isCorrect = (rawAnswer ? 0 : 1) === q.correctOptionIndex;
+          } else if (typeof rawAnswer === "number" || /^\d+$/.test(String(rawAnswer ?? ""))) {
+            isCorrect = Number(rawAnswer) === q.correctOptionIndex;
+          } else if (typeof rawAnswer === "string" && rawAnswer.trim()) {
+            const normUser = normalizeAr(rawAnswer);
+            const expectedOpt = normalizeAr(
+              q.options?.[q.correctOptionIndex] || q.correctAnswerText || "",
+            );
+            isCorrect = Boolean(normUser && normUser === expectedOpt);
+          }
         } else if (q.type === "fill_in_the_blank") {
           const userText = normalizeAr(String(rawAnswer || ""));
           const correctText = normalizeAr(q.correctAnswerText || "");
@@ -5905,12 +5963,20 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       try {
         const resType: "meeting" | "lecture" = "courseCode" in resource ? "lecture" : "meeting";
         const activeSegments = await ensureRealSegments(resource, resType);
+        const transcriptLanguage = resolveTranscriptLanguage({
+          existing: resource.transcriptLanguage,
+          segments: activeSegments,
+          rawTranscript: resource.rawTranscript || resource.fullText,
+          title: resource.title,
+          languageHint: resource.language,
+        });
         const generated = await generateAiFlashcards(
           resource.title,
           activeSegments,
           resource.summary || ("studyNotes" in resource ? resource.studyNotes : undefined),
           "courseCode" in resource ? resource.courseCode : undefined,
           appLanguage,
+          transcriptLanguage,
         );
 
         const now = new Date().toISOString();
@@ -5990,12 +6056,20 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
       try {
         const resType: "meeting" | "lecture" = "courseCode" in resource ? "lecture" : "meeting";
         const activeSegments = await ensureRealSegments(resource, resType);
+        const transcriptLanguage = resolveTranscriptLanguage({
+          existing: resource.transcriptLanguage,
+          segments: activeSegments,
+          rawTranscript: resource.rawTranscript || resource.fullText,
+          title: resource.title,
+          languageHint: resource.language,
+        });
         const rootNode = await generateAiMindMap(
           resource.title,
           activeSegments,
           resource.summary || ("studyNotes" in resource ? resource.studyNotes : undefined),
           "courseCode" in resource ? resource.courseCode : undefined,
           appLanguage,
+          transcriptLanguage,
         );
 
         const now = new Date().toISOString();

@@ -30,16 +30,25 @@ import {
 import { logObservabilityEvent } from "./pipeline-logger";
 import {
   answerBuiltInChat,
+  areQuestionsSemanticallySimilar,
   buildBuiltInSummary,
   buildBuiltInLectureAnalysis,
   buildBuiltInFlashcards,
   buildBuiltInMindMap,
   buildBuiltInQuiz,
+  computeSupportedQuestionCount,
   normalizeText,
+  partitionTranscriptIntoTopicSections,
   retrieveRelevantSegmentsBM25,
   selectHighSignalSegments,
   trySolveMathQuery,
+  type QuizCognitiveLevel,
 } from "./builtin-ai";
+import {
+  resolveOutputLanguageFromTranscript,
+  resolveTranscriptLanguage,
+  type TranscriptLanguage,
+} from "./transcript-format";
 import {
   extractJsonFromLlmOutput,
   generateLocalLlmJson,
@@ -55,7 +64,7 @@ const FALLBACK_TEXT_MODEL = geminiConfig.fallbackTextModel;
 const ASR_MODEL = geminiConfig.asrModel;
 const FALLBACK_ASR_MODEL = geminiConfig.fallbackAsrModel;
 
-const PROMPT_VERSION = 5;
+const PROMPT_VERSION = 6;
 
 // ============================================================================
 // ZOD STRUCTURED AI RESPONSE SCHEMAS & VALIDATE → REPAIR → VALIDATE PIPELINE
@@ -115,9 +124,16 @@ const AiLectureAnalysisZodSchema = z.object({
 });
 
 const AiQuizItemZodSchema = z.object({
+  id: z.string().optional(),
   question: z.string().min(5),
-  type: z.enum(["multiple_choice", "true_false", "short_answer", "fill_in_the_blank"]).optional(),
+  type: z
+    .enum(["mcq", "multiple_choice", "true_false", "short_answer", "fill_in_the_blank"])
+    .optional(),
+  cognitiveLevel: z
+    .enum(["direct", "conceptual", "comparison", "application", "analysis", "deep"])
+    .optional(),
   options: z.array(z.string()).optional(),
+  correctAnswer: z.union([z.string(), z.boolean()]).optional(),
   correctOptionIndex: z.number().int().optional(),
   correctAnswerText: z.string().optional(),
   acceptableAnswers: z.array(z.string()).optional(),
@@ -126,9 +142,16 @@ const AiQuizItemZodSchema = z.object({
   sectionRef: z.string().optional(),
   timestampRef: z.string().optional(),
   sourceTranscriptSegment: z.string().optional(),
+  sourceSegmentIds: z.array(z.string()).optional(),
 });
 
-const AiQuizArrayZodSchema = z.array(AiQuizItemZodSchema).min(1);
+const AiQuizArrayZodSchema = z.union([
+  z.array(AiQuizItemZodSchema).min(1),
+  z.object({
+    language: z.enum(["ar", "en"]).optional(),
+    questions: z.array(AiQuizItemZodSchema).min(1),
+  }),
+]);
 
 const AiFlashcardsZodSchema = z
   .array(
@@ -632,16 +655,43 @@ export function extractHighlightsFromSegments(segments: TranscriptSegment[]): Ar
   return results;
 }
 
-function detectTranscriptLanguage(
+export function detectTranscriptLanguage(
   title: string,
   segments: TranscriptSegment[],
-): "ar" | "en" | "mixed" {
-  const combined = `${title} ${segments.map((s) => s.text || "").join(" ")}`;
-  const arabicChars = (combined.match(/[\u0600-\u06FF]/g) || []).length;
-  const latinChars = (combined.match(/[a-zA-Z]/g) || []).length;
-  if (arabicChars > 10 && latinChars > 20 && latinChars > arabicChars * 0.4) return "mixed";
-  if (arabicChars > 0 && arabicChars >= latinChars * 0.25) return "ar";
-  return latinChars > 0 ? "en" : "ar";
+  existing?: TranscriptLanguage,
+): TranscriptLanguage {
+  return resolveTranscriptLanguage({ existing, segments, title });
+}
+
+function resolveTaskLanguage(params: {
+  title: string;
+  segments: TranscriptSegment[];
+  transcriptLanguage?: TranscriptLanguage;
+  appLanguage?: "en" | "ar";
+}): { transcriptLang: TranscriptLanguage; outputLang: "ar" | "en"; isEnglish: boolean } {
+  const fallbackAppLang: "ar" | "en" = params.appLanguage === "ar" ? "ar" : "en";
+  if (!params.segments || params.segments.length === 0) {
+    return {
+      transcriptLang: params.transcriptLanguage || fallbackAppLang,
+      outputLang: fallbackAppLang,
+      isEnglish: fallbackAppLang === "en",
+    };
+  }
+  const transcriptLang = resolveTranscriptLanguage({
+    existing: params.transcriptLanguage,
+    segments: params.segments,
+    title: params.title,
+  });
+  const outputLang = resolveOutputLanguageFromTranscript(
+    transcriptLang,
+    params.segments,
+    params.appLanguage,
+  );
+  return {
+    transcriptLang,
+    outputLang,
+    isEnglish: outputLang === "en",
+  };
 }
 
 function chunkTranscriptSegments(
@@ -1193,7 +1243,7 @@ export async function generateAiSummary(
   type: "meeting" | "lecture" = "lecture",
   courseCode?: string,
   appLanguage?: "en" | "ar",
-  options?: { fastFallback?: boolean },
+  options?: { fastFallback?: boolean; transcriptLanguage?: TranscriptLanguage },
 ): Promise<{
   summary: string;
   executiveSummary?: string;
@@ -1208,9 +1258,12 @@ export async function generateAiSummary(
     priority: "high" | "medium" | "low";
   }>;
 }> {
-  const detectedLang = detectTranscriptLanguage(title, segments);
-  const targetLang = appLanguage || detectedLang || "en";
-  const isEnglish = targetLang === "en";
+  const { outputLang: targetLang, isEnglish } = resolveTaskLanguage({
+    title,
+    segments,
+    transcriptLanguage: options?.transcriptLanguage,
+    appLanguage,
+  });
 
   if (!segments || segments.length === 0) {
     return {
@@ -1227,7 +1280,7 @@ export async function generateAiSummary(
     "summary",
     title,
     segments,
-    `${type}:${courseCode || ""}:${appLanguage || ""}`,
+    `${type}:${courseCode || ""}:${targetLang}`,
   );
   const cached = getCachedAiAnalysis<{
     summary: string;
@@ -1437,7 +1490,7 @@ ${preparedTranscript}
 
   // Tier 2: Hybrid Fast Local LLM Summary — crisp plain-text abstractive executive overview
   // from Gemma 3 1B (~7-10s, zero JSON syntax overhead) combined with instant grounded facts/actions.
-  const builtInRef = buildBuiltInSummary(title, segments, type, courseCode, appLanguage);
+  const builtInRef = buildBuiltInSummary(title, segments, type, courseCode, targetLang);
   const allowLocalLlm =
     !options?.fastFallback || process.env.ENABLE_LOCAL_LLM_BATCH_ANALYSIS === "true";
   const localTranscript = allowLocalLlm ? formatCompactTranscriptForLocalLlm(segments, 1800) : "";
@@ -1523,10 +1576,32 @@ ${preparedTranscript}
   return builtInRef;
 }
 
+export interface NormalizedQuizQuestion {
+  id: string;
+  questionNumber?: number;
+  question: string;
+  type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
+  schemaType?: "mcq" | "true_false";
+  cognitiveLevel?: QuizCognitiveLevel;
+  options: string[];
+  correctOptionIndex: number;
+  correctAnswer?: string | boolean;
+  correctAnswerText?: string;
+  acceptableAnswers?: string[];
+  explanation: string;
+  difficulty: "easy" | "medium" | "hard";
+  sectionRef: string;
+  timestampRef?: string;
+  sourceReference?: string;
+  sourceTranscriptSegment?: string;
+  sourceSegmentIds?: string[];
+  groundingVerified?: boolean;
+}
+
 /**
  * Verifies that a generated quiz question is genuinely grounded in the actual
- * transcript text. Rejects hallucinated questions whose evidence/answer terms
- * do not appear in the canonical transcript.
+ * transcript text and resolves real `sourceSegmentIds`. Rejects hallucinated
+ * questions whose evidence/answer terms do not appear in the canonical transcript.
  */
 export function verifyQuizQuestionGrounding(
   question: {
@@ -1537,25 +1612,39 @@ export function verifyQuizQuestionGrounding(
     correctAnswerText?: string;
     explanation?: string;
     sourceTranscriptSegment?: string;
+    sourceSegmentIds?: string[];
   },
   segments: TranscriptSegment[],
-): { grounded: boolean; matchedSegmentText?: string; matchedTimestamp?: string } {
-  if (!segments || segments.length === 0) return { grounded: false };
+): {
+  grounded: boolean;
+  matchedSegmentText?: string;
+  matchedTimestamp?: string;
+  matchedSegmentIds: string[];
+} {
+  if (!segments || segments.length === 0) return { grounded: false, matchedSegmentIds: [] };
 
-  const normalizedSegments = segments.map((s) => ({
-    raw: s,
-    norm: normalizeArabicAndLatin(s.text),
-    tokens: new Set(
-      normalizeArabicAndLatin(s.text)
-        .split(" ")
-        .filter((t) => t.length >= 2),
-    ),
-  }));
+  const validIdMap = new Map<string, TranscriptSegment>();
+  const normalizedSegments = segments.map((s) => {
+    validIdMap.set(s.id, s);
+    return {
+      raw: s,
+      norm: normalizeArabicAndLatin(s.text),
+      tokens: new Set(
+        normalizeArabicAndLatin(s.text)
+          .split(" ")
+          .filter((t) => t.length >= 2),
+      ),
+    };
+  });
   const fullNormTranscript = normalizedSegments.map((s) => s.norm).join(" ");
   const fullTokenSet = new Set<string>();
   for (const s of normalizedSegments) {
     for (const t of s.tokens) fullTokenSet.add(t);
   }
+
+  const explicitIds = (question.sourceSegmentIds || [])
+    .map((id) => String(id || "").trim())
+    .filter((id) => validIdMap.has(id));
 
   // 1. Check direct evidence quote (`sourceTranscriptSegment`) if provided
   if (question.sourceTranscriptSegment && question.sourceTranscriptSegment.trim().length >= 6) {
@@ -1567,10 +1656,12 @@ export function verifyQuizQuestionGrounding(
       const hit = normalizedSegments.find(
         (s) => s.norm.includes(quoteNorm.slice(0, 20)) || quoteNorm.includes(s.norm.slice(0, 20)),
       );
+      const ids = Array.from(new Set([...explicitIds, ...(hit ? [hit.raw.id] : [])]));
       return {
         grounded: true,
         matchedSegmentText: hit?.raw.text || question.sourceTranscriptSegment,
         matchedTimestamp: hit ? formatMmSs(hit.raw.startTime) : undefined,
+        matchedSegmentIds: ids.length > 0 ? ids : [segments[0].id],
       };
     }
 
@@ -1584,10 +1675,12 @@ export function verifyQuizQuestionGrounding(
             score: quoteTokens.filter((t) => s.tokens.has(t)).length,
           }))
           .sort((a, b) => b.score - a.score)[0];
+        const ids = Array.from(new Set([...explicitIds, ...(bestSeg ? [bestSeg.s.raw.id] : [])]));
         return {
           grounded: true,
           matchedSegmentText: bestSeg?.s.raw.text || question.sourceTranscriptSegment,
           matchedTimestamp: bestSeg ? formatMmSs(bestSeg.s.raw.startTime) : undefined,
+          matchedSegmentIds: ids.length > 0 ? ids : [segments[0].id],
         };
       }
     }
@@ -1605,7 +1698,7 @@ export function verifyQuizQuestionGrounding(
     .split(" ")
     .filter((t) => t.length >= 3);
 
-  if (probeTokens.length === 0) return { grounded: false };
+  if (probeTokens.length === 0) return { grounded: false, matchedSegmentIds: [] };
 
   let bestSeg = normalizedSegments[0];
   let bestScore = 0;
@@ -1624,14 +1717,284 @@ export function verifyQuizQuestionGrounding(
 
   const grounded =
     bestScore >= 2 || (totalMatched >= 2 && totalMatched / uniqueProbe.length >= 0.2);
+  const resolvedIds = grounded
+    ? Array.from(new Set([...explicitIds, ...(bestSeg ? [bestSeg.raw.id] : [])]))
+    : [];
   return {
     grounded,
     matchedSegmentText: grounded ? bestSeg?.raw.text : undefined,
     matchedTimestamp: grounded && bestSeg ? formatMmSs(bestSeg.raw.startTime) : undefined,
+    matchedSegmentIds: resolvedIds,
   };
 }
 
-// Generate Quiz directly grounded in the transcript and summary (with automated grounding validation)
+const PLACEHOLDER_OPTION_RX =
+  /^(?:none|nothing|something|all of the above|none of the above|not mentioned|n\/a|لا شيء مما سبق|جميع ما سبق|كل ما سبق|غير مذكور|لا يوجد)$/i;
+const TRIVIAL_STEM_RX =
+  /(?:what is mentioned in the lecture|which topic was mentioned|تناولت الجلسة النقطة التالية|ما الذي ذُكر في المحاضرة فقط)/i;
+const CHAIN_OF_THOUGHT_PREFIX_RX =
+  /^(?:let'?s think step by step[:\s,-]*|thinking process[:\s,-]*|chain of thought[:\s,-]*)/i;
+
+/**
+ * Strict 10-point Grounding, Language, Rigor & Semantic Deduplication Validator
+ * for university-grade MCQ and True/False exam questions.
+ */
+export function validateAndNormalizeQuizQuestions(
+  rawItems: unknown[],
+  segments: TranscriptSegment[],
+  outputLang: "ar" | "en",
+  options?: {
+    avoidQuestionTitles?: string[];
+    requestedDifficulty?: "all" | "easy" | "medium" | "hard";
+    idPrefix?: string;
+  },
+): NormalizedQuizQuestion[] {
+  if (!Array.isArray(rawItems) || rawItems.length === 0 || segments.length === 0) return [];
+
+  const isEnglish = outputLang === "en";
+  const transcriptNorm = normalizeArabicAndLatin(segments.map((s) => s.text).join(" "));
+  const transcriptNums = new Set((transcriptNorm.match(/\d+(?:\.\d+)?/g) || []).map((n) => n));
+
+  const accepted: NormalizedQuizQuestion[] = [];
+  const comparisonPool: Array<{
+    question: string;
+    correctAnswerText?: string;
+    sourceSegmentIds?: string[];
+  }> = (options?.avoidQuestionTitles || []).map((q) => ({ question: q }));
+
+  rawItems.forEach((rawItem, idx) => {
+    if (!rawItem || typeof rawItem !== "object") return;
+    const q = rawItem as Record<string, unknown>;
+    const rawQ = String(q.question || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (rawQ.length < 16 || TRIVIAL_STEM_RX.test(rawQ)) return;
+
+    // Language isolation check: English lecture -> 0 Arabic script; Arabic lecture -> Arabic script required
+    if (isEnglish) {
+      if (/[\u0600-\u06FF]/.test(rawQ)) return;
+    } else {
+      if (!/[\u0600-\u06FF]/.test(rawQ)) return;
+    }
+
+    // Allowed types ONLY: MCQ ("mcq" / "multiple_choice") or "true_false"
+    const rawType = String(q.type || "multiple_choice").toLowerCase();
+    if (rawType !== "mcq" && rawType !== "multiple_choice" && rawType !== "true_false") {
+      return;
+    }
+    const qType: "multiple_choice" | "true_false" =
+      rawType === "true_false" ? "true_false" : "multiple_choice";
+
+    let qOptions: string[] = [];
+    let correctOptionIndex =
+      typeof q.correctOptionIndex === "number" && Number.isInteger(q.correctOptionIndex)
+        ? q.correctOptionIndex
+        : 0;
+    let resolvedCorrectAnswer: string | boolean = "";
+
+    if (qType === "multiple_choice") {
+      const rawOpts = Array.isArray(q.options)
+        ? q.options.map((o: unknown) =>
+            String(o || "")
+              .replace(/\s+/g, " ")
+              .trim(),
+          )
+        : [];
+      const seenOptNorm = new Set<string>();
+      const uniqueOpts: string[] = [];
+      for (const opt of rawOpts) {
+        if (!opt || PLACEHOLDER_OPTION_RX.test(opt)) continue;
+        if (isEnglish && /[\u0600-\u06FF]/.test(opt)) continue;
+        const n = normalizeArabicAndLatin(opt);
+        if (!n || seenOptNorm.has(n)) continue;
+        seenOptNorm.add(n);
+        uniqueOpts.push(opt);
+      }
+      if (uniqueOpts.length < 4) return; // Reject incomplete or duplicate options
+      qOptions = uniqueOpts.slice(0, 4);
+
+      // Align correctOptionIndex with explicit correctAnswer string if provided
+      const explicitAnsStr =
+        typeof q.correctAnswer === "string" && q.correctAnswer.trim()
+          ? q.correctAnswer.trim()
+          : typeof q.correctAnswerText === "string" && q.correctAnswerText.trim()
+            ? q.correctAnswerText.trim()
+            : "";
+      if (explicitAnsStr) {
+        const matchedIdx = qOptions.findIndex(
+          (opt) => normalizeArabicAndLatin(opt) === normalizeArabicAndLatin(explicitAnsStr),
+        );
+        if (matchedIdx !== -1) correctOptionIndex = matchedIdx;
+      }
+      if (correctOptionIndex < 0 || correctOptionIndex >= 4) correctOptionIndex = 0;
+      const chosenCorrect = qOptions[correctOptionIndex];
+
+      // Block fabricated numbers in the correct answer
+      const answerNums = chosenCorrect.match(/\d+(?:\.\d+)?/g) || [];
+      if (answerNums.some((num) => !transcriptNums.has(num) && !transcriptNorm.includes(num))) {
+        return;
+      }
+
+      // Reject trivial question stems that literally include a long correct option verbatim
+      if (
+        chosenCorrect.split(/\s+/).length >= 5 &&
+        normalizeArabicAndLatin(rawQ).includes(normalizeArabicAndLatin(chosenCorrect))
+      ) {
+        return;
+      }
+      resolvedCorrectAnswer = chosenCorrect;
+    } else {
+      // Deterministic True / False validation (non-interrogative declarative statement)
+      if (/[?؟]\s*$/.test(rawQ)) return;
+      qOptions = isEnglish ? ["True", "False"] : ["صح", "خطأ"];
+      let boolAns: boolean;
+      if (typeof q.correctAnswer === "boolean") {
+        boolAns = q.correctAnswer;
+      } else if (typeof q.correctAnswer === "string") {
+        boolAns = /^(true|صح|صواب|صحيحة)$/i.test(q.correctAnswer.trim());
+      } else {
+        boolAns = correctOptionIndex === 1 ? false : true;
+      }
+      correctOptionIndex = boolAns ? 0 : 1;
+      resolvedCorrectAnswer = boolAns;
+    }
+
+    const rawExplanation = String(q.explanation || "")
+      .replace(CHAIN_OF_THOUGHT_PREFIX_RX, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (rawExplanation && isEnglish && /[\u0600-\u06FF]/.test(rawExplanation)) return;
+    if (rawExplanation && !isEnglish && !/[\u0600-\u06FF]/.test(rawExplanation)) return;
+
+    const rawSegIds = Array.isArray(q.sourceSegmentIds)
+      ? q.sourceSegmentIds.map((s) => String(s || "").trim()).filter(Boolean)
+      : undefined;
+
+    const verification = verifyQuizQuestionGrounding(
+      {
+        question: rawQ,
+        type: qType,
+        options: qOptions,
+        correctOptionIndex,
+        correctAnswerText: qOptions[correctOptionIndex],
+        explanation: rawExplanation,
+        sourceTranscriptSegment:
+          typeof q.sourceTranscriptSegment === "string" ? q.sourceTranscriptSegment : undefined,
+        sourceSegmentIds: rawSegIds,
+      },
+      segments,
+    );
+    if (!verification.grounded) return;
+
+    const resolvedSegIds =
+      verification.matchedSegmentIds.length > 0 ? verification.matchedSegmentIds : [segments[0].id];
+    const resolvedCorrectText = qOptions[correctOptionIndex] || "";
+
+    // Semantic deduplication check against prior & accepted questions
+    const candidateProbe = {
+      question: rawQ,
+      correctAnswerText: resolvedCorrectText,
+      sourceSegmentIds: resolvedSegIds,
+    };
+    if (
+      comparisonPool.some((existing) => areQuestionsSemanticallySimilar(existing, candidateProbe))
+    ) {
+      return;
+    }
+
+    const resolvedTs =
+      (typeof q.timestampRef === "string" && q.timestampRef.trim()) ||
+      (typeof q.timestamp === "string" && q.timestamp.trim()) ||
+      verification.matchedTimestamp ||
+      "00:00";
+    const resolvedQuote =
+      (typeof q.sourceTranscriptSegment === "string" && q.sourceTranscriptSegment.trim()) ||
+      verification.matchedSegmentText ||
+      "";
+    const requestedDifficulty = options?.requestedDifficulty;
+    const rawDiff = String(q.difficulty || "").toLowerCase();
+    const difficulty: "easy" | "medium" | "hard" =
+      requestedDifficulty && requestedDifficulty !== "all"
+        ? requestedDifficulty
+        : rawDiff === "easy" || rawDiff === "medium" || rawDiff === "hard"
+          ? rawDiff
+          : "medium";
+    const rawCog = String(q.cognitiveLevel || "").toLowerCase();
+    const cognitiveLevel: QuizCognitiveLevel | undefined = [
+      "direct",
+      "conceptual",
+      "comparison",
+      "application",
+      "analysis",
+      "deep",
+    ].includes(rawCog)
+      ? (rawCog as QuizCognitiveLevel)
+      : undefined;
+
+    const normalizedQuestion: NormalizedQuizQuestion = {
+      id: `${options?.idPrefix || "q"}_${Date.now()}_${idx + 1}`,
+      questionNumber: accepted.length + 1,
+      question: rawQ,
+      type: qType,
+      schemaType: qType === "true_false" ? "true_false" : "mcq",
+      cognitiveLevel,
+      options: qOptions,
+      correctOptionIndex,
+      correctAnswer: resolvedCorrectAnswer,
+      correctAnswerText: resolvedCorrectText,
+      acceptableAnswers: [resolvedCorrectText],
+      explanation:
+        rawExplanation ||
+        (isEnglish
+          ? `Confirmed directly in the lecture transcript at [${resolvedTs}].`
+          : `مؤكد وموثق مباشرة في نص المحاضرة عند [${resolvedTs}].`),
+      difficulty,
+      sectionRef:
+        (typeof q.sectionRef === "string" && q.sectionRef.trim()) ||
+        (isEnglish ? "Lecture Section" : "محاور المحاضرة"),
+      timestampRef: resolvedTs,
+      sourceReference: `${(typeof q.sectionRef === "string" && q.sectionRef.trim()) || (isEnglish ? "Transcript" : "النص المفرغ")} [${resolvedTs}]`,
+      sourceTranscriptSegment: resolvedQuote,
+      sourceSegmentIds: resolvedSegIds,
+      groundingVerified: true,
+    };
+
+    accepted.push(normalizedQuestion);
+    comparisonPool.push(normalizedQuestion);
+  });
+
+  return accepted;
+}
+
+function formatSectionedTranscriptForQuizPrompt(
+  segments: TranscriptSegment[],
+  isEnglish: boolean,
+  maxChars = 48000,
+): { sectionedText: string; sectionCount: number; sectionSummaryLine: string } {
+  const sections = partitionTranscriptIntoTopicSections(segments, !isEnglish);
+  if (sections.length === 0) {
+    return { sectionedText: "", sectionCount: 0, sectionSummaryLine: "" };
+  }
+  const perSectionBudget = Math.max(1200, Math.floor(maxChars / sections.length));
+  const blocks = sections.map((sec) => {
+    const header = `=== ${sec.sectionLabel} (Segments: ${sec.segments[0]?.id} .. ${sec.segments[sec.segments.length - 1]?.id}) ===`;
+    let body = "";
+    for (const seg of sec.segments) {
+      const line = `[${seg.id} | ${formatMmSs(seg.startTime)}] ${seg.speaker}: ${seg.text}\n`;
+      if (body.length + line.length > perSectionBudget && body.length > 0) break;
+      body += line;
+    }
+    return `${header}\n${body.trim()}`;
+  });
+
+  return {
+    sectionedText: blocks.join("\n\n").slice(0, maxChars),
+    sectionCount: sections.length,
+    sectionSummaryLine: sections.map((s) => s.sectionLabel).join(" | "),
+  };
+}
+
+// Generate University-Grade Quiz directly grounded in the transcript (with 10-rule validation + targeted regeneration)
 export async function generateAiQuiz(
   title: string,
   segments: TranscriptSegment[],
@@ -1642,207 +2005,206 @@ export async function generateAiQuiz(
     variant?: number;
     difficulty?: "all" | "easy" | "medium" | "hard";
     appLanguage?: "en" | "ar";
+    transcriptLanguage?: TranscriptLanguage;
     numQuestions?: number;
     fastFallback?: boolean;
   },
 ): Promise<{
+  language: "ar" | "en";
+  transcriptLanguage: TranscriptLanguage;
   title: string;
   courseCode?: string;
-  questions: Array<{
-    id: string;
-    question: string;
-    type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
-    options: string[];
-    correctOptionIndex: number;
-    correctAnswerText?: string;
-    acceptableAnswers?: string[];
-    explanation: string;
-    difficulty: "easy" | "medium" | "hard";
-    sectionRef: string;
-    timestampRef?: string;
-    sourceReference?: string;
-    sourceTranscriptSegment?: string;
-    groundingVerified?: boolean;
-  }>;
+  questions: NormalizedQuizQuestion[];
 }> {
-  const detectedLang = detectTranscriptLanguage(title, segments);
-  const targetLang = options?.appLanguage || detectedLang || "en";
-  const isEnglish = targetLang === "en";
+  const {
+    transcriptLang,
+    outputLang: targetLang,
+    isEnglish,
+  } = resolveTaskLanguage({
+    title,
+    segments,
+    transcriptLanguage: options?.transcriptLanguage,
+    appLanguage: options?.appLanguage,
+  });
   const ai = getGeminiClient();
   const variant = options?.variant || 1;
-  const totalWords = segments
-    .map((s) => s.text)
-    .join(" ")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean).length;
-  const defaultQuestionCount =
-    totalWords < 50 ? 4 : totalWords < 150 ? 6 : totalWords < 300 ? 8 : 10;
-  const requestedCount =
-    typeof options?.numQuestions === "number" && Number.isFinite(options.numQuestions)
-      ? Math.min(20, Math.max(1, Math.round(options.numQuestions)))
-      : defaultQuestionCount;
+  const requestedCount = computeSupportedQuestionCount(segments, options?.numQuestions);
 
   logObservabilityEvent("info", "quiz_generation_started", {
     title,
     segmentsCount: segments.length,
     requestedCount,
     targetLang,
+    transcriptLang,
   });
+
+  if (!segments || segments.length === 0 || requestedCount === 0) {
+    return {
+      language: targetLang,
+      transcriptLanguage: transcriptLang,
+      title: isEnglish
+        ? `Comprehensive Academic Exam: ${title}`
+        : `اختبار الفهم الأكاديمي الشامل: ${title}`,
+      courseCode,
+      questions: [],
+    };
+  }
 
   const cacheHash = computeTranscriptHash(
     "quiz",
     title,
     segments,
-    `${courseCode || ""}:${options?.appLanguage || ""}:${requestedCount}:${options?.difficulty || "all"}`,
+    `${courseCode || ""}:${targetLang}:${requestedCount}:${options?.difficulty || "all"}`,
   );
   const canUseCache =
     (!options?.avoidQuestionTitles || options.avoidQuestionTitles.length === 0) && variant === 1;
   if (canUseCache) {
     const cached = getCachedAiAnalysis<{
+      language: "ar" | "en";
+      transcriptLanguage: TranscriptLanguage;
       title: string;
       courseCode?: string;
-      questions: Array<{
-        id: string;
-        question: string;
-        type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
-        options: string[];
-        correctOptionIndex: number;
-        correctAnswerText?: string;
-        acceptableAnswers?: string[];
-        explanation: string;
-        difficulty: "easy" | "medium" | "hard";
-        sectionRef: string;
-        timestampRef?: string;
-        sourceReference?: string;
-        sourceTranscriptSegment?: string;
-        groundingVerified?: boolean;
-      }>;
+      questions: NormalizedQuizQuestion[];
     }>(cacheHash);
-    if (cached) return cached;
+    if (cached && cached.questions.length > 0) return cached;
   }
 
+  let cloudVerifiedQuestions: NormalizedQuizQuestion[] = [];
   if (ai && segments.length > 0) {
     try {
-      const preparedTranscript = await prepareTranscriptForLlm(ai, title, segments, 24000);
-      const avoidList = (options?.avoidQuestionTitles || []).slice(0, 15).join(" | ");
-      const langDirective =
-        detectedLang === "en"
-          ? "Generate ALL questions, options, and explanations in clear English matching the transcript."
-          : "أنشئ الأسئلة والخيارات والشروحات باللغة العربية مع الحفاظ على المصطلحات التقنية كما وردت.";
-      const targetQuestionRange = options?.numQuestions
-        ? `exactly ${requestedCount}`
-        : totalWords < 50
-          ? "3 to 5"
-          : totalWords < 150
-            ? "6 to 10"
-            : totalWords < 300
-              ? "10 to 15"
-              : `up to ${Math.min(20, Math.max(3, Math.floor(totalWords / 20)))}`;
+      const { sectionedText, sectionCount, sectionSummaryLine } =
+        formatSectionedTranscriptForQuizPrompt(segments, isEnglish, 48000);
+      const avoidList = (options?.avoidQuestionTitles || []).slice(0, 18).join(" || ");
+      const difficultyDirectiveEn =
+        options?.difficulty && options.difficulty !== "all"
+          ? `Set difficulty to "${options.difficulty}" across questions.`
+          : 'Distribute difficulty realistically across "easy", "medium", and "hard".';
+      const difficultyDirectiveAr =
+        options?.difficulty && options.difficulty !== "all"
+          ? `اجعل مستوى الصعوبة "${options.difficulty}".`
+          : 'نوّع مستوى الصعوبة بواقعية بين "easy" و"medium" و"hard".';
 
-      const prompt = isEnglish
-        ? `You are an elite academic assessment designer and test examiner at MeetMind AI.
-Strict Mission: Generate a grounded practice quiz of ${targetQuestionRange} questions (up to 20 maximum) strictly covering ONLY the transcript for session: "${title}" ${courseCode ? `(Course: ${courseCode})` : ""}.
-Generate ALL questions, options, and explanations in fluent, clear English.
-ZERO HALLUCINATION & TRANSCRIPT GROUNDING RULES:
-1. Every question and its correct answer MUST be 100% grounded in facts explicitly stated in the transcript below.
-2. If the transcript is brief, do NOT invent questions. Produce only as many questions as the transcript legitimately supports.
-3. Include the "sourceTranscriptSegment" field with an exact verbatim quote from the transcript proving the answer.
-4. Accepted types ONLY:
-   - "multiple_choice": question with EXACTLY 4 unique options (1 correct, 3 plausible distractors grounded in context).
-   - "true_false": unambiguous declarative statement, options: ["True", "False"].
-   Do NOT invent filler questions just to reach a target number — if the transcript supports only fewer questions, return only those.
-5. Include sectionRef, timestampRef, and difficulty ("easy" | "medium" | "hard")${options?.difficulty && options.difficulty !== "all" ? ` — focus on "${options.difficulty}" difficulty` : " — mix easy, medium, and hard"}.
-6. ${avoidList ? `Avoid repeating these questions: ${avoidList}` : `This is variant ${variant} of the quiz.`}
+      const buildExamPrompt = (countNeeded: number, extraAvoid: string[]) => {
+        const fullAvoid = [...(options?.avoidQuestionTitles || []), ...extraAvoid]
+          .slice(0, 24)
+          .join(" || ");
+        return isEnglish
+          ? `You are a distinguished university professor designing an official academic exam for the lecture: "${title}" ${courseCode ? `(Course: ${courseCode})` : ""}.
+Generate up to ${countNeeded} rigorous, non-repetitive exam questions (NEVER exceed 20, and NEVER invent filler if the transcript supports fewer) in natural academic English ONLY (zero Arabic characters).
 
-Transcript:
-"""
-${preparedTranscript}
-"""
+MANDATORY EXAM ARCHITECTURE:
+1. WHOLE-LECTURE PROPORTIONAL COVERAGE: The transcript is divided into ${sectionCount} chronological sections (${sectionSummaryLine}). Distribute questions proportionally across ALL sections from 0% to 100% — NEVER cluster questions in the opening paragraphs.
+2. COGNITIVE DEPTH MIX (6 Levels): Mix:
+   - "direct": explicit definitions, rules, and core facts
+   - "conceptual": why/how mechanisms work
+   - "comparison": distinctions between two concepts/methods explained in the lecture
+   - "application": realistic scenarios applying a rule or condition taught in the lecture
+   - "analysis": synthesizing two connected parts of the lecture
+   - "deep": subtle conceptual or conditional distinctions
+3. ALLOWED QUESTION TYPES ONLY:
+   - "multiple_choice": Clear academic question stem + EXACTLY 4 distinct, realistic, lecture-relevant options (1 unambiguously correct + 3 plausible distractors grounded in lecture terminology; NEVER use "All of the above", "None of the above", or silly placeholders).
+   - "true_false": Non-trivial declarative statement testing a condition, relationship, distinction, or consequence (NEVER end with "?"), options: ["True", "False"], correctAnswer: true or false.
+4. ZERO HALLUCINATION & STRICT GROUNDING: Use ONLY facts, relationships, and numbers explicitly present in the transcript. Cite exact segment IDs in "sourceSegmentIds" (e.g. ["seg_3"]) and a brief verbatim quote in "sourceTranscriptSegment".
+5. CONCISE EXPLANATION: 1–2 crisp educational sentences explaining WHY the answer is correct and why alternatives fail (NO chain-of-thought).
+6. ${difficultyDirectiveEn}
+7. ${fullAvoid || avoidList ? `STRICTLY AVOID semantically repeating any of these questions: ${fullAvoid || avoidList}` : `Exam Variant: ${variant}.`}
 
-Summary Context:
+SECTIONED LECTURE TRANSCRIPT:
 """
-${summaryText || ""}
+${sectionedText}
 """
+${summaryText ? `\nSUMMARY CONTEXT:\n"""\n${summaryText.slice(0, 2500)}\n"""` : ""}
 
-Return ONLY a JSON array matching:
-[
-  {
-    "question": "Question in English...",
-    "type": "multiple_choice",
-    "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
-    "correctOptionIndex": 0,
-    "correctAnswerText": "Option 1",
-    "acceptableAnswers": [],
-    "explanation": "Clear explanation in English...",
-    "difficulty": "medium",
-    "sectionRef": "Section 1",
-    "timestampRef": "00:15",
-    "sourceTranscriptSegment": "exact verbatim quote from transcript"
-  }
-]`
-        : `أنت بروفيسور وخبير تقييم أكاديمي في منصة MeetMind AI.
-المهمة الصارمة: أنشئ اختباراً موثقاً من ${targetQuestionRange} أسئلة (بحد أقصى 20 سؤالاً) يغطي المحتوى الفعلي فقط لجلسة: "${title}".
-${langDirective}
+Return ONLY a valid JSON object matching:
+{
+  "language": "en",
+  "questions": [
+    {
+      "id": "q1",
+      "type": "multiple_choice",
+      "cognitiveLevel": "conceptual",
+      "difficulty": "medium",
+      "question": "Clear university-level question in English...",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctOptionIndex": 0,
+      "correctAnswer": "Option A",
+      "explanation": "Concise academic explanation citing the lecture principle.",
+      "sectionRef": "Section 1",
+      "timestampRef": "01:15",
+      "sourceTranscriptSegment": "short verbatim quote",
+      "sourceSegmentIds": ["seg_1"]
+    }
+  ]
+}`
+          : `أنت أستاذ جامعي متخصص تضع اختباراً أكاديمياً رسمياً رفيع المستوى لمحاضرة: "${title}" ${courseCode ? `(مقرر: ${courseCode})` : ""}.
+أنشئ ما يصل إلى ${countNeeded} سؤالاً جامعياً رصيناً وغير مكرر (بحد أقصى 20 سؤالاً، ودون أي حشو إذا كان النص يدعم عدداً أقل) باللغة العربية الفصحى الأكاديمية السليمة والواضحة، مع الحفاظ على المصطلحات التقنية الإنجليزية كما وردت في المحاضرة.
 
-القواعد الصارمة لمنع الاختلاق وتثبيت التوثيق (ZERO HALLUCINATION & TRANSCRIPT GROUNDING):
-1. كل سؤال وإجابته الصحيحة يجب أن يستندا بنسبة 100% إلى حقيقة مذكورة صراحةً في النص المفرغ أدناه.
-2. إذا كان النص المفرغ قصيراً فلا تخترع أسئلة إضافية من خارج النص إطلاقاً — اكتفِ بعدد الأسئلة التي يدعمها النص فعلياً فقط (مثلاً 14 أو 10 أسئلة ولا تملأ بفراغ وهمي).
-3. أدرج لكل سؤال الحقل "sourceTranscriptSegment" بنص حرفي مقتبس مباشرة من النص المفرغ يثبت الإجابة الصحيحة.
-4. الأنواع المعتمدة حصراً:
-   - "multiple_choice": سؤال مع 4 خيارات فريدة دقيقة (خيار واحد صحيح و3 مشتتات منطقية من سياق المحتوى ولكنها خاطئة).
-   - "true_false": عبارة قاطعة لا لبس فيها، والخيارات ["صح", "خطأ"].
-   ممنوع اختلاق أسئلة إضافية لملء العدد؛ إذا كان النص يدعم عدداً أقل فأرجع هذا العدد فقط.
-5. حدد القسم والزمن الفعلي (sectionRef، timestampRef) ومستوى الصعوبة (easy | medium | hard)${options?.difficulty && options.difficulty !== "all" ? ` مع التركيز على مستوى "${options.difficulty}"` : ""}.
-6. ${avoidList ? `تجنب تكرار هذه الأسئلة التي طُرحت سابقاً: ${avoidList}` : `هذا الإصدار ${variant} من الاختبار.`}
+القواعد الإلزامية لبناء الاختبار الجامعي:
+1. التغطية الشاملة لكامل المحاضرة (من البداية 0% حتى النهاية 100%): النص مقسم إلى ${sectionCount} أقسام متتابعة (${sectionSummaryLine}). وزّع الأسئلة بالتناسب على جميع الأقسام من أول المحاضرة إلى آخرها، ويُمنع تكديس الأسئلة في المقدمة فقط.
+2. التنوع المعرفي العميق (6 مستويات): نوّع الأسئلة بين:
+   - "direct": المفاهيم والتعريفات والقواعد الصريحة
+   - "conceptual": الفهم العميق وتفسير الكيفية والأسباب (لماذا/كيف)
+   - "comparison": المقارنة والتمييز الدقيق بين مفهومين أو طريقتين وردتا في الشرح
+   - "application": أسئلة تطبيقية وسيناريوهات عملية مبنية على قواعد المحاضرة
+   - "analysis": الربط التحليلي بين أكثر من فكرة داخل المحاضرة
+   - "deep": الفروق الدقيقة والشروط الحاكمة
+3. الأنواع المسموح بها حصراً:
+   - "multiple_choice": سؤال جامعي واضح يتبعه 4 خيارات متميزة ومنطقية من صلب مصطلحات المحاضرة (إجابة واحدة صحيحة بلا لبس + 3 مشتتات ذكية؛ يُمنع استخدام "جميع ما سبق" أو "لا شيء مما سبق" أو خيارات تافهة).
+   - "true_false": عبارة خبرية علمية غير بديهية تختبر شرطاً أو علاقة سببية أو فرقاً دقيقاً (بدون علامة استفهام)، والخيارات حصراً ["صح", "خطأ"] وحقل correctAnswer بقيمة true أو false.
+4. التوثيق الصارم ومنع الاختلاق: التزم بنسبة 100% بما ورد في النص المفرغ وأرقامه وحقائقه. أرفق معرفات المقاطع الحقيقية في "sourceSegmentIds" (مثل ["seg_4"]) واقتباساً قصيراً في "sourceTranscriptSegment".
+5. جودة الصياغة والشرح: صياغة عربية فصحى سلسة خالية من العامية والركاكة، مع حقل "explanation" من جملة أو جملتين تعليميتين توضح سبب صحة الإجابة دون إطالة.
+6. ${difficultyDirectiveAr}
+7. ${fullAvoid || avoidList ? `يُمنع منعاً باتاً تكرار هذه الأسئلة لفظياً أو معنوياً: ${fullAvoid || avoidList}` : `نموذج الاختبار رقم ${variant}.`}
 
-النص المفرغ:
+النص المفرغ المقسم حسب محاور المحاضرة:
 """
-${preparedTranscript}
+${sectionedText}
 """
+${summaryText ? `\nملخص استرشادي:\n"""\n${summaryText.slice(0, 2500)}\n"""` : ""}
 
-الملخص التوجيهي:
-"""
-${summaryText || ""}
-"""
-
-أرجع مصفوفة JSON فقط بالشكل التالي:
-[
-  {
-    "question": "...",
-    "type": "multiple_choice",
-    "options": ["...", "...", "...", "..."],
-    "correctOptionIndex": 0,
-    "correctAnswerText": "...",
-    "acceptableAnswers": [],
-    "explanation": "...",
-    "difficulty": "medium",
-    "sectionRef": "...",
-    "timestampRef": "00:15",
-    "sourceTranscriptSegment": "exact verbatim quote from transcript"
-  }
-]`;
+أرجع كائن JSON صالحاً فقط بالهيكل التالي:
+{
+  "language": "ar",
+  "questions": [
+    {
+      "id": "q1",
+      "type": "multiple_choice",
+      "cognitiveLevel": "conceptual",
+      "difficulty": "medium",
+      "question": "نص السؤال باللغة العربية الفصحى الأكاديمية...",
+      "options": ["الخيار الأول", "الخيار الثاني", "الخيار الثالث", "الخيار الرابع"],
+      "correctOptionIndex": 0,
+      "correctAnswer": "الخيار الأول",
+      "explanation": "شرح علمي موجز ودقيق يوضح سبب صحة الإجابة استناداً للمحاضرة.",
+      "sectionRef": "القسم 1",
+      "timestampRef": "01:15",
+      "sourceTranscriptSegment": "اقتباس قصير من النص",
+      "sourceSegmentIds": ["seg_1"]
+    }
+  ]
+}`;
+      };
 
       const config = getGeminiConfig();
       const { result: response } = await executeWithRetryAndFallback(
         "generateAiQuiz",
-        async (model) => {
-          return ai.models.generateContent({
+        async (model) =>
+          ai.models.generateContent({
             model,
-            contents: prompt,
+            contents: buildExamPrompt(requestedCount, []),
             config: {
               responseMimeType: "application/json",
+              temperature: 0.2,
               thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             },
-          });
-        },
+          }),
         {
           primaryModel: config.textModel,
           fallbackModel: config.fallbackTextModel,
           maxRetries: Math.min(2, config.maxRetries),
           baseDelayMs: 500,
           maxDelayMs: 2000,
-          timeoutMs: 35000,
+          timeoutMs: 38000,
         },
       );
 
@@ -1855,7 +2217,7 @@ ${summaryText || ""}
             async (model) =>
               ai.models.generateContent({
                 model,
-                contents: `Repair this JSON array of quiz questions. Validation errors: ${issues}\n\nMalformed output:\n${malformed}`,
+                contents: `Repair this JSON quiz payload so it matches {"language":"${targetLang}","questions":[...]}. Validation errors: ${issues}\n\nMalformed output:\n${malformed}`,
                 config: { responseMimeType: "application/json" },
               }),
             { primaryModel: config.fallbackTextModel, maxRetries: 0, timeoutMs: 15000 },
@@ -1864,105 +2226,132 @@ ${summaryText || ""}
         },
       );
 
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        const requestedDifficulty = options?.difficulty;
-        const seenQuestions = new Set<string>();
-        const verifiedQuestions = parsed
-          .map((q, idx) => {
-            const rawQ = String(q.question || "").trim();
-            if (!rawQ) return null;
-            const normQ = normalizeArabicAndLatin(rawQ);
-            if (seenQuestions.has(normQ)) return null;
-            seenQuestions.add(normQ);
+      const rawQuestionList = Array.isArray(parsed)
+        ? parsed
+        : parsed && Array.isArray(parsed.questions)
+          ? parsed.questions
+          : [];
 
-            const qType: "multiple_choice" | "true_false" =
-              q.type === "true_false" ? "true_false" : "multiple_choice";
+      cloudVerifiedQuestions = validateAndNormalizeQuizQuestions(
+        rawQuestionList,
+        segments,
+        targetLang,
+        {
+          avoidQuestionTitles: options?.avoidQuestionTitles,
+          requestedDifficulty: options?.difficulty,
+          idPrefix: "q",
+        },
+      );
 
-            let qOptions: string[] = [];
-            let correctOptionIndex =
-              typeof q.correctOptionIndex === "number" ? q.correctOptionIndex : 0;
-
-            if (qType === "multiple_choice") {
-              const rawOpts = Array.isArray(q.options)
-                ? q.options.map((o: unknown) => String(o).trim())
-                : [];
-              const uniqueOpts: string[] = Array.from(new Set(rawOpts)).filter((x): x is string =>
-                Boolean(x),
-              );
-              if (uniqueOpts.length < 4) return null; // Reject incomplete or duplicate options
-              qOptions = uniqueOpts.slice(0, 4);
-              if (correctOptionIndex < 0 || correctOptionIndex >= 4) correctOptionIndex = 0;
-            } else {
-              qOptions = isEnglish ? ["True", "False"] : ["صح", "خطأ"];
-              if (correctOptionIndex !== 0 && correctOptionIndex !== 1) correctOptionIndex = 0;
-            }
-
-            const verification = verifyQuizQuestionGrounding(
-              { ...q, question: rawQ, options: qOptions, correctOptionIndex },
-              segments,
-            );
-            if (!verification.grounded) return null;
-
-            const resolvedTs = q.timestampRef || verification.matchedTimestamp || "00:00";
-            const resolvedQuote =
-              q.sourceTranscriptSegment || verification.matchedSegmentText || "";
-            const resolvedCorrectText =
-              q.correctAnswerText?.trim() || qOptions[correctOptionIndex] || "";
-            const resolvedAcceptable =
-              Array.isArray(q.acceptableAnswers) && q.acceptableAnswers.length > 0
-                ? q.acceptableAnswers.map((a) => String(a).trim()).filter(Boolean)
-                : resolvedCorrectText
-                  ? [resolvedCorrectText]
-                  : [];
-
-            return {
-              id: `q_${Date.now()}_${idx + 1}`,
-              question: rawQ,
-              type: qType,
-              options: qOptions,
-              correctOptionIndex,
-              correctAnswerText: resolvedCorrectText,
-              acceptableAnswers: resolvedAcceptable,
-              explanation:
-                q.explanation ||
-                (detectedLang === "en"
-                  ? `Directly verified at [${resolvedTs}] from the transcript.`
-                  : `موثق ومستخرج مباشرة من نص الجلسة عند [${resolvedTs}].`),
-              difficulty: (["easy", "medium", "hard"].includes(q.difficulty || "")
-                ? q.difficulty
-                : requestedDifficulty && requestedDifficulty !== "all"
-                  ? requestedDifficulty
-                  : "medium") as "easy" | "medium" | "hard",
-              sectionRef:
-                q.sectionRef || (detectedLang === "en" ? "Transcript Section" : "محاور الجلسة"),
-              timestampRef: resolvedTs,
-              sourceReference: `${q.sectionRef || "Transcript"} [${resolvedTs}]`,
-              sourceTranscriptSegment: resolvedQuote,
-              groundingVerified: true,
-            };
-          })
-          .filter((item): item is NonNullable<typeof item> => Boolean(item && item.question));
-
-        if (verifiedQuestions.length > 0) {
-          const cappedQuestions = verifiedQuestions.slice(0, Math.min(20, requestedCount));
-          const finalResult = {
-            title:
-              detectedLang === "en"
-                ? `Comprehension Quiz (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`
-                : `اختبار الفهم الشامل (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`,
-            courseCode,
-            questions: cappedQuestions,
-          };
-          logObservabilityEvent("info", "quiz_generation_completed", {
-            title,
-            provider: "gemini",
-            questionsCount: cappedQuestions.length,
-          });
-          if (canUseCache) {
-            setCachedAiAnalysis(cacheHash, "quiz", config.textModel, finalResult);
-          }
-          return finalResult;
+      // Targeted regeneration pass when validation filtered out invalid/duplicate questions
+      const minSatisfactory = Math.min(
+        requestedCount,
+        Math.max(3, Math.floor(requestedCount * 0.75)),
+      );
+      if (cloudVerifiedQuestions.length > 0 && cloudVerifiedQuestions.length < minSatisfactory) {
+        const missingCount = requestedCount - cloudVerifiedQuestions.length;
+        try {
+          const { result: regenResp } = await executeWithRetryAndFallback(
+            "regenerateFilteredQuizQuestions",
+            async (model) =>
+              ai.models.generateContent({
+                model,
+                contents: buildExamPrompt(
+                  missingCount + 2,
+                  cloudVerifiedQuestions.map((q) => q.question),
+                ),
+                config: {
+                  responseMimeType: "application/json",
+                  temperature: 0.25,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                },
+              }),
+            {
+              primaryModel: config.textModel,
+              fallbackModel: config.fallbackTextModel,
+              maxRetries: 0,
+              timeoutMs: 22000,
+            },
+          );
+          const regenExtracted = extractJsonFromLlmOutput<unknown>(regenResp.text || "");
+          const regenRawList = Array.isArray(regenExtracted)
+            ? regenExtracted
+            : regenExtracted &&
+                typeof regenExtracted === "object" &&
+                Array.isArray((regenExtracted as { questions?: unknown[] }).questions)
+              ? (regenExtracted as { questions: unknown[] }).questions
+              : [];
+          const regenVerified = validateAndNormalizeQuizQuestions(
+            regenRawList,
+            segments,
+            targetLang,
+            {
+              avoidQuestionTitles: [
+                ...(options?.avoidQuestionTitles || []),
+                ...cloudVerifiedQuestions.map((q) => q.question),
+              ],
+              requestedDifficulty: options?.difficulty,
+              idPrefix: "q_regen",
+            },
+          );
+          cloudVerifiedQuestions = [...cloudVerifiedQuestions, ...regenVerified];
+        } catch {
+          // Non-fatal: deterministic section-aware supplement below fills remaining supported slots
         }
+      }
+
+      if (cloudVerifiedQuestions.length > 0) {
+        // Supplement any remaining supported slots from deterministic section-distributed engine (deduplicated)
+        if (cloudVerifiedQuestions.length < requestedCount) {
+          const supplement = buildBuiltInQuiz(title, segments, {
+            courseCode,
+            appLanguage: targetLang,
+            transcriptLanguage: transcriptLang,
+            numQuestions: requestedCount,
+            variant,
+            avoidQuestionTitles: [
+              ...(options?.avoidQuestionTitles || []),
+              ...cloudVerifiedQuestions.map((q) => q.question),
+            ],
+            difficulty: options?.difficulty,
+          });
+          for (const cand of supplement.questions) {
+            if (cloudVerifiedQuestions.length >= requestedCount) break;
+            if (
+              !cloudVerifiedQuestions.some((existing) =>
+                areQuestionsSemanticallySimilar(existing, cand),
+              )
+            ) {
+              cloudVerifiedQuestions.push(cand);
+            }
+          }
+        }
+
+        const cappedQuestions = cloudVerifiedQuestions
+          .slice(0, Math.min(20, requestedCount))
+          .map((q, i) => ({
+            ...q,
+            questionNumber: i + 1,
+          }));
+        const finalResult = {
+          language: targetLang,
+          transcriptLanguage: transcriptLang,
+          title: isEnglish
+            ? `Comprehensive Academic Exam (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`
+            : `اختبار الفهم الأكاديمي الشامل (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`,
+          courseCode,
+          questions: cappedQuestions,
+        };
+        logObservabilityEvent("info", "quiz_generation_completed", {
+          title,
+          provider: "gemini",
+          language: targetLang,
+          questionsCount: cappedQuestions.length,
+        });
+        if (canUseCache) {
+          setCachedAiAnalysis(cacheHash, "quiz", config.textModel, finalResult);
+        }
+        return finalResult;
       }
     } catch (e) {
       suspendGeminiIfUnavailableError(e);
@@ -1975,270 +2364,28 @@ ${summaryText || ""}
     }
   }
 
-  // Hybrid Fast-Path: when the transcript has dense structured specs/entities/definitions/cloze
-  // facts that already satisfy requestedCount with zero raw-clause fallbacks, return instantaneously (<10ms).
-  const builtInQuizCandidate = buildBuiltInQuiz(title, segments, {
+  // Deterministic Whole-Transcript 6-Level University Quiz Engine (<15ms, 100% grounded, zero translation drift)
+  const builtInQuizResult = buildBuiltInQuiz(title, segments, {
     courseCode,
-    appLanguage: isEnglish ? "en" : "ar",
-    numQuestions: requestedCount,
+    appLanguage: targetLang,
+    transcriptLanguage: transcriptLang,
+    numQuestions: Math.min(20, requestedCount),
     variant,
     avoidQuestionTitles: options?.avoidQuestionTitles,
     difficulty: options?.difficulty,
   });
-  const highSignalBuiltInCount = builtInQuizCandidate.questions.filter(
-    (q) => !q.id.startsWith("q_tf_cl_"),
-  ).length;
-  if (
-    highSignalBuiltInCount >= requestedCount &&
-    builtInQuizCandidate.questions.length >= requestedCount
-  ) {
-    if (canUseCache) {
-      setCachedAiAnalysis(cacheHash, "quiz", "meetmind-grounded-hybrid", builtInQuizCandidate);
-    }
-    return builtInQuizCandidate;
-  }
 
-  // Tier 2: Real Embedded Local LLM Quiz Generator (for prose/conceptual transcripts lacking structured specs)
-  const allowLocalQuizLlm =
-    !options?.fastFallback || process.env.ENABLE_LOCAL_LLM_BATCH_ANALYSIS === "true";
-  const localTranscript = allowLocalQuizLlm
-    ? formatCompactTranscriptForLocalLlm(segments, 1500)
-    : "";
-  if (localTranscript && segments.length > 0) {
-    const llmQuestionCount = Math.min(requestedCount, 2);
-    const localQuizSystem = isEnglish
-      ? "You are an exam designer for MeetMind AI. Write concise factual MCQ questions strictly from the transcript. Copy exact figures and terms from the transcript for correctAnswer."
-      : "أنت مصمم اختبارات في MeetMind AI. اكتب أسئلة اختيار من متعدد دقيقة مبنية حصراً على النص المفرغ. انسخ القيمة أو المصطلح الحقيقي من النص تماماً في حقل correctAnswer بدون أي تغيير أو اختلاق.";
-
-    const localQuizUser = isEnglish
-      ? `Create ${llmQuestionCount} MCQ questions strictly from "${title}":\n"""\n${localTranscript}\n"""\n\nReturn ONLY a JSON array where each object has: question (string), correctAnswer (exact short fact/value from transcript), distractors (array of 3 plausible WRONG strings distinct from correctAnswer), explanation (1 short sentence).`
-      : `أنشئ ${llmQuestionCount} أسئلة اختيار من متعدد باللغة العربية مبنية حصراً على الحقائق والأرقام في النص التالي لتسجيل «${title}»:\n"""\n${localTranscript}\n"""\n\nأخرج مصفوفة JSON فقط، كل عنصر به الحقول: question (سؤال واضح)، correctAnswer (الإجابة الصحيحة القصيرة والمطابقة تماماً للنص)، distractors (مصفوفة من 3 خيارات خاطئة ومختلفة تماماً)، explanation (جملة قصيرة).`;
-
-    const parsedLocalQuiz = await generateLocalLlmJson<unknown>({
-      systemPrompt: localQuizSystem,
-      userPrompt: localQuizUser,
-      maxNewTokens: 165,
-      timeoutMs: 30000,
-    });
-
-    const rawList = Array.isArray(parsedLocalQuiz)
-      ? parsedLocalQuiz
-      : parsedLocalQuiz &&
-          typeof parsedLocalQuiz === "object" &&
-          Array.isArray((parsedLocalQuiz as { questions?: unknown[] }).questions)
-        ? (parsedLocalQuiz as { questions: unknown[] }).questions
-        : [];
-
-    if (rawList.length > 0) {
-      const seenQuestions = new Set<string>(
-        (options?.avoidQuestionTitles || []).map((q) => normalizeArabicAndLatin(q)),
-      );
-      const transcriptNorm = normalizeText(segments.map((s) => s.text).join(" "));
-      const transcriptTokenSet = new Set(transcriptNorm.split(" ").filter(Boolean));
-
-      const isAnswerGroundedInTranscript = (ans: string): boolean => {
-        const normAns = normalizeText(ans);
-        if (!normAns) return false;
-        if (transcriptNorm.includes(normAns)) return true;
-        const toks = normAns.split(" ").filter((t) => t.length >= 2 || /\d/.test(t));
-        if (toks.length === 0) return false;
-        // Every numeric token in the correct answer MUST appear in the transcript (blocks hallucinated 800000 vs 7)
-        const numToks = toks.filter((t) => /\d/.test(t));
-        if (numToks.some((nt) => !transcriptTokenSet.has(nt) && !transcriptNorm.includes(nt))) {
-          return false;
-        }
-        const matched = toks.filter(
-          (t) => transcriptTokenSet.has(t) || (t.length >= 4 && transcriptNorm.includes(t)),
-        );
-        return matched.length / toks.length >= 0.5;
-      };
-
-      const verifiedLocal = rawList
-        .map((item, idx) => {
-          if (!item || typeof item !== "object") return null;
-          const q = item as Record<string, unknown>;
-          const rawQ = String(q.question || "").trim();
-          if (rawQ.length < 10) return null;
-          const normQ = normalizeArabicAndLatin(rawQ);
-          if (seenQuestions.has(normQ)) return null;
-          seenQuestions.add(normQ);
-
-          const qType: "multiple_choice" | "true_false" =
-            q.type === "true_false" ? "true_false" : "multiple_choice";
-
-          let qOptions: string[] = [];
-          let correctOptionIndex = 0;
-
-          if (qType === "multiple_choice") {
-            const explicitCorrect =
-              typeof q.correctAnswer === "string" ? q.correctAnswer.trim() : "";
-            const explicitDistractors = Array.isArray(q.distractors)
-              ? q.distractors.map((d: unknown) => String(d || "").trim()).filter(Boolean)
-              : [];
-
-            if (explicitCorrect && explicitDistractors.length >= 3) {
-              if (!isAnswerGroundedInTranscript(explicitCorrect)) return null;
-              const seenOptNorms = new Set<string>([normalizeArabicAndLatin(explicitCorrect)]);
-              const cleanDistractors: string[] = [];
-              for (const d of explicitDistractors) {
-                const dn = normalizeArabicAndLatin(d);
-                if (dn && !seenOptNorms.has(dn)) {
-                  seenOptNorms.add(dn);
-                  cleanDistractors.push(d);
-                }
-              }
-              if (cleanDistractors.length < 3) return null;
-              // Deterministically rotate correct option slot so correct answer isn't always index 0
-              const slot = (idx + variant) % 4;
-              const ordered = [explicitCorrect, ...cleanDistractors.slice(0, 3)];
-              const tmp = ordered[0];
-              ordered[0] = ordered[slot];
-              ordered[slot] = tmp;
-              qOptions = ordered;
-              correctOptionIndex = slot;
-            } else {
-              const rawOpts = Array.isArray(q.options)
-                ? q.options.map((o: unknown) => String(o || "").trim()).filter(Boolean)
-                : [];
-              const seenOptNorms = new Set<string>();
-              const uniqueOpts: string[] = [];
-              for (const o of rawOpts) {
-                const on = normalizeArabicAndLatin(o);
-                if (on && !seenOptNorms.has(on)) {
-                  seenOptNorms.add(on);
-                  uniqueOpts.push(o);
-                }
-              }
-              if (uniqueOpts.length < 4) return null;
-              qOptions = uniqueOpts.slice(0, 4);
-              correctOptionIndex =
-                typeof q.correctOptionIndex === "number" &&
-                Number.isInteger(q.correctOptionIndex) &&
-                q.correctOptionIndex >= 0 &&
-                q.correctOptionIndex < 4
-                  ? q.correctOptionIndex
-                  : 0;
-              // If the chosen index isn't grounded but another option IS grounded (off-by-one LLM bug), reject or fix only when unambiguous
-              if (!isAnswerGroundedInTranscript(qOptions[correctOptionIndex])) {
-                const groundedIdx = qOptions.findIndex((opt) => isAnswerGroundedInTranscript(opt));
-                if (groundedIdx === -1) return null;
-                correctOptionIndex = groundedIdx;
-              }
-            }
-          } else {
-            qOptions = isEnglish ? ["True", "False"] : ["صح (صواب)", "خطأ"];
-            correctOptionIndex = q.correctOptionIndex === 1 ? 1 : 0;
-          }
-
-          const verification = verifyQuizQuestionGrounding(
-            {
-              question: rawQ,
-              type: qType,
-              options: qOptions,
-              correctOptionIndex,
-              correctAnswerText: qOptions[correctOptionIndex],
-              explanation: typeof q.explanation === "string" ? q.explanation : undefined,
-              sourceTranscriptSegment:
-                typeof q.sourceTranscriptSegment === "string"
-                  ? q.sourceTranscriptSegment
-                  : undefined,
-            },
-            segments,
-          );
-          if (!verification.grounded) return null;
-
-          const resolvedTs =
-            (typeof q.timestampRef === "string" && q.timestampRef.trim()) ||
-            verification.matchedTimestamp ||
-            "00:00";
-          const resolvedQuote =
-            (typeof q.sourceTranscriptSegment === "string" && q.sourceTranscriptSegment.trim()) ||
-            verification.matchedSegmentText ||
-            "";
-
-          return {
-            id: `q_llm_${Date.now()}_${idx + 1}`,
-            question: rawQ,
-            type: qType,
-            options: qOptions,
-            correctOptionIndex,
-            correctAnswerText: qOptions[correctOptionIndex],
-            acceptableAnswers: [qOptions[correctOptionIndex]],
-            explanation:
-              (typeof q.explanation === "string" && q.explanation.trim()) ||
-              (isEnglish
-                ? `Verified directly in transcript at [${resolvedTs}].`
-                : `موثق مباشرةً في النص المفرغ عند [${resolvedTs}].`),
-            difficulty: (["easy", "medium", "hard"].includes(String(q.difficulty || ""))
-              ? String(q.difficulty)
-              : "medium") as "easy" | "medium" | "hard",
-            sectionRef:
-              (typeof q.sectionRef === "string" && q.sectionRef.trim()) ||
-              (isEnglish ? "Transcript Concept" : "محاور الجلسة"),
-            timestampRef: resolvedTs,
-            sourceReference: `${isEnglish ? "Transcript" : "النص المفرغ"} [${resolvedTs}]`,
-            sourceTranscriptSegment: resolvedQuote,
-            groundingVerified: true,
-          };
-        })
-        .filter((item): item is NonNullable<typeof item> => Boolean(item));
-
-      if (verifiedLocal.length > 0) {
-        let finalQuestions: Array<{
-          id: string;
-          question: string;
-          type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
-          options: string[];
-          correctOptionIndex: number;
-          correctAnswerText?: string;
-          acceptableAnswers?: string[];
-          explanation: string;
-          difficulty: "easy" | "medium" | "hard";
-          sectionRef: string;
-          timestampRef?: string;
-          sourceReference?: string;
-          sourceTranscriptSegment?: string;
-          groundingVerified?: boolean;
-        }> = verifiedLocal.slice(0, requestedCount);
-        if (finalQuestions.length < requestedCount) {
-          const topUp = buildBuiltInQuiz(title, segments, {
-            courseCode,
-            appLanguage: isEnglish ? "en" : "ar",
-            numQuestions: requestedCount - finalQuestions.length,
-            variant,
-            avoidQuestionTitles: [
-              ...(options?.avoidQuestionTitles || []),
-              ...finalQuestions.map((q) => q.question),
-            ],
-            difficulty: options?.difficulty,
-          });
-          finalQuestions = [...finalQuestions, ...topUp.questions].slice(0, requestedCount);
-        }
-
-        const localQuizResult = {
-          title: isEnglish
-            ? `Comprehension Quiz (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`
-            : `اختبار الفهم الشامل (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`,
-          courseCode,
-          questions: finalQuestions,
-        };
-        if (canUseCache) {
-          setCachedAiAnalysis(cacheHash, "quiz", getLocalLlmModelId(), localQuizResult);
-        }
-        return localQuizResult;
-      }
-    }
-  }
-
-  // Tier 3: Upgraded Grounded Concept & Specification Quiz Engine (no cache poison)
-  return buildBuiltInQuiz(title, segments, {
-    courseCode,
-    appLanguage: isEnglish ? "en" : "ar",
-    numQuestions: requestedCount,
-    variant,
-    avoidQuestionTitles: options?.avoidQuestionTitles,
-    difficulty: options?.difficulty,
+  logObservabilityEvent("info", "quiz_generation_completed", {
+    title,
+    provider: "meetmind-grounded-exam-engine",
+    language: targetLang,
+    questionsCount: builtInQuizResult.questions.length,
   });
+
+  if (canUseCache && builtInQuizResult.questions.length >= Math.min(4, requestedCount)) {
+    setCachedAiAnalysis(cacheHash, "quiz", "meetmind-grounded-hybrid", builtInQuizResult);
+  }
+  return builtInQuizResult;
 }
 
 // Generate Detailed Lecture/Meeting Analysis in Arabic
@@ -2248,6 +2395,7 @@ export async function generateAiLectureAnalysis(
   type: "meeting" | "lecture" = "lecture",
   courseCode?: string,
   appLanguage?: "en" | "ar",
+  transcriptLanguage?: TranscriptLanguage,
 ): Promise<{
   overview: string;
   topics: string[];
@@ -2259,16 +2407,19 @@ export async function generateAiLectureAnalysis(
   importantSentences: string[];
   reviewAreas: string[];
 }> {
-  const detectedLang = detectTranscriptLanguage(title, segments);
-  const targetLang = appLanguage || detectedLang || "en";
-  const isEnglish = targetLang === "en";
+  const { outputLang: targetLang, isEnglish } = resolveTaskLanguage({
+    title,
+    segments,
+    transcriptLanguage,
+    appLanguage,
+  });
   const ai = getGeminiClient();
 
   const cacheHash = computeTranscriptHash(
     "deep_analysis",
     title,
     segments,
-    `${type}:${courseCode || ""}:${appLanguage || ""}`,
+    `${type}:${courseCode || ""}:${targetLang}`,
   );
   const cached = getCachedAiAnalysis<{
     overview: string;
@@ -2389,7 +2540,7 @@ ${preparedTranscript}
         segments,
         type,
         courseCode,
-        appLanguage,
+        targetLang,
       ).executiveSummary;
       const finalResult = {
         overview:
@@ -2435,7 +2586,7 @@ ${preparedTranscript}
     segments,
     type,
     courseCode,
-    appLanguage,
+    targetLang,
   );
   setCachedAiAnalysis(cacheHash, "deep_analysis", "meetmind-analytical-hybrid", builtInAnalysis);
   return builtInAnalysis;
@@ -3237,6 +3388,7 @@ export async function generateAiFlashcards(
   summaryText?: string,
   courseCode?: string,
   appLanguage?: "en" | "ar",
+  transcriptLanguage?: TranscriptLanguage,
 ): Promise<
   Array<{
     front: string;
@@ -3246,16 +3398,19 @@ export async function generateAiFlashcards(
     difficulty?: "easy" | "medium" | "hard";
   }>
 > {
-  const detectedLang = detectTranscriptLanguage(title, segments);
-  const targetLang = appLanguage || detectedLang || "en";
-  const isEnglish = targetLang === "en";
+  const { outputLang: targetLang, isEnglish } = resolveTaskLanguage({
+    title,
+    segments,
+    transcriptLanguage,
+    appLanguage,
+  });
   const ai = getGeminiClient();
 
   const cacheHash = computeTranscriptHash(
     "flashcards",
     title,
     segments,
-    `${courseCode || ""}:${appLanguage || ""}`,
+    `${courseCode || ""}:${targetLang}`,
   );
   const cached = getCachedAiAnalysis<
     Array<{
@@ -3403,7 +3558,7 @@ ${summaryText || ""}
   }
 
   // Hybrid Fast-Path: sub-second grounded concept flashcards engine (definitions, specs, key clauses)
-  const builtInCards = buildBuiltInFlashcards(title, segments, courseCode, appLanguage);
+  const builtInCards = buildBuiltInFlashcards(title, segments, courseCode, targetLang);
   if (builtInCards.length > 0) {
     setCachedAiAnalysis(cacheHash, "flashcards", "meetmind-analytical-hybrid", builtInCards);
   }
@@ -3417,17 +3572,21 @@ export async function generateAiMindMap(
   summaryText?: string,
   courseCode?: string,
   appLanguage?: "en" | "ar",
+  transcriptLanguage?: TranscriptLanguage,
 ): Promise<MindMapNode> {
-  const detectedLang = detectTranscriptLanguage(title, segments);
-  const targetLang = appLanguage || detectedLang || "en";
-  const isEnglish = targetLang === "en";
+  const { outputLang: targetLang, isEnglish } = resolveTaskLanguage({
+    title,
+    segments,
+    transcriptLanguage,
+    appLanguage,
+  });
   const ai = getGeminiClient();
 
   const cacheHash = computeTranscriptHash(
     "mindmap",
     title,
     segments,
-    `${courseCode || ""}:${appLanguage || ""}`,
+    `${courseCode || ""}:${targetLang}`,
   );
   const cached = getCachedAiAnalysis<MindMapNode>(cacheHash);
   if (cached) return cached;
@@ -3528,7 +3687,7 @@ ${summaryText || ""}
   }
 
   // Hybrid Fast-Path: sub-second hierarchical mind map engine grounded in extracted facts & themes
-  const builtInMap = buildBuiltInMindMap(title, segments, courseCode, appLanguage);
+  const builtInMap = buildBuiltInMindMap(title, segments, courseCode, targetLang);
   setCachedAiAnalysis(cacheHash, "mindmap", "meetmind-analytical-hybrid", builtInMap);
   return builtInMap;
 }
@@ -3567,24 +3726,11 @@ export interface UnifiedRecordingAnalysisResult {
   examHints: string[];
   notes: string[];
   quiz: {
+    language: "ar" | "en";
+    transcriptLanguage: TranscriptLanguage;
     title: string;
     courseCode?: string;
-    questions: Array<{
-      id: string;
-      question: string;
-      type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
-      options: string[];
-      correctOptionIndex: number;
-      correctAnswerText?: string;
-      acceptableAnswers?: string[];
-      explanation: string;
-      difficulty: "easy" | "medium" | "hard";
-      sectionRef: string;
-      timestampRef?: string;
-      sourceReference?: string;
-      sourceTranscriptSegment?: string;
-      groundingVerified?: boolean;
-    }>;
+    questions: NormalizedQuizQuestion[];
   };
   flashcards: Array<{
     front: string;
@@ -3716,11 +3862,19 @@ export async function generateUnifiedRecordingAnalysis(params: {
   resourceType: "meeting" | "lecture";
   courseCode?: string;
   appLanguage?: "en" | "ar";
+  transcriptLanguage?: TranscriptLanguage;
 }): Promise<UnifiedRecordingAnalysisResult> {
-  const { title, segments, resourceType, courseCode, appLanguage } = params;
-  const detectedLang = detectTranscriptLanguage(title, segments);
-  const targetLang = appLanguage || detectedLang || "en";
-  const isEnglish = targetLang === "en";
+  const { title, segments, resourceType, courseCode, appLanguage, transcriptLanguage } = params;
+  const {
+    transcriptLang,
+    outputLang: targetLang,
+    isEnglish,
+  } = resolveTaskLanguage({
+    title,
+    segments,
+    transcriptLanguage,
+    appLanguage,
+  });
 
   const transcriptHash = computeTranscriptHash("transcript", "", segments, "");
   const analysisHash = computeTranscriptHash(
@@ -3735,13 +3889,7 @@ export async function generateUnifiedRecordingAnalysis(params: {
     return { ...cached, cacheHit: true, transcriptHash, analysisHash };
   }
 
-  const totalWords = segments
-    .map((s) => s.text)
-    .join(" ")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean).length;
-  const targetQuizCount = totalWords < 60 ? 4 : totalWords < 180 ? 6 : totalWords < 400 ? 8 : 10;
+  const targetQuizCount = computeSupportedQuestionCount(segments);
 
   const ai = getGeminiClient();
   if (ai && segments.length > 0) {
@@ -3892,87 +4040,12 @@ ${preparedTranscript}
           : [];
 
         const rawQuiz = Array.isArray(raw.quiz) ? raw.quiz : [];
-        const seenQ = new Set<string>();
-        const verifiedQuizQuestions = rawQuiz
-          .map((qObj, idx) => {
-            if (!qObj || typeof qObj !== "object") return null;
-            const q = qObj as Record<string, unknown>;
-            const rawQ = String(q.question || "").trim();
-            if (rawQ.length < 5) return null;
-            const normQ = normalizeArabicAndLatin(rawQ);
-            if (seenQ.has(normQ)) return null;
-            seenQ.add(normQ);
-
-            const qType: "multiple_choice" | "true_false" =
-              q.type === "true_false" ? "true_false" : "multiple_choice";
-            let qOptions: string[];
-            let correctIdx =
-              typeof q.correctOptionIndex === "number" && Number.isInteger(q.correctOptionIndex)
-                ? q.correctOptionIndex
-                : 0;
-
-            if (qType === "multiple_choice") {
-              const opts = Array.isArray(q.options)
-                ? Array.from(new Set(q.options.map((o) => String(o || "").trim()).filter(Boolean)))
-                : [];
-              if (opts.length < 4) return null;
-              qOptions = opts.slice(0, 4);
-              if (correctIdx < 0 || correctIdx >= 4) correctIdx = 0;
-            } else {
-              qOptions = isEnglish ? ["True", "False"] : ["صح", "خطأ"];
-              if (correctIdx !== 0 && correctIdx !== 1) correctIdx = 0;
-            }
-
-            const verification = verifyQuizQuestionGrounding(
-              {
-                question: rawQ,
-                type: qType,
-                options: qOptions,
-                correctOptionIndex: correctIdx,
-                correctAnswerText: qOptions[correctIdx],
-                explanation: typeof q.explanation === "string" ? q.explanation : undefined,
-                sourceTranscriptSegment:
-                  typeof q.sourceTranscriptSegment === "string"
-                    ? q.sourceTranscriptSegment
-                    : undefined,
-              },
-              segments,
-            );
-            if (!verification.grounded) return null;
-
-            const ts =
-              (typeof q.timestamp === "string" && q.timestamp.trim()) ||
-              verification.matchedTimestamp ||
-              "00:00";
-            return {
-              id: `q_uni_${Date.now()}_${idx + 1}`,
-              question: rawQ,
-              type: qType,
-              options: qOptions,
-              correctOptionIndex: correctIdx,
-              correctAnswerText: qOptions[correctIdx],
-              acceptableAnswers: [qOptions[correctIdx]],
-              explanation:
-                (typeof q.explanation === "string" && q.explanation.trim()) ||
-                (isEnglish
-                  ? `Verified directly at [${ts}] from the transcript.`
-                  : `موثق مباشرة من النص المفرغ عند [${ts}].`),
-              difficulty: (["easy", "medium", "hard"].includes(String(q.difficulty || ""))
-                ? String(q.difficulty)
-                : "medium") as "easy" | "medium" | "hard",
-              sectionRef: topics[0] || (isEnglish ? "Recording Transcript" : "محاور الجلسة"),
-              timestampRef: ts,
-              sourceReference: `${isEnglish ? "Transcript" : "النص المفرغ"} [${ts}]`,
-              sourceTranscriptSegment:
-                (typeof q.sourceTranscriptSegment === "string" &&
-                  q.sourceTranscriptSegment.trim()) ||
-                verification.matchedSegmentText ||
-                "",
-              groundingVerified: true,
-            };
-          })
-          .filter((x): x is NonNullable<typeof x> => Boolean(x))
-          .slice(0, 20);
+        const verifiedQuizQuestions = validateAndNormalizeQuizQuestions(
+          rawQuiz,
+          segments,
+          targetLang,
+          { idPrefix: "q_uni" },
+        ).slice(0, 20);
 
         const detailedSummary = formatDetailedSummaryLocally({
           isEnglish,
@@ -4024,21 +4097,26 @@ ${preparedTranscript}
           examHints,
           notes,
           quiz: {
-            title: isEnglish ? `Comprehension Quiz: ${title}` : `اختبار الفهم الشامل: ${title}`,
+            language: targetLang,
+            transcriptLanguage: transcriptLang,
+            title: isEnglish
+              ? `Comprehensive Academic Exam: ${title}`
+              : `اختبار الفهم الأكاديمي الشامل: ${title}`,
             courseCode,
             questions:
               verifiedQuizQuestions.length > 0
                 ? verifiedQuizQuestions
                 : buildBuiltInQuiz(title, segments, {
                     courseCode,
-                    appLanguage: isEnglish ? "en" : "ar",
+                    appLanguage: targetLang,
+                    transcriptLanguage: transcriptLang,
                     numQuestions: targetQuizCount,
                   }).questions,
           },
           flashcards:
             flashcards.length > 0
               ? flashcards
-              : buildBuiltInFlashcards(title, segments, courseCode, isEnglish ? "en" : "ar"),
+              : buildBuiltInFlashcards(title, segments, courseCode, targetLang),
           mindMap,
         };
 
@@ -4059,32 +4137,22 @@ ${preparedTranscript}
   }
 
   // Ultra-fast grounded deterministic analytical fallback (<50ms on a 14-min transcript — ZERO 25s CPU LLM queue stall!)
-  const builtInSummary = buildBuiltInSummary(
-    title,
-    segments,
-    resourceType,
-    courseCode,
-    appLanguage,
-  );
+  const builtInSummary = buildBuiltInSummary(title, segments, resourceType, courseCode, targetLang);
   const builtInDeep = buildBuiltInLectureAnalysis(
     title,
     segments,
     resourceType,
     courseCode,
-    appLanguage,
+    targetLang,
   );
   const builtInQuiz = buildBuiltInQuiz(title, segments, {
     courseCode,
-    appLanguage: isEnglish ? "en" : "ar",
+    appLanguage: targetLang,
+    transcriptLanguage: transcriptLang,
     numQuestions: targetQuizCount,
   });
-  const builtInFlashcards = buildBuiltInFlashcards(
-    title,
-    segments,
-    courseCode,
-    isEnglish ? "en" : "ar",
-  );
-  const builtInMindMap = buildBuiltInMindMap(title, segments, courseCode, appLanguage);
+  const builtInFlashcards = buildBuiltInFlashcards(title, segments, courseCode, targetLang);
+  const builtInMindMap = buildBuiltInMindMap(title, segments, courseCode, targetLang);
 
   const deadlines = builtInSummary.actionItems
     .map((a) => a.dueDate)

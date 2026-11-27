@@ -93,6 +93,7 @@ async function main() {
           "tests/theme.test.mjs",
           "tests/chat-engine.test.mjs",
           "tests/n8n-assemblyai-integration.test.mjs",
+          "tests/quiz-and-cleanup.test.mjs",
         ];
 
   console.log(`Running tests against ${testUrl}: ${testFiles.join(", ")}`);

@@ -59,7 +59,12 @@ import {
   transcribeAudioWithAssemblyAi,
   type AssemblyAiSpeakerStat,
 } from "./assemblyai";
-import { buildTranscriptArtifacts } from "./transcript-format";
+import {
+  buildTranscriptArtifacts,
+  resolveOutputLanguageFromTranscript,
+  resolveTranscriptLanguage,
+  type TranscriptLanguage,
+} from "./transcript-format";
 import { executeN8nAudioWorkflow, getN8nConfig, type N8nWorkflowResult } from "./n8n-integration";
 import {
   createCorrelationId,
@@ -1132,6 +1137,17 @@ async function persistN8nWorkflowResult(params: {
   const rawSegments = artifacts.rawSegments;
   const rawTranscript = artifacts.rawTranscript;
   const processedTranscript = artifacts.processedTranscript;
+  const transcriptLanguage: TranscriptLanguage = resolveTranscriptLanguage({
+    segments,
+    rawTranscript,
+    title,
+    languageHint: transcript.language,
+  });
+  const quizLanguage = resolveOutputLanguageFromTranscript(
+    transcriptLanguage,
+    segments,
+    appLanguage,
+  );
   const averageConfidence = transcript.averageConfidence ?? artifacts.averageConfidence;
   const asrModel = transcript.asrModel || getConfiguredAssemblyAiSpeechModels().join(",");
   const diarizationEnabled = transcript.diarizationEnabled !== false;
@@ -1187,6 +1203,7 @@ async function persistN8nWorkflowResult(params: {
               analysisProvider: "n8n",
               correlationId,
               language: transcript.language,
+              transcriptLanguage,
               appLanguage: appLanguage || m.appLanguage,
               durationSeconds: Math.max(1, transcript.durationSeconds, m.durationSeconds || 1),
               summary: analysis.summary || undefined,
@@ -1238,6 +1255,7 @@ async function persistN8nWorkflowResult(params: {
               analysisProvider: "n8n",
               correlationId,
               language: transcript.language,
+              transcriptLanguage,
               appLanguage: appLanguage || l.appLanguage,
               durationSeconds: Math.max(1, transcript.durationSeconds, l.durationSeconds || 1),
               studyNotes: analysis.notes.length ? analysis.notes.join("\n") : analysis.summary,
@@ -1289,12 +1307,14 @@ async function persistN8nWorkflowResult(params: {
   }
 
   if (analysis.quiz.length > 0) {
-    const isAr = transcript.language.startsWith("ar") || /[\u0600-\u06FF]/.test(transcript.text);
+    const isAr = quizLanguage === "ar";
     db.update("quizzes", (quizzes) => [
       {
         id: `quiz_n8n_${jobId}`,
         ...(resourceType === "meeting" ? { meetingId: resourceId } : { lectureId: resourceId }),
-        title: isAr ? `اختبار الفهم: ${title}` : `Comprehension Quiz: ${title}`,
+        language: quizLanguage,
+        transcriptLanguage,
+        title: isAr ? `اختبار الفهم الأكاديمي: ${title}` : `Comprehensive Academic Exam: ${title}`,
         courseCode,
         questions: analysis.quiz,
         attemptsCount: 0,
@@ -3244,6 +3264,12 @@ export async function runUnifiedPostTranscriptionPipeline(
   const finalTranscript = processedTranscript;
   const rawSegments = incomingRawSegments || artifacts.rawSegments;
   const averageConfidence = incomingAverageConfidence ?? artifacts.averageConfidence;
+  const transcriptLanguage: TranscriptLanguage = resolveTranscriptLanguage({
+    segments,
+    rawTranscript,
+    title,
+    languageHint: language,
+  });
   const fullText = processedTranscript;
   const runId = jobId || `live_${resourceId}_${Date.now()}`;
   const liveMilestones: NonNullable<JobRecord["milestones"]> = {
@@ -3361,6 +3387,7 @@ export async function runUnifiedPostTranscriptionPipeline(
           diarizationEnabled: diarizationEnabled ?? m.diarizationEnabled,
           averageConfidence: averageConfidence ?? m.averageConfidence,
           language,
+          transcriptLanguage,
           appLanguage:
             appLanguage || (language === "ar" ? "ar" : language === "en" ? "en" : undefined),
           durationSeconds: Math.max(1, durationSeconds, m.durationSeconds || 1),
@@ -3396,6 +3423,7 @@ export async function runUnifiedPostTranscriptionPipeline(
           diarizationEnabled: diarizationEnabled ?? l.diarizationEnabled,
           averageConfidence: averageConfidence ?? l.averageConfidence,
           language,
+          transcriptLanguage,
           appLanguage:
             appLanguage || (language === "ar" ? "ar" : language === "en" ? "en" : undefined),
           durationSeconds: Math.max(1, durationSeconds, l.durationSeconds || 1),
@@ -3443,6 +3471,7 @@ export async function runUnifiedPostTranscriptionPipeline(
           resourceType,
           courseCode,
           appLanguage,
+          transcriptLanguage,
         }));
 
       analysis = unified.summary;
@@ -3602,7 +3631,7 @@ export async function runUnifiedPostTranscriptionPipeline(
                   resourceType,
                   courseCode,
                   appLanguage,
-                  { fastFallback: true },
+                  { fastFallback: true, transcriptLanguage },
                 );
                 const durMs = Math.max(1, Date.now() - t0);
                 if (sharedTimings) {
@@ -3689,7 +3718,14 @@ export async function runUnifiedPostTranscriptionPipeline(
           () =>
             withStageTimeout(
               () =>
-                generateAiLectureAnalysis(title, segments, resourceType, courseCode, appLanguage),
+                generateAiLectureAnalysis(
+                  title,
+                  segments,
+                  resourceType,
+                  courseCode,
+                  appLanguage,
+                  transcriptLanguage,
+                ),
               "deep_analysis",
               45000,
             ),
@@ -3699,6 +3735,7 @@ export async function runUnifiedPostTranscriptionPipeline(
                 const t0 = Date.now();
                 const res = await generateAiQuiz(title, segments, undefined, courseCode, {
                   appLanguage,
+                  transcriptLanguage,
                   fastFallback: true,
                 });
                 const durMs = Math.max(1, Date.now() - t0);
@@ -3725,6 +3762,8 @@ export async function runUnifiedPostTranscriptionPipeline(
                       ...(resourceType === "meeting"
                         ? { meetingId: resourceId }
                         : { lectureId: resourceId }),
+                      language: res.language,
+                      transcriptLanguage: res.transcriptLanguage || transcriptLanguage,
                       title: res.title,
                       courseCode,
                       questions: res.questions,
@@ -3759,6 +3798,7 @@ export async function runUnifiedPostTranscriptionPipeline(
                   undefined,
                   courseCode,
                   appLanguage,
+                  transcriptLanguage,
                 );
                 const durMs = Math.max(1, Date.now() - t0);
                 if (sharedTimings) sharedTimings.flashcardsMs = durMs;
@@ -3815,7 +3855,15 @@ export async function runUnifiedPostTranscriptionPipeline(
             ),
           () =>
             withStageTimeout(
-              () => generateAiMindMap(title, segments, undefined, courseCode, appLanguage),
+              () =>
+                generateAiMindMap(
+                  title,
+                  segments,
+                  undefined,
+                  courseCode,
+                  appLanguage,
+                  transcriptLanguage,
+                ),
               "mindmap",
               45000,
             ),
@@ -4016,6 +4064,7 @@ export async function runUnifiedPostTranscriptionPipeline(
           correlationId,
           speakerBreakdown,
           language,
+          transcriptLanguage,
           durationSeconds: Math.max(1, durationSeconds, m.durationSeconds || 1),
           recordingPath: recordingPath || m.recordingPath,
           recordingFileName: recordingFileName || m.recordingFileName,
@@ -4087,6 +4136,10 @@ export async function runUnifiedPostTranscriptionPipeline(
         {
           id: `quiz_${runId}`,
           meetingId: resourceId,
+          language:
+            generatedQuiz.language ||
+            resolveOutputLanguageFromTranscript(transcriptLanguage, segments, appLanguage),
+          transcriptLanguage,
           title: generatedQuiz.title,
           questions: generatedQuiz.questions,
           attemptsCount: 0,
@@ -4162,6 +4215,7 @@ export async function runUnifiedPostTranscriptionPipeline(
           correlationId,
           speakerBreakdown,
           language,
+          transcriptLanguage,
           durationSeconds: Math.max(1, durationSeconds, l.durationSeconds || 1),
           recordingPath: recordingPath || l.recordingPath,
           recordingFileName: recordingFileName || l.recordingFileName,
@@ -4210,6 +4264,10 @@ export async function runUnifiedPostTranscriptionPipeline(
         {
           id: `quiz_${runId}`,
           lectureId: resourceId,
+          language:
+            generatedQuiz.language ||
+            resolveOutputLanguageFromTranscript(transcriptLanguage, segments, appLanguage),
+          transcriptLanguage,
           title: generatedQuiz.title,
           courseCode,
           questions: generatedQuiz.questions,

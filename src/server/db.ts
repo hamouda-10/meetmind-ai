@@ -235,6 +235,7 @@ export interface MeetingRecord {
   analysisProvider?: "n8n" | "gemini" | "local-llm" | "analytical";
   correlationId?: string;
   language?: string;
+  transcriptLanguage?: "ar" | "en" | "mixed";
   appLanguage?: "en" | "ar";
   recordingPath?: string;
   recordingFileName?: string;
@@ -302,6 +303,7 @@ export interface LectureRecord {
   analysisProvider?: "n8n" | "gemini" | "local-llm" | "analytical";
   correlationId?: string;
   language?: string;
+  transcriptLanguage?: "ar" | "en" | "mixed";
   appLanguage?: "en" | "ar";
   recordingPath?: string;
   recordingFileName?: string;
@@ -367,10 +369,14 @@ export interface RecordingSessionRecord {
 
 export interface QuizQuestionRecord {
   id: string;
+  questionNumber?: number;
   question: string;
   type?: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
+  schemaType?: "mcq" | "true_false";
+  cognitiveLevel?: "direct" | "conceptual" | "comparison" | "application" | "analysis" | "deep";
   options: string[];
   correctOptionIndex: number;
+  correctAnswer?: string | boolean;
   correctAnswerText?: string;
   acceptableAnswers?: string[];
   explanation: string;
@@ -379,6 +385,7 @@ export interface QuizQuestionRecord {
   timestampRef?: string;
   sourceReference?: string;
   sourceTranscriptSegment?: string;
+  sourceSegmentIds?: string[];
   groundingVerified?: boolean;
 }
 
@@ -400,6 +407,8 @@ export interface QuizRecord {
   meetingId?: string;
   title: string;
   courseCode?: string;
+  language?: "ar" | "en";
+  transcriptLanguage?: "ar" | "en" | "mixed";
   questions: QuizQuestionRecord[];
   attemptsCount: number;
   lastScore?: number;
@@ -502,6 +511,7 @@ export interface JobRecord {
   originalFilename?: string;
   fileSha256?: string;
   language?: string;
+  transcriptLanguage?: "ar" | "en" | "mixed";
   appLanguage?: "en" | "ar";
   retryCount?: number;
   maxRetries?: number;

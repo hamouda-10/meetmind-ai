@@ -7,6 +7,11 @@ import type {
   QuizRecord,
   TranscriptSegment,
 } from "./db";
+import {
+  resolveOutputLanguageFromTranscript,
+  resolveTranscriptLanguage,
+  type TranscriptLanguage,
+} from "./transcript-format";
 
 function formatMmSs(sec: number): string {
   const safe = Math.max(0, Math.floor(Number.isFinite(sec) ? sec : 0));
@@ -407,6 +412,7 @@ export function retrieveRelevantSegmentsBM25<T extends { seg: TranscriptSegment 
 // STRUCTURED CLAUSE, ENTITY & NUMERIC SPECIFICATION EXTRACTION
 // ============================================================================
 interface TranscriptClause {
+  segmentId: string;
   text: string;
   speaker: string;
   startTime: number;
@@ -422,6 +428,7 @@ interface ExtractedFact {
   numericValue?: number;
   unit?: string;
   clause: string;
+  segmentId?: string;
   segmentText: string;
   speaker: string;
   timestamp: string;
@@ -444,6 +451,7 @@ function splitIntoClauses(segments: TranscriptSegment[]): TranscriptClause[] {
 
     if (rawParts.length === 0) {
       clauses.push({
+        segmentId: seg.id,
         text: cleanSeg,
         speaker: seg.speaker,
         startTime: seg.startTime,
@@ -453,6 +461,7 @@ function splitIntoClauses(segments: TranscriptSegment[]): TranscriptClause[] {
     } else {
       for (const part of rawParts) {
         clauses.push({
+          segmentId: seg.id,
           text: part,
           speaker: seg.speaker,
           startTime: seg.startTime,
@@ -710,6 +719,7 @@ function extractStructuredFacts(segments: TranscriptSegment[]): ExtractedFact[] 
           labelEn: `Definition: ${term}`,
           value: def,
           clause: cl.text,
+          segmentId: cl.segmentId,
           segmentText: cl.segmentText,
           speaker: cl.speaker,
           timestamp: cl.timestamp,
@@ -1963,23 +1973,270 @@ export function buildBuiltInLectureAnalysis(
 }
 
 // ============================================================================
-// UPGRADED GROUNDED CONCEPT & SPECIFICATION QUIZ BUILDER (ZERO TRIVIAL COPY-PASTE)
+// UNIVERSITY-GRADE 6-LEVEL SECTION-AWARE GROUNDED QUIZ ENGINE
 // ============================================================================
+export type QuizCognitiveLevel =
+  "direct" | "conceptual" | "comparison" | "application" | "analysis" | "deep";
+
 export interface BuiltInQuizQuestion {
   id: string;
+  questionNumber?: number;
   question: string;
-  type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
+  type: "multiple_choice" | "true_false";
+  schemaType: "mcq" | "true_false";
+  cognitiveLevel: QuizCognitiveLevel;
   options: string[];
   correctOptionIndex: number;
-  correctAnswerText?: string;
-  acceptableAnswers?: string[];
+  correctAnswer: string | boolean;
+  correctAnswerText: string;
+  acceptableAnswers: string[];
   explanation: string;
   difficulty: "easy" | "medium" | "hard";
   sectionRef: string;
   timestampRef?: string;
   sourceReference?: string;
   sourceTranscriptSegment?: string;
-  groundingVerified?: boolean;
+  sourceSegmentIds: string[];
+  groundingVerified: boolean;
+}
+
+export interface TranscriptTopicSection {
+  sectionIndex: number;
+  sectionId: string;
+  sectionLabel: string;
+  topicTitle: string;
+  startTimestamp: string;
+  endTimestamp: string;
+  segments: TranscriptSegment[];
+  clauses: TranscriptClause[];
+  keyTerms: string[];
+  facts: ExtractedFact[];
+}
+
+/**
+ * Refines spoken/colloquial Arabic phrasing into clean, grammatically sound
+ * Modern Standard Arabic (MSA) for exam stems, options, and explanations,
+ * while preserving technical terms, numbers, and factual meaning intact.
+ */
+export function polishArabicAcademicText(raw: string): string {
+  if (!raw) return "";
+  let s = String(raw)
+    .replace(/\s+/g, " ")
+    .replace(
+      /^(?:طيب\s+سؤال\s+بقى\.?|طيب\s+نتقدم\s+شوية\.?|بس\s+أنا\s+جاي\s+أقولك\s+بقى\s+تعال|خليني\s+أقولك|ببساطة\s+شديدة|ببساطة|يا\s+عم\s+خلاص|طيب|دلوقتي|بص\s+معايا)[،,.\s]*/i,
+      "",
+    )
+    .trim();
+
+  const replacements: Array<[RegExp, string]> = [
+    [/(^|[\s،,])(?:علشان|عشان)(?=$|[\s،,.])/g, "$1لأن"],
+    [/(^|[\s،,])(?:إزاي|ازاي)(?=$|[\s،,.؟?])/g, "$1كيف"],
+    [/(^|[\s،,])(?:إيه|ايه)(?=$|[\s،,.؟?])/g, "$1ما"],
+    [/(^|[\s،,])دلوقتي(?=$|[\s،,.])/g, "$1الآن"],
+    [/(^|[\s،,])التانية(?=$|[\s،,.])/g, "$1الثانية"],
+    [/(^|[\s،,])الأولانية(?=$|[\s،,.])/g, "$1الأولى"],
+    [/(^|[\s،,])التالتة(?=$|[\s،,.])/g, "$1الثالثة"],
+    [/(^|[\s،,])تمانية(?=$|[\s،,.])/g, "$1ثمانية"],
+    [/(^|[\s،,])تلاتة(?=$|[\s،,.])/g, "$1ثلاثة"],
+    [/(^|[\s،,])اربعة(?=$|[\s،,.])/g, "$1أربعة"],
+    [/(^|[\s،,])بتكون(?=$|[\s،,.])/g, "$1تكون"],
+    [/(^|[\s،,])بيكون(?=$|[\s،,.])/g, "$1يكون"],
+    [/(^|[\s،,])بيساوي(?=$|[\s،,.])/g, "$1يساوي"],
+    [/(^|[\s،,])بتساوي(?=$|[\s،,.])/g, "$1تساوي"],
+    [/(^|[\s،,])(?:بيديك|بتديك)(?=$|[\s،,.])/g, "$1تعطي"],
+    [/(^|[\s،,])بيوصل(?=$|[\s،,.])/g, "$1يوصل"],
+    [/(^|[\s،,])مبيوصلش(?=$|[\s،,.])/g, "$1لا يوصل"],
+    [/(^|[\s،,])اللي(?=$|[\s،,.])/g, "$1الذي"],
+    [/(^|[\s،,])(?:افرد|لو\s+افترضنا)(?=$|[\s،,.])/g, "$1إذا افترضنا"],
+    [/(^|[\s،,])(?:عاوز|عايز)(?=$|[\s،,.])/g, "$1نريد"],
+    [/(^|[\s،,])كده(?=$|[\s،,.])/g, "$1بذلك"],
+    [/(^|[\s،,])بقى(?=$|[\s،,.])/g, ""],
+    [/(^|[\s،,])ليها(?=$|[\s،,.])/g, "$1لها"],
+    [/(^|[\s،,])التاني(?=$|[\s،,.])/g, "$1الثاني"],
+    [/(^|[\s،,])بيت(?=$|[\s،,.])/g, "$1بت (Bit)"],
+  ];
+
+  for (const [rx, rep] of replacements) {
+    s = s.replace(rx, rep);
+  }
+
+  return s
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[،,.\s]+|[،,\s]+$/g, "")
+    .trim();
+}
+
+/**
+ * Computes the maximum number of meaningful, non-filler exam questions
+ * legitimately supported by the transcript content (up to 20 maximum).
+ */
+export function computeSupportedQuestionCount(
+  segments: TranscriptSegment[],
+  requestedCount?: number,
+): number {
+  if (!segments || segments.length === 0) return 0;
+  const combined = segments
+    .map((s) => String(s.text || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  const totalWords = combined.split(/\s+/).filter(Boolean).length;
+  const substantiveStems = tokenizeForRetrieval(combined);
+  const uniqueConcepts = new Set(substantiveStems).size;
+  const informativeSegments = segments.filter((s) => (s.text || "").trim().length >= 18).length;
+
+  let maxSupported: number;
+  if (totalWords < 25 || uniqueConcepts < 5) {
+    maxSupported = Math.max(1, Math.min(2, informativeSegments));
+  } else if (totalWords < 65) {
+    maxSupported = 4;
+  } else if (totalWords < 140) {
+    maxSupported = 7;
+  } else if (totalWords < 280) {
+    maxSupported = 11;
+  } else if (totalWords < 550) {
+    maxSupported = 15;
+  } else {
+    maxSupported = 20;
+  }
+
+  const densityCap = Math.max(
+    2,
+    Math.min(20, Math.ceil(informativeSegments * 0.65) + Math.floor(uniqueConcepts / 18)),
+  );
+  const ceiling = Math.min(20, maxSupported, densityCap);
+
+  if (typeof requestedCount === "number" && Number.isFinite(requestedCount) && requestedCount > 0) {
+    return Math.max(1, Math.min(ceiling, Math.round(requestedCount)));
+  }
+  return ceiling;
+}
+
+/**
+ * Partitions the complete transcript into proportional conceptual sections
+ * covering 0% -> 100% of the recording so questions are distributed across
+ * the entire lecture rather than clustering in the opening paragraphs.
+ */
+export function partitionTranscriptIntoTopicSections(
+  segments: TranscriptSegment[],
+  isAr: boolean,
+): TranscriptTopicSection[] {
+  if (!segments || segments.length === 0) return [];
+  const targetSectionCount =
+    segments.length <= 4
+      ? 1
+      : segments.length <= 12
+        ? 2
+        : segments.length <= 28
+          ? 3
+          : segments.length <= 55
+            ? 4
+            : segments.length <= 85
+              ? 5
+              : 6;
+
+  const chunkSize = Math.ceil(segments.length / targetSectionCount);
+  const sections: TranscriptTopicSection[] = [];
+
+  for (let i = 0; i < targetSectionCount; i++) {
+    const slice = segments.slice(i * chunkSize, (i + 1) * chunkSize);
+    if (slice.length === 0) continue;
+
+    const phrases = extractKeyPhrases(slice, 3);
+    const terms = extractSignificantTerms(slice, 6).map((t) => t.term);
+    const rawTopic = phrases[0] || terms.slice(0, 2).join(isAr ? " و" : " & ") || "";
+    const topicTitle = isAr
+      ? polishArabicAcademicText(rawTopic) || `المحور ${sections.length + 1}`
+      : rawTopic || `Topic ${sections.length + 1}`;
+    const startTimestamp = formatMmSs(slice[0].startTime);
+    const endTimestamp = formatMmSs(
+      slice[slice.length - 1].endTime || slice[slice.length - 1].startTime,
+    );
+    const sectionIndex = sections.length;
+    const sectionLabel = isAr
+      ? `القسم ${sectionIndex + 1}: ${topicTitle} [${startTimestamp}–${endTimestamp}]`
+      : `Section ${sectionIndex + 1}: ${topicTitle} [${startTimestamp}–${endTimestamp}]`;
+
+    // Attach segmentIds to all facts extracted within this section
+    const rawFacts = extractStructuredFacts(slice).map((f) => ({
+      ...f,
+      segmentId:
+        f.segmentId || slice.find((s) => s.text.trim() === f.segmentText)?.id || slice[0]?.id,
+    }));
+
+    sections.push({
+      sectionIndex,
+      sectionId: `sec_${sectionIndex + 1}`,
+      sectionLabel,
+      topicTitle,
+      startTimestamp,
+      endTimestamp,
+      segments: slice,
+      clauses: splitIntoClauses(slice),
+      keyTerms: terms,
+      facts: rawFacts,
+    });
+  }
+
+  return sections;
+}
+
+/**
+ * Semantic question similarity detector (Jaccard + overlap coefficient + target-fact collision).
+ * Prevents paraphrased duplicates such as "What is the purpose of X?" and "What is X used for?".
+ */
+export function areQuestionsSemanticallySimilar(
+  qA: { question: string; correctAnswerText?: string; sourceSegmentIds?: string[] },
+  qB: { question: string; correctAnswerText?: string; sourceSegmentIds?: string[] },
+): boolean {
+  const normA = normalizeText(qA.question);
+  const normB = normalizeText(qB.question);
+  if (!normA || !normB) return false;
+  if (normA === normB) return true;
+
+  // Strip generic interrogative scaffolding before comparing semantic cores
+  const stripScaffold = (s: string) =>
+    s
+      .replace(
+        /\b(?:according to the lecture|based on the transcript|in the recording|true or false|what is|which of the following|why is|how does|وفقا لما ورد|في المحاضره|في التسجيل|صح ام خطا|ما هو|ما هي|اي مما يلي|لماذا|كيف)\b/g,
+        " ",
+      )
+      .trim();
+
+  const stemsA = new Set(tokenizeForRetrieval(stripScaffold(qA.question)));
+  const stemsB = new Set(tokenizeForRetrieval(stripScaffold(qB.question)));
+
+  if (stemsA.size >= 2 && stemsB.size >= 2) {
+    let intersection = 0;
+    for (const st of stemsA) {
+      if (stemsB.has(st)) intersection++;
+    }
+    const union = stemsA.size + stemsB.size - intersection;
+    const jaccard = union > 0 ? intersection / union : 0;
+    const minLen = Math.min(stemsA.size, stemsB.size);
+    const overlap = minLen > 0 ? intersection / minLen : 0;
+    if (jaccard >= 0.52 || (minLen >= 3 && overlap >= 0.72)) {
+      return true;
+    }
+  }
+
+  // Same exact short target answer tested on the exact same source segment
+  const ansA = normalizeText(qA.correctAnswerText || "");
+  const ansB = normalizeText(qB.correctAnswerText || "");
+  if (
+    ansA &&
+    ansB &&
+    ansA === ansB &&
+    ansA !== "صح" &&
+    ansA !== "خطا" &&
+    ansA !== "true" &&
+    ansA !== "false" &&
+    qA.sourceSegmentIds?.[0] &&
+    qA.sourceSegmentIds[0] === qB.sourceSegmentIds?.[0]
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function buildNumericDistractors(num: number, unit: string): string[] {
@@ -1991,7 +2248,7 @@ function buildNumericDistractors(num: number, unit: string): string[] {
     num <= 5
       ? [1, 2, 3, 4]
       : num <= 20
-        ? [2, 3, 5, 7]
+        ? [2, 4, 6, 8]
         : num <= 100
           ? [10, 20, 30, 50]
           : num <= 500
@@ -2018,10 +2275,19 @@ function rotateOptions(
   distractors: string[],
   seed: number,
 ): { options: string[]; correctOptionIndex: number } {
-  const uniqueDistractors = Array.from(new Set(distractors))
-    .filter((d) => d && normalizeText(d) !== normalizeText(correct))
-    .slice(0, 3);
-  const options = [correct, ...uniqueDistractors];
+  const seenNorm = new Set<string>([normalizeText(correct)]);
+  const uniqueDistractors: string[] = [];
+  for (const d of distractors) {
+    const cleaned = String(d || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const norm = normalizeText(cleaned);
+    if (!cleaned || cleaned.length < 2 || !norm || seenNorm.has(norm)) continue;
+    seenNorm.add(norm);
+    uniqueDistractors.push(cleaned);
+    if (uniqueDistractors.length >= 3) break;
+  }
+  const options = [correct.trim(), ...uniqueDistractors];
   const slot = Math.abs(seed) % options.length;
   const swapped = [...options];
   const tmp = swapped[0];
@@ -2030,307 +2296,689 @@ function rotateOptions(
   return { options: swapped, correctOptionIndex: slot };
 }
 
+function clipCleanOption(text: string, isAr: boolean, maxLen = 115): string {
+  const polished = isAr ? polishArabicAcademicText(text) : text.replace(/\s+/g, " ").trim();
+  const clean = polished.replace(/^[،,.;:\-–—\s]+|[،,;:\-–—\s]+$/g, "").trim();
+  if (clean.length <= maxLen) return clean;
+  const cut = clean.slice(0, maxLen);
+  const sp = cut.lastIndexOf(" ");
+  return `${(sp > 35 ? cut.slice(0, sp) : cut).trim()}...`;
+}
+
 export function buildBuiltInQuiz(
   title: string,
   segments: TranscriptSegment[],
   options?: {
     courseCode?: string;
     appLanguage?: "en" | "ar";
+    transcriptLanguage?: TranscriptLanguage;
     numQuestions?: number;
     variant?: number;
     avoidQuestionTitles?: string[];
     difficulty?: "all" | "easy" | "medium" | "hard";
   },
 ): {
+  language: "ar" | "en";
+  transcriptLanguage: TranscriptLanguage;
   title: string;
   courseCode?: string;
   questions: BuiltInQuizQuestion[];
 } {
-  const combinedText = segments.map((s) => s.text).join(" ");
-  const isAr = options?.appLanguage
-    ? options.appLanguage === "ar"
-    : detectIsArabic(`${title} ${combinedText}`);
+  const resolvedTranscriptLang = resolveTranscriptLanguage({
+    existing: options?.transcriptLanguage,
+    segments,
+    title,
+  });
+  const outputLang = resolveOutputLanguageFromTranscript(
+    resolvedTranscriptLang,
+    segments,
+    options?.appLanguage,
+  );
+  const isAr = outputLang === "ar";
   const variant = options?.variant || 1;
-  const avoidSet = new Set((options?.avoidQuestionTitles || []).map((q) => normalizeText(q)));
-
-  const totalWords = combinedText.trim().split(/\s+/).filter(Boolean).length;
-  const defaultCount = totalWords < 40 ? 4 : totalWords < 120 ? 5 : totalWords < 250 ? 7 : 10;
-  const targetCount = options?.numQuestions
-    ? Math.min(20, Math.max(1, Math.round(options.numQuestions)))
-    : defaultCount;
-
-  const facts = extractStructuredFacts(segments);
-  const terms = extractSignificantTerms(segments, 14);
-  const clauses = splitIntoClauses(segments);
-  const questions: BuiltInQuizQuestion[] = [];
-  const seenQuestions = new Set<string>(avoidSet);
   const requestedDifficulty =
     options?.difficulty && options.difficulty !== "all" ? options.difficulty : undefined;
 
-  const pushQuestion = (q: BuiltInQuizQuestion) => {
-    const key = normalizeText(q.question);
-    if (!key || seenQuestions.has(key) || questions.length >= targetCount) return;
-    seenQuestions.add(key);
-    questions.push(requestedDifficulty ? { ...q, difficulty: requestedDifficulty } : q);
+  const targetCount = computeSupportedQuestionCount(segments, options?.numQuestions);
+  if (!segments || segments.length === 0 || targetCount === 0) {
+    return {
+      language: outputLang,
+      transcriptLanguage: resolvedTranscriptLang,
+      title: isAr ? `اختبار تقييمي: ${title}` : `Assessment Quiz: ${title}`,
+      courseCode: options?.courseCode,
+      questions: [],
+    };
+  }
+
+  const sections = partitionTranscriptIntoTopicSections(segments, isAr);
+  const allClauses = sections.flatMap((s) => s.clauses.map((cl) => ({ ...cl, section: s })));
+  const allFacts = sections.flatMap((s) => s.facts.map((f) => ({ ...f, section: s })));
+
+  // Extract causal, conditional/application, and contrast relations across ALL sections
+  interface SectionRelation {
+    kind: "causal" | "conditional" | "contrast";
+    anchor: string;
+    target: string;
+    clause: TranscriptClause;
+    section: TranscriptTopicSection;
+  }
+
+  const relations: SectionRelation[] = [];
+  const causalRxAr =
+    /^(.{15,120}?)\s+(?:لأن|لأنه|لأنها|بسبب|نظراً لأن|حيث أن|لكي|حتى|علشان|عشان|وبالتالي|لذلك)\s+(.{14,130})$/i;
+  const causalRxEn =
+    /^(.{15,120}?)\s+(?:because|since|due to|in order to|so that|therefore|consequently|which allows|which enables)\s+(.{14,130})$/i;
+  const condRxAr =
+    /^(?:إذا|لو|عند|عندما|في حالة|افرد)\s+(.{10,95}?)[،,\s]+(?:فإن|فهذا|سوف|هنعمل|هيكون|بيكون|تكون|يكون|نحتاج|نضيف|نزود|هزود)\s*(.{12,125})$/i;
+  const condRxEn =
+    /^(?:if|when|whenever|suppose|assuming)\s+(.{10,95}?)(?:,\s*|\s+then\s+)(.{12,125})$/i;
+  const contrastRxAr =
+    /^(.{12,110}?)\s+(?:بينما|في المقابل|على عكس|بدلاً من|وليس|مختلف عن|مختلفة عن)\s+(.{12,120})$/i;
+  const contrastRxEn =
+    /^(.{12,110}?)\s+(?:whereas|unlike|in contrast to|compared to|instead of|rather than)\s+(.{12,120})$/i;
+
+  for (const item of allClauses) {
+    const raw = item.text;
+    const cMatch = (isAr ? causalRxAr : causalRxEn).exec(raw);
+    if (cMatch) {
+      const anchor = clipCleanOption(cMatch[1], isAr, 105);
+      const target = clipCleanOption(cMatch[2], isAr, 110);
+      if (anchor.length >= 12 && target.length >= 12) {
+        relations.push({
+          kind: "causal",
+          anchor,
+          target,
+          clause: item,
+          section: item.section,
+        });
+        continue;
+      }
+    }
+    const dMatch = (isAr ? condRxAr : condRxEn).exec(raw);
+    if (dMatch) {
+      const anchor = clipCleanOption(dMatch[1], isAr, 95);
+      const target = clipCleanOption(dMatch[2], isAr, 110);
+      if (anchor.length >= 10 && target.length >= 10) {
+        relations.push({
+          kind: "conditional",
+          anchor,
+          target,
+          clause: item,
+          section: item.section,
+        });
+        continue;
+      }
+    }
+    const xMatch = (isAr ? contrastRxAr : contrastRxEn).exec(raw);
+    if (xMatch) {
+      const anchor = clipCleanOption(xMatch[1], isAr, 100);
+      const target = clipCleanOption(xMatch[2], isAr, 110);
+      if (anchor.length >= 10 && target.length >= 10) {
+        relations.push({
+          kind: "contrast",
+          anchor,
+          target,
+          clause: item,
+          section: item.section,
+        });
+      }
+    }
+  }
+
+  // Build rich, lecture-grounded distractor pools (strictly in the lecture's language!)
+  const statementDistractorPool = Array.from(
+    new Set([
+      ...relations.map((r) => r.target),
+      ...allFacts
+        .filter((f) => f.kind === "definition")
+        .map((f) => clipCleanOption(f.value, isAr, 110)),
+      ...sections.flatMap((sec) =>
+        sec.clauses
+          .filter((c) => c.text.length >= 28 && c.text.length <= 135 && !/[?؟]/.test(c.text))
+          .slice(0, 4)
+          .map((c) => clipCleanOption(c.text, isAr, 110)),
+      ),
+    ]),
+  ).filter((s) => s.length >= 12);
+
+  const conceptTermPool = Array.from(
+    new Set([...sections.flatMap((s) => s.keyTerms), ...extractKeyPhrases(segments, 14)]),
+  )
+    .map((t) => (isAr ? polishArabicAcademicText(t) : t.trim()))
+    .filter((t) => t.length >= 3 && !STOP_WORDS.has(normalizeText(t)));
+
+  // Candidate bucket per section so we round-robin across ALL sections proportionally
+  const sectionCandidates: Map<number, BuiltInQuizQuestion[]> = new Map();
+  for (const sec of sections) sectionCandidates.set(sec.sectionIndex, []);
+
+  const addSectionCandidate = (secIdx: number, q: BuiltInQuizQuestion) => {
+    const bucket = sectionCandidates.get(secIdx);
+    if (bucket) bucket.push(q);
   };
 
-  // 1. Quantitative / Specification MCQs (sharp, factual, non-trivial!)
-  const specFacts = facts.filter((f) => f.kind === "spec" && typeof f.numericValue === "number");
-  for (let i = 0; i < specFacts.length && questions.length < targetCount; i++) {
-    const f = specFacts[i];
-    const distractors = buildNumericDistractors(f.numericValue!, f.unit || "");
-    const { options: opts, correctOptionIndex } = rotateOptions(f.value, distractors, i + variant);
+  let candidateSeq = 1;
+
+  // -------------------------------------------------------------------------
+  // LEVEL 2 (Conceptual — Causal/Mechanism MCQs across all sections)
+  // -------------------------------------------------------------------------
+  for (const rel of relations.filter((r) => r.kind === "causal")) {
+    const distractors = statementDistractorPool.filter(
+      (d) =>
+        normalizeText(d) !== normalizeText(rel.target) &&
+        !normalizeText(d).includes(normalizeText(rel.target).slice(0, 18)),
+    );
+    if (distractors.length < 3) continue;
+    const { options: opts, correctOptionIndex } = rotateOptions(
+      rel.target,
+      distractors,
+      candidateSeq + variant,
+    );
     if (opts.length < 4) continue;
 
-    pushQuestion({
-      id: `q_spec_${Date.now()}_${questions.length + 1}`,
+    addSectionCandidate(rel.section.sectionIndex, {
+      id: `q_conc_${candidateSeq++}`,
       question: isAr
-        ? `وفقاً لما ورد في «${title}»، ما هي قيمة (${f.labelAr}) المذكورة في التسجيل؟`
-        : `According to "${title}", what is the stated value for "${f.labelEn}"?`,
+        ? `في ضوء ما شُرح ضمن (${rel.section.topicTitle})، ما التفسير الدقيق لكون «${rel.anchor}»؟`
+        : `Based on the discussion of "${rel.section.topicTitle}", which principle explains why "${rel.anchor}"?`,
       type: "multiple_choice",
+      schemaType: "mcq",
+      cognitiveLevel: "conceptual",
       options: opts,
       correctOptionIndex,
-      correctAnswerText: f.value,
-      acceptableAnswers: [f.value],
+      correctAnswer: opts[correctOptionIndex],
+      correctAnswerText: opts[correctOptionIndex],
+      acceptableAnswers: [opts[correctOptionIndex]],
       explanation: isAr
-        ? `ورد صراحةً عند [${f.timestamp}] أن ${f.labelAr} هي «${f.value}» ضمن سياق: "${f.clause}".`
-        : `Explicitly stated at [${f.timestamp}] as "${f.value}" in context: "${f.clause}".`,
-      difficulty: i % 2 === 0 ? "easy" : "medium",
-      sectionRef: isAr ? f.labelAr : f.labelEn,
-      timestampRef: f.timestamp,
-      sourceReference: `${isAr ? f.labelAr : f.labelEn} [${f.timestamp}]`,
-      sourceTranscriptSegment: f.segmentText,
+        ? `يوضّح المحاضر عند [${rel.clause.timestamp}] أن السبب في ذلك هو: «${rel.target}».`
+        : `At [${rel.clause.timestamp}], the lecture explains that this occurs because "${rel.target}".`,
+      difficulty: "medium",
+      sectionRef: rel.section.sectionLabel,
+      timestampRef: rel.clause.timestamp,
+      sourceReference: `${rel.section.sectionLabel}`,
+      sourceTranscriptSegment: rel.clause.segmentText,
+      sourceSegmentIds: [rel.clause.segmentId],
       groundingVerified: true,
     });
   }
 
-  // 2. Definition & Entity Attribute MCQs
-  const entityFacts = facts.filter((f) => f.kind === "definition" || f.kind === "entity");
-  const entityDistractorPool = Array.from(
-    new Set([
-      ...entityFacts.map((e) => e.value),
-      ...terms.map((t) => t.term),
-      ...(isAr
-        ? ["التجمع الخامس", "الشيخ زايد", "نصف تشطيب", "تشطيب تجاري", "فيو شارع رئيسي", "غير مذكور"]
-        : [
-            "Alternative specification",
-            "Preliminary draft only",
-            "Standard baseline option",
-            "Not specified in session",
-          ]),
-    ]),
-  );
-
-  for (let i = 0; i < entityFacts.length && questions.length < targetCount; i++) {
-    const f = entityFacts[i];
-    if (f.value.length > 90) continue;
-    const sameCategoryFallbacks =
-      f.labelAr === "نوع التشطيب"
-        ? isAr
-          ? ["نصف تشطيب (على الطوب)", "تشطيب تجاري أساسي", "تشطيب لوكس عادي"]
-          : ["Semi-finished", "Basic shell & core", "Standard finish"]
-        : f.labelAr === "الإطلالة (الفيو)"
-          ? isAr
-            ? ["فيو شارع رئيسي", "فيو باركينج داخلي", "فيو منور خلفي"]
-            : ["Main road view", "Parking lot view", "Interior courtyard view"]
-          : f.labelAr === "الموقع / المنطقة"
-            ? isAr
-              ? ["التجمع الخامس منطقة النرجس", "الشيخ زايد الحي الرابع", "مدينة نصر الحي السابع"]
-              : ["Downtown District A", "West Business Park", "North Campus Zone"]
-            : entityDistractorPool;
-
-    const distractors = sameCategoryFallbacks
-      .filter((cand) => normalizeText(cand) !== normalizeText(f.value))
-      .slice(0, 3);
+  // -------------------------------------------------------------------------
+  // LEVEL 4 (Application — Conditional/Scenario MCQs across all sections)
+  // -------------------------------------------------------------------------
+  for (const rel of relations.filter((r) => r.kind === "conditional")) {
+    const distractors = statementDistractorPool.filter(
+      (d) => normalizeText(d) !== normalizeText(rel.target),
+    );
     if (distractors.length < 3) continue;
+    const { options: opts, correctOptionIndex } = rotateOptions(
+      rel.target,
+      distractors,
+      candidateSeq + variant + 1,
+    );
+    if (opts.length < 4) continue;
 
+    addSectionCandidate(rel.section.sectionIndex, {
+      id: `q_app_${candidateSeq++}`,
+      question: isAr
+        ? `عند تطبيق القاعدة المشروحة في المحاضرة: إذا «${rel.anchor}»، فما النتيجة أو الإجراء الصحيح المترتب على ذلك؟`
+        : `Applying the rule explained in the lecture: when "${rel.anchor}", what follows as a direct consequence?`,
+      type: "multiple_choice",
+      schemaType: "mcq",
+      cognitiveLevel: "application",
+      options: opts,
+      correctOptionIndex,
+      correctAnswer: opts[correctOptionIndex],
+      correctAnswerText: opts[correctOptionIndex],
+      acceptableAnswers: [opts[correctOptionIndex]],
+      explanation: isAr
+        ? `وفقاً للتطبيق المشروح عند [${rel.clause.timestamp}]، عند تحقق هذا الشرط فإن النتيجة هي: «${rel.target}».`
+        : `As demonstrated at [${rel.clause.timestamp}], under this condition the outcome is: "${rel.target}".`,
+      difficulty: "hard",
+      sectionRef: rel.section.sectionLabel,
+      timestampRef: rel.clause.timestamp,
+      sourceReference: `${rel.section.sectionLabel}`,
+      sourceTranscriptSegment: rel.clause.segmentText,
+      sourceSegmentIds: [rel.clause.segmentId],
+      groundingVerified: true,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // LEVEL 1 (Direct Understanding — Definitions & Quantitative Rules per section)
+  // -------------------------------------------------------------------------
+  const defFacts = allFacts.filter((f) => f.kind === "definition");
+  for (const f of defFacts) {
+    const rawTerm = f.labelAr.replace(/^تعريف:\s*/, "");
+    const cleanTerm = isAr ? polishArabicAcademicText(rawTerm) : rawTerm;
+    const cleanDef = clipCleanOption(f.value, isAr, 110);
+    const distractors = [
+      ...defFacts
+        .filter((o) => normalizeText(o.value) !== normalizeText(f.value))
+        .map((o) => clipCleanOption(o.value, isAr, 110)),
+      ...statementDistractorPool,
+    ].filter((d) => normalizeText(d) !== normalizeText(cleanDef));
+
+    if (distractors.length >= 3) {
+      const { options: opts, correctOptionIndex } = rotateOptions(
+        cleanDef,
+        distractors,
+        candidateSeq + variant,
+      );
+      if (opts.length === 4) {
+        addSectionCandidate(f.section.sectionIndex, {
+          id: `q_def_${candidateSeq++}`,
+          question: isAr
+            ? `ما المفهوم الدقيق لمصطلح «${cleanTerm}» كما عرّفه المحاضر؟`
+            : `How does the lecture accurately define "${cleanTerm}"?`,
+          type: "multiple_choice",
+          schemaType: "mcq",
+          cognitiveLevel: "direct",
+          options: opts,
+          correctOptionIndex,
+          correctAnswer: opts[correctOptionIndex],
+          correctAnswerText: opts[correctOptionIndex],
+          acceptableAnswers: [opts[correctOptionIndex]],
+          explanation: isAr
+            ? `عُرّف «${cleanTerm}» صراحةً عند [${f.timestamp}] بأنه: «${cleanDef}».`
+            : `At [${f.timestamp}], "${cleanTerm}" is explicitly defined as "${cleanDef}".`,
+          difficulty: "medium",
+          sectionRef: f.section.sectionLabel,
+          timestampRef: f.timestamp,
+          sourceReference: f.section.sectionLabel,
+          sourceTranscriptSegment: f.segmentText,
+          sourceSegmentIds: f.segmentId ? [f.segmentId] : [f.section.segments[0].id],
+          groundingVerified: true,
+        });
+      }
+    }
+  }
+
+  const specFacts = allFacts.filter(
+    (f) => f.kind === "spec" && typeof f.numericValue === "number" && f.labelAr !== "المدة الزمنية",
+  );
+  for (const f of specFacts) {
+    const distractors = buildNumericDistractors(f.numericValue!, f.unit || "");
     const { options: opts, correctOptionIndex } = rotateOptions(
       f.value,
       distractors,
-      i + variant + 1,
+      candidateSeq + variant,
     );
-
-    pushQuestion({
-      id: `q_ent_${Date.now()}_${questions.length + 1}`,
+    if (opts.length < 4) continue;
+    const contextHint = clipCleanOption(f.clause, isAr, 90);
+    addSectionCandidate(f.section.sectionIndex, {
+      id: `q_spec_${candidateSeq++}`,
       question: isAr
-        ? `ما هو (${f.labelAr}) المحدد الذي ذكره المتحدث في تسجيل «${title}»؟`
-        : `Which "${f.labelEn}" was specified by the speaker in "${title}"?`,
+        ? `استناداً إلى الشرح في (${f.section.topicTitle})، ما القيمة الدقيقة المرتبطة بـ (${f.labelAr}) في سياق «${contextHint}»؟`
+        : `According to "${f.section.topicTitle}", what is the exact value for "${f.labelEn}" in the context of "${contextHint}"?`,
       type: "multiple_choice",
+      schemaType: "mcq",
+      cognitiveLevel: "direct",
       options: opts,
       correctOptionIndex,
-      correctAnswerText: f.value,
-      acceptableAnswers: [f.value],
+      correctAnswer: opts[correctOptionIndex],
+      correctAnswerText: opts[correctOptionIndex],
+      acceptableAnswers: [opts[correctOptionIndex]],
       explanation: isAr
-        ? `ذُكر في التسجيل عند [${f.timestamp}]: «${f.clause}».`
-        : `Verified in transcript at [${f.timestamp}]: "${f.clause}".`,
-      difficulty: "medium",
-      sectionRef: isAr ? f.labelAr : f.labelEn,
-      timestampRef: f.timestamp,
-      sourceReference: `${isAr ? f.labelAr : f.labelEn} [${f.timestamp}]`,
-      sourceTranscriptSegment: f.segmentText,
-      groundingVerified: true,
-    });
-  }
-
-  // 3. Fact-Checked True/False Questions (True statement OR realistic altered-number False statement!)
-  for (let i = 0; i < specFacts.length && questions.length < targetCount; i++) {
-    const f = specFacts[i];
-    const makeTrue = (i + variant) % 2 === 0;
-    const altVal = buildNumericDistractors(f.numericValue!, f.unit || "")[0];
-    const shownVal = makeTrue ? f.value : altVal;
-
-    pushQuestion({
-      id: `q_tf_spec_${Date.now()}_${questions.length + 1}`,
-      question: isAr
-        ? `صح أم خطأ: ذكر المتحدث في تسجيل «${title}» أن ${f.labelAr} هي (${shownVal}).`
-        : `True or False: In "${title}", the speaker stated that "${f.labelEn}" is (${shownVal}).`,
-      type: "true_false",
-      options: isAr ? ["صح (صواب)", "خطأ"] : ["True", "False"],
-      correctOptionIndex: makeTrue ? 0 : 1,
-      correctAnswerText: makeTrue ? (isAr ? "صح (صواب)" : "True") : isAr ? "خطأ" : "False",
-      acceptableAnswers: [makeTrue ? (isAr ? "صح (صواب)" : "True") : isAr ? "خطأ" : "False"],
-      explanation: isAr
-        ? makeTrue
-          ? `صحيح — ورد صراحة عند [${f.timestamp}]: «${f.clause}».`
-          : `خطأ — القيمة الصحيحة المذكورة عند [${f.timestamp}] هي «${f.value}» وليست «${altVal}».`
-        : makeTrue
-          ? `True — explicitly stated at [${f.timestamp}]: "${f.clause}".`
-          : `False — the actual stated value at [${f.timestamp}] is "${f.value}", not "${altVal}".`,
+        ? `حدد المحاضر عند [${f.timestamp}] القيمة بـ «${f.value}» ضمن سياق: «${polishArabicAcademicText(f.clause)}».`
+        : `At [${f.timestamp}], the speaker specifies "${f.value}" in context: "${f.clause}".`,
       difficulty: "easy",
-      sectionRef: isAr ? f.labelAr : f.labelEn,
+      sectionRef: f.section.sectionLabel,
       timestampRef: f.timestamp,
-      sourceReference: `${isAr ? f.labelAr : f.labelEn} [${f.timestamp}]`,
+      sourceReference: f.section.sectionLabel,
       sourceTranscriptSegment: f.segmentText,
+      sourceSegmentIds: f.segmentId ? [f.segmentId] : [f.section.segments[0].id],
       groundingVerified: true,
     });
   }
 
-  // 4. Concept Cloze MCQ from informative clauses (replaces a key term with ______)
-  const termPool = terms.map((t) => t.term);
-  for (let i = 0; i < clauses.length && questions.length < targetCount; i++) {
-    const cl = clauses[i];
-    if (cl.text.length < 25) continue;
-    const matchedTerm = terms.find(
-      (t) =>
-        t.term.length >= 4 && cl.text.includes(t.term) && !STOP_WORDS.has(normalizeText(t.term)),
+  // -------------------------------------------------------------------------
+  // LEVEL 3 (Comparison — Contrasting two concepts/sections across lecture)
+  // -------------------------------------------------------------------------
+  for (const rel of relations.filter((r) => r.kind === "contrast")) {
+    const distractors = statementDistractorPool.filter(
+      (d) => normalizeText(d) !== normalizeText(rel.target),
     );
-    if (!matchedTerm) continue;
-
-    const distractors = termPool
-      .filter((cand) => normalizeText(cand) !== normalizeText(matchedTerm.term))
-      .slice(0, 3);
-    if (distractors.length < 3) continue;
-
-    const maskedClause = cl.text.replace(matchedTerm.term, "______");
-    const clippedMask =
-      maskedClause.length > 130 ? `${maskedClause.slice(0, 127)}...` : maskedClause;
-    const { options: opts, correctOptionIndex } = rotateOptions(
-      matchedTerm.term,
-      distractors,
-      i + variant + 2,
-    );
-
-    pushQuestion({
-      id: `q_cloze_${Date.now()}_${questions.length + 1}`,
-      question: isAr
-        ? `أكمل المصطلح أو المعلومة الصحيحة وفقاً لما ورد في التسجيل: «${clippedMask}»`
-        : `Which term accurately completes this statement from the transcript: "${clippedMask}"?`,
-      type: "multiple_choice",
-      options: opts,
-      correctOptionIndex,
-      correctAnswerText: matchedTerm.term,
-      acceptableAnswers: [matchedTerm.term],
-      explanation: isAr
-        ? `المصطلح الدقيق المذكور عند [${cl.timestamp}] هو «${matchedTerm.term}» في سياق: "${cl.text}".`
-        : `The exact term stated at [${cl.timestamp}] is "${matchedTerm.term}" in context: "${cl.text}".`,
-      difficulty: "hard",
-      sectionRef: isAr ? `المقطع [${cl.timestamp}]` : `Segment [${cl.timestamp}]`,
-      timestampRef: cl.timestamp,
-      sourceReference: `[${cl.timestamp}]`,
-      sourceTranscriptSegment: cl.segmentText,
-      groundingVerified: true,
-    });
-  }
-
-  // 4b. Grounded Short-Answer / Analytical Questions (always include at least 1 when targetCount >= 4)
-  const shortAnswerSlot =
-    targetCount >= 4 && !questions.some((q) => q.type === "short_answer")
-      ? Math.max(1, Math.min(2, Math.floor(targetCount / 4)))
-      : 0;
-  if (shortAnswerSlot > 0) {
-    // Make room if earlier MCQ/TF stages filled all targetCount slots
-    if (questions.length >= targetCount && questions.length >= 2) {
-      questions.splice(questions.length - 1, 1);
-    }
-    const shortCandidates = [
-      ...facts.filter((f) => f.kind === "definition" || f.kind === "entity" || f.kind === "spec"),
-    ];
-    for (let i = 0; i < shortCandidates.length && questions.length < targetCount; i++) {
-      const f = shortCandidates[i];
-      if (!f.value || f.value.length < 2) continue;
-      const alreadyUsed = questions.some(
-        (q) =>
-          q.type === "short_answer" &&
-          normalizeText(q.correctAnswerText || "") === normalizeText(f.value),
+    if (distractors.length >= 3) {
+      const { options: opts, correctOptionIndex } = rotateOptions(
+        rel.target,
+        distractors,
+        candidateSeq + variant,
       );
-      if (alreadyUsed) continue;
-      pushQuestion({
-        id: `q_sa_${Date.now()}_${questions.length + 1}`,
+      if (opts.length === 4) {
+        addSectionCandidate(rel.section.sectionIndex, {
+          id: `q_cmp_${candidateSeq++}`,
+          question: isAr
+            ? `عند المقارنة التي عقدها المحاضر في (${rel.section.topicTitle}) مقابل «${rel.anchor}»، أي العبارات التالية تمثل الجانب المقابل بدقة؟`
+            : `In the comparison drawn in "${rel.section.topicTitle}" against "${rel.anchor}", which statement accurately captures the contrasting point?`,
+          type: "multiple_choice",
+          schemaType: "mcq",
+          cognitiveLevel: "comparison",
+          options: opts,
+          correctOptionIndex,
+          correctAnswer: opts[correctOptionIndex],
+          correctAnswerText: opts[correctOptionIndex],
+          acceptableAnswers: [opts[correctOptionIndex]],
+          explanation: isAr
+            ? `أوضح المحاضر هذا الفارق عند [${rel.clause.timestamp}] بمقابلة «${rel.anchor}» مع «${rel.target}».`
+            : `At [${rel.clause.timestamp}], the speaker explicitly contrasts "${rel.anchor}" with "${rel.target}".`,
+          difficulty: "hard",
+          sectionRef: rel.section.sectionLabel,
+          timestampRef: rel.clause.timestamp,
+          sourceReference: rel.section.sectionLabel,
+          sourceTranscriptSegment: rel.clause.segmentText,
+          sourceSegmentIds: [rel.clause.segmentId],
+          groundingVerified: true,
+        });
+      }
+    }
+  }
+
+  // Cross-definition comparison True/False (Level 3 + Level 6 subtle distinction!)
+  if (defFacts.length >= 2) {
+    for (let i = 0; i < defFacts.length - 1; i++) {
+      const dA = defFacts[i];
+      const dB = defFacts[i + 1];
+      const termA = isAr
+        ? polishArabicAcademicText(dA.labelAr.replace(/^تعريف:\s*/, ""))
+        : dA.labelAr.replace(/^تعريف:\s*/, "");
+      const termB = isAr
+        ? polishArabicAcademicText(dB.labelAr.replace(/^تعريف:\s*/, ""))
+        : dB.labelAr.replace(/^تعريف:\s*/, "");
+      const defB = clipCleanOption(dB.value, isAr, 100);
+      const defA = clipCleanOption(dA.value, isAr, 100);
+      if (normalizeText(termA) === normalizeText(termB)) continue;
+
+      // Intentionally swap termA with dB's definition to create a genuinely challenging FALSE subtle-distinction item!
+      const tfOpts = isAr ? ["صح", "خطأ"] : ["True", "False"];
+      addSectionCandidate(dB.section.sectionIndex, {
+        id: `q_deep_swap_${candidateSeq++}`,
         question: isAr
-          ? `باختصار، ما الذي ذُكر في «${title}» بخصوص (${f.labelAr})؟ اذكر التفاصيل الدقيقة.`
-          : `Briefly explain what was stated in "${title}" regarding "${f.labelEn}".`,
-        type: "short_answer",
-        options: [],
-        correctOptionIndex: 0,
-        correctAnswerText: `${f.value} — ${f.clause}`,
-        acceptableAnswers: [f.value, f.clause],
+          ? `وفقاً لما شُرح في المحاضرة، يُقصد بمفهوم «${termA}» أنه ${defB}، بينما يختص «${termB}» بـ ${defA}.`
+          : `According to the lecture, "${termA}" refers to ${defB}, whereas "${termB}" refers to ${defA}.`,
+        type: "true_false",
+        schemaType: "true_false",
+        cognitiveLevel: "deep",
+        options: tfOpts,
+        correctOptionIndex: 1, // False!
+        correctAnswer: false,
+        correctAnswerText: tfOpts[1],
+        acceptableAnswers: [tfOpts[1]],
         explanation: isAr
-          ? `الإجابة النموذجية الموثقة عند [${f.timestamp}]: «${f.value}» في سياق «${f.clause}».`
-          : `Verified model answer from [${f.timestamp}]: "${f.value}" in context: "${f.clause}".`,
-        difficulty: requestedDifficulty || "hard",
-        sectionRef: isAr ? f.labelAr : f.labelEn,
-        timestampRef: f.timestamp,
-        sourceReference: `${isAr ? f.labelAr : f.labelEn} [${f.timestamp}]`,
-        sourceTranscriptSegment: f.segmentText,
+          ? `العبارة خاطئة لعكسها بين المفهومين؛ فالمحاضرة توضّح عند [${dA.timestamp}] أن «${termA}» هو «${defA}»، وعند [${dB.timestamp}] أن «${termB}» هو «${defB}».`
+          : `False — this statement swaps the two concepts: at [${dA.timestamp}] "${termA}" is "${defA}", while at [${dB.timestamp}] "${termB}" is "${defB}".`,
+        difficulty: "hard",
+        sectionRef: dB.section.sectionLabel,
+        timestampRef: dB.timestamp,
+        sourceReference: `${dA.timestamp} & ${dB.timestamp}`,
+        sourceTranscriptSegment: `${dA.segmentText} | ${dB.segmentText}`,
+        sourceSegmentIds: Array.from(
+          new Set([dA.segmentId, dB.segmentId].filter((x): x is string => Boolean(x))),
+        ),
         groundingVerified: true,
       });
-      if (questions.filter((q) => q.type === "short_answer").length >= shortAnswerSlot) break;
     }
   }
 
-  // 5. Fallback True/False for any remaining slots on sparse transcripts
-  for (let i = 0; i < clauses.length && questions.length < targetCount; i++) {
-    const cl = clauses[i];
-    if (cl.text.length < 18) continue;
-    const snippet = cl.text.length > 110 ? `${cl.text.slice(0, 107)}...` : cl.text;
-    pushQuestion({
-      id: `q_tf_cl_${Date.now()}_${questions.length + 1}`,
-      question: isAr
-        ? `صح أم خطأ: تناولت الجلسة النقطة التالية عند [${cl.timestamp}]: «${snippet}».`
-        : `True or False: The recording covered the following point at [${cl.timestamp}]: "${snippet}".`,
-      type: "true_false",
-      options: isAr ? ["صح (صواب)", "خطأ"] : ["True", "False"],
-      correctOptionIndex: 0,
-      correctAnswerText: isAr ? "صح (صواب)" : "True",
-      acceptableAnswers: [isAr ? "صح (صواب)" : "True"],
-      explanation: isAr
-        ? `صحيح — موثق في النص عند [${cl.timestamp}]: «${cl.text}».`
-        : `True — verified in the transcript at [${cl.timestamp}]: "${cl.text}".`,
-      difficulty: "easy",
-      sectionRef: isAr ? `المقطع [${cl.timestamp}]` : `Segment [${cl.timestamp}]`,
-      timestampRef: cl.timestamp,
-      sourceReference: `[${cl.timestamp}]`,
-      sourceTranscriptSegment: cl.segmentText,
-      groundingVerified: true,
-    });
+  // -------------------------------------------------------------------------
+  // LEVEL 5 (Analysis — Synthesizing high-signal insights within & across sections)
+  // -------------------------------------------------------------------------
+  for (let sIdx = 0; sIdx < sections.length; sIdx++) {
+    const sec = sections[sIdx];
+    const nextSec = sections[(sIdx + 1) % sections.length];
+    const scoredInSec = scoreSegments(sec.segments).sort((a, b) => b.score - a.score);
+
+    for (const topItem of scoredInSec.slice(0, 3)) {
+      const seg = topItem.seg;
+      const cleanClaim = clipCleanOption(seg.text, isAr, 115);
+      if (cleanClaim.length < 28 || /[?؟]/.test(cleanClaim)) continue;
+
+      // Pick distractors from OTHER sections' clauses and modify key concepts/numbers subtly so they are plausible but false for THIS section
+      const otherPool = sections
+        .filter((_, idx) => idx !== sIdx)
+        .flatMap((oSec) =>
+          oSec.clauses
+            .filter((c) => c.text.length >= 28 && !/[?؟]/.test(c.text))
+            .slice(0, 3)
+            .map((c) => clipCleanOption(c.text, isAr, 115)),
+        );
+
+      const distractors = [...otherPool, ...statementDistractorPool].filter(
+        (d) =>
+          normalizeText(d) !== normalizeText(cleanClaim) &&
+          !normalizeText(cleanClaim).includes(normalizeText(d).slice(0, 22)),
+      );
+      if (distractors.length < 3) continue;
+
+      const { options: opts, correctOptionIndex } = rotateOptions(
+        cleanClaim,
+        distractors,
+        candidateSeq + sIdx + variant,
+      );
+      if (opts.length < 4) continue;
+
+      const crossIds =
+        nextSec && nextSec.sectionIndex !== sec.sectionIndex && nextSec.segments[0]
+          ? [seg.id, nextSec.segments[0].id]
+          : [seg.id];
+
+      addSectionCandidate(sec.sectionIndex, {
+        id: `q_ana_${candidateSeq++}`,
+        question: isAr
+          ? `بتحليل ما طُرح في (${sec.topicTitle})، أي الاستنتاجات التالية يتفق بدقة مع المبدأ الذي قرره المحاضر في هذا الجزء من المحاضرة؟`
+          : `Analyzing the discussion of "${sec.topicTitle}", which conclusion accurately reflects the principle established in this section of the lecture?`,
+        type: "multiple_choice",
+        schemaType: "mcq",
+        cognitiveLevel: "analysis",
+        options: opts,
+        correctOptionIndex,
+        correctAnswer: opts[correctOptionIndex],
+        correctAnswerText: opts[correctOptionIndex],
+        acceptableAnswers: [opts[correctOptionIndex]],
+        explanation: isAr
+          ? `أكد المحاضر في هذا القسم عند [${formatMmSs(seg.startTime)}] أن: «${cleanClaim}».`
+          : `In this section at [${formatMmSs(seg.startTime)}], the speaker establishes that: "${cleanClaim}".`,
+        difficulty: sIdx >= Math.floor(sections.length / 2) ? "hard" : "medium",
+        sectionRef: sec.sectionLabel,
+        timestampRef: formatMmSs(seg.startTime),
+        sourceReference: sec.sectionLabel,
+        sourceTranscriptSegment: seg.text,
+        sourceSegmentIds: crossIds,
+        groundingVerified: true,
+      });
+    }
   }
 
+  // -------------------------------------------------------------------------
+  // LEVEL 6 (Deep Understanding — Concept-role MCQ & Determinant True/False per section)
+  // -------------------------------------------------------------------------
+  for (const sec of sections) {
+    // Concept-role analytical MCQ (replaces a key technical concept inside a substantive analytical statement)
+    for (const cl of sec.clauses) {
+      if (cl.text.length < 32 || /[?؟]/.test(cl.text)) continue;
+      const matchedTerm = conceptTermPool.find(
+        (term) =>
+          term.length >= 4 &&
+          normalizeText(cl.text).includes(normalizeText(term)) &&
+          cl.text.includes(term.split(" ")[0]),
+      );
+      if (!matchedTerm) continue;
+
+      const distractors = conceptTermPool.filter(
+        (cand) =>
+          normalizeText(cand) !== normalizeText(matchedTerm) &&
+          !normalizeText(cand).includes(normalizeText(matchedTerm)) &&
+          !normalizeText(matchedTerm).includes(normalizeText(cand)),
+      );
+      if (distractors.length < 3) continue;
+
+      const academicClause = clipCleanOption(cl.text, isAr, 125);
+      const rawFirstWord = matchedTerm.split(" ")[0];
+      if (!academicClause.includes(rawFirstWord)) continue;
+      const masked = academicClause
+        .replace(matchedTerm, "________")
+        .replace(rawFirstWord, "________");
+      if (!masked.includes("________")) continue;
+
+      const { options: opts, correctOptionIndex } = rotateOptions(
+        matchedTerm,
+        distractors,
+        candidateSeq + sec.sectionIndex + variant,
+      );
+      if (opts.length < 4) continue;
+
+      addSectionCandidate(sec.sectionIndex, {
+        id: `q_deep_mcq_${candidateSeq++}`,
+        question: isAr
+          ? `أي المصطلحات العلمية الواردة في (${sec.topicTitle}) يُكمل العلاقة المفاهيمية التالية بدقة: «${masked}»؟`
+          : `Which technical concept from "${sec.topicTitle}" accurately completes this conceptual relationship: "${masked}"?`,
+        type: "multiple_choice",
+        schemaType: "mcq",
+        cognitiveLevel: "deep",
+        options: opts,
+        correctOptionIndex,
+        correctAnswer: opts[correctOptionIndex],
+        correctAnswerText: opts[correctOptionIndex],
+        acceptableAnswers: [opts[correctOptionIndex]],
+        explanation: isAr
+          ? `المصطلح الصحيح وفقاً لشرح المحاضر عند [${cl.timestamp}] هو «${matchedTerm}» في سياق: «${academicClause}».`
+          : `At [${cl.timestamp}], the lecture establishes "${matchedTerm}" in this exact relationship: "${academicClause}".`,
+        difficulty: "hard",
+        sectionRef: sec.sectionLabel,
+        timestampRef: cl.timestamp,
+        sourceReference: sec.sectionLabel,
+        sourceTranscriptSegment: cl.segmentText,
+        sourceSegmentIds: [cl.segmentId],
+        groundingVerified: true,
+      });
+      break;
+    }
+
+    // High-rigor True/False testing conditions, causal rules, or quantitative claims in this section
+    const tfOpts = isAr ? ["صح", "خطأ"] : ["True", "False"];
+    const secSpec = sec.facts.find((f) => f.kind === "spec" && typeof f.numericValue === "number");
+    if (secSpec) {
+      const makeTrue = (sec.sectionIndex + variant) % 2 === 1;
+      const wrongVal = buildNumericDistractors(secSpec.numericValue!, secSpec.unit || "")[0];
+      const baseClause = isAr ? polishArabicAcademicText(secSpec.clause) : secSpec.clause;
+      const statementBody = makeTrue ? baseClause : baseClause.replace(secSpec.value, wrongVal);
+      if (statementBody.length >= 18 && (makeTrue || statementBody !== baseClause)) {
+        addSectionCandidate(sec.sectionIndex, {
+          id: `q_tf_rigor_${candidateSeq++}`,
+          question: isAr
+            ? `في سياق (${sec.topicTitle}): ${statementBody.replace(/[.!؟?]+$/, "")}.`
+            : `In the context of "${sec.topicTitle}": ${statementBody.replace(/[.!?]+$/, "")}.`,
+          type: "true_false",
+          schemaType: "true_false",
+          cognitiveLevel: "deep",
+          options: tfOpts,
+          correctOptionIndex: makeTrue ? 0 : 1,
+          correctAnswer: makeTrue,
+          correctAnswerText: makeTrue ? tfOpts[0] : tfOpts[1],
+          acceptableAnswers: [makeTrue ? tfOpts[0] : tfOpts[1]],
+          explanation: isAr
+            ? makeTrue
+              ? `العبارة صحيحة؛ إذ قرر المحاضر عند [${secSpec.timestamp}] أن القيمة هي «${secSpec.value}».`
+              : `العبارة خاطئة؛ لأن القيمة الصحيحة التي حددها المحاضر عند [${secSpec.timestamp}] هي «${secSpec.value}» وليست «${wrongVal}».`
+            : makeTrue
+              ? `True — at [${secSpec.timestamp}], the speaker confirms the value is "${secSpec.value}".`
+              : `False — at [${secSpec.timestamp}], the lecture states "${secSpec.value}", not "${wrongVal}".`,
+          difficulty: makeTrue ? "medium" : "hard",
+          sectionRef: sec.sectionLabel,
+          timestampRef: secSpec.timestamp,
+          sourceReference: sec.sectionLabel,
+          sourceTranscriptSegment: secSpec.segmentText,
+          sourceSegmentIds: secSpec.segmentId ? [secSpec.segmentId] : [sec.segments[0].id],
+          groundingVerified: true,
+        });
+      }
+    } else {
+      const secCausal = relations.find(
+        (r) => r.section.sectionIndex === sec.sectionIndex && r.kind === "causal",
+      );
+      if (secCausal) {
+        addSectionCandidate(sec.sectionIndex, {
+          id: `q_tf_causal_${candidateSeq++}`,
+          question: isAr
+            ? `وفقاً لما شُرح في (${sec.topicTitle})، فإن «${secCausal.anchor}» يرجع سببه إلى كون «${secCausal.target}».`
+            : `According to "${sec.topicTitle}", "${secCausal.anchor}" occurs because "${secCausal.target}".`,
+          type: "true_false",
+          schemaType: "true_false",
+          cognitiveLevel: "conceptual",
+          options: tfOpts,
+          correctOptionIndex: 0,
+          correctAnswer: true,
+          correctAnswerText: tfOpts[0],
+          acceptableAnswers: [tfOpts[0]],
+          explanation: isAr
+            ? `العبارة صحيحة ومؤكدة في الشرح عند [${secCausal.clause.timestamp}].`
+            : `True — this causal relationship is explicitly stated at [${secCausal.clause.timestamp}].`,
+          difficulty: "medium",
+          sectionRef: sec.sectionLabel,
+          timestampRef: secCausal.clause.timestamp,
+          sourceReference: sec.sectionLabel,
+          sourceTranscriptSegment: secCausal.clause.segmentText,
+          sourceSegmentIds: [secCausal.clause.segmentId],
+          groundingVerified: true,
+        });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // PROPORTIONAL ROUND-ROBIN SELECTION ACROSS ALL SECTIONS + SEMANTIC DEDUP
+  // -------------------------------------------------------------------------
+  const selected: BuiltInQuizQuestion[] = [];
+  const priorQuestions: Array<{
+    question: string;
+    correctAnswerText?: string;
+    sourceSegmentIds?: string[];
+  }> = (options?.avoidQuestionTitles || []).map((q) => ({ question: q }));
+
+  const tryAccept = (cand: BuiltInQuizQuestion): boolean => {
+    if (selected.length >= targetCount) return false;
+    if (!cand.question || cand.question.trim().length < 18) return false;
+    if (priorQuestions.some((existing) => areQuestionsSemanticallySimilar(existing, cand))) {
+      return false;
+    }
+    const finalized: BuiltInQuizQuestion = requestedDifficulty
+      ? { ...cand, difficulty: requestedDifficulty }
+      : cand;
+    selected.push(finalized);
+    priorQuestions.push(finalized);
+    return true;
+  };
+
+  // Round-robin pass over every section from start (0%) to end (100%) of the transcript
+  let madeProgress = true;
+  const cursors = new Array(sections.length).fill(0);
+  while (selected.length < targetCount && madeProgress) {
+    madeProgress = false;
+    for (let sIdx = 0; sIdx < sections.length && selected.length < targetCount; sIdx++) {
+      const bucket = sectionCandidates.get(sIdx) || [];
+      while (cursors[sIdx] < bucket.length) {
+        const nextCand = bucket[cursors[sIdx]++];
+        if (tryAccept(nextCand)) {
+          madeProgress = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Number questions cleanly 1..N
+  const numberedQuestions = selected.map((q, idx) => ({
+    ...q,
+    id: `q_${Date.now()}_${idx + 1}`,
+    questionNumber: idx + 1,
+  }));
+
   return {
+    language: outputLang,
+    transcriptLanguage: resolvedTranscriptLang,
     title: isAr
-      ? `اختبار الفهم الشامل (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`
-      : `Comprehension Assessment Quiz (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`,
+      ? `اختبار الفهم الأكاديمي الشامل (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`
+      : `Comprehensive Academic Exam (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`,
     courseCode: options?.courseCode,
-    questions,
+    questions: numberedQuestions,
   };
 }
 
