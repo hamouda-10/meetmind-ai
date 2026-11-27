@@ -57,6 +57,10 @@ async function main() {
     testUrl = "http://127.0.0.1:5173";
     serverProcess = spawn("cmd.exe", ["/c", "npx vite --port 5173 --host 127.0.0.1"], {
       stdio: "pipe",
+      env: {
+        ...process.env,
+        NODE_ENV: "test",
+      },
     });
 
     serverProcess.stderr.on("data", (d) => {
@@ -74,8 +78,9 @@ async function main() {
       } catch {}
       process.exit(1);
     }
-    // Warm up SSR route
-    await probe("http://127.0.0.1:5173/login", 5000);
+    // Warm up SSR and API health routes before parallel tests hit Vite dev server
+    await probe("http://127.0.0.1:5173/api/v1/health", 10000);
+    await probe("http://127.0.0.1:5173/login", 10000);
     console.log("Test server ready on http://127.0.0.1:5173");
   }
 
@@ -87,6 +92,7 @@ async function main() {
           "tests/auth.test.mjs",
           "tests/theme.test.mjs",
           "tests/chat-engine.test.mjs",
+          "tests/n8n-assemblyai-integration.test.mjs",
         ];
 
   console.log(`Running tests against ${testUrl}: ${testFiles.join(", ")}`);

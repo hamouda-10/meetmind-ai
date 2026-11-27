@@ -63,6 +63,7 @@ export default function QuizView() {
   const [selectedDifficulty, setSelectedDifficulty] = useState<"all" | "easy" | "medium" | "hard">(
     "all",
   );
+  const [selectedQuestionCount, setSelectedQuestionCount] = useState<number | undefined>(undefined);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [submittedResults, setSubmittedResults] = useState<{
     scorePercent: number;
@@ -158,7 +159,12 @@ export default function QuizView() {
         throw new Error(isArabic ? "لم يتم تحديد محاضرة" : "No lecture selected");
       }
       const resType = requestedResource?.type || "lecture";
-      const res = await api.generateQuiz(urlResourceId, resType, 6, selectedDifficulty);
+      const res = await api.generateQuiz(
+        urlResourceId,
+        resType,
+        selectedQuestionCount || 10,
+        selectedDifficulty,
+      );
       return res.quiz;
     },
     onSuccess: (newQuiz) => {
@@ -172,7 +178,13 @@ export default function QuizView() {
       );
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "تعذر توليد الاختبار");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : isArabic
+            ? "تعذر توليد الاختبار"
+            : "Failed to generate quiz",
+      );
     },
   });
 
@@ -196,7 +208,13 @@ export default function QuizView() {
       );
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "فشل تسليم الإجابات");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : isArabic
+            ? "فشل تسليم الإجابات"
+            : "Failed to submit quiz answers",
+      );
     },
   });
 
@@ -215,6 +233,7 @@ export default function QuizView() {
         avoidQuestionTitles: avoidTitles,
         variant: (activeQuiz.attemptsCount || 0) + 2,
         difficulty: selectedDifficulty,
+        numQuestions: selectedQuestionCount,
       });
     },
     onSuccess: (newQuiz) => {
@@ -228,7 +247,13 @@ export default function QuizView() {
       );
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "تعذر توليد الاختبار الجديد");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : isArabic
+            ? "تعذر توليد الاختبار الجديد"
+            : "Failed to generate new quiz",
+      );
     },
   });
 
@@ -336,6 +361,22 @@ export default function QuizView() {
                   </button>
                 ))}
               </div>
+
+              <select
+                aria-label={isArabic ? "عدد الأسئلة (بحد أقصى 20)" : "Question count (max 20)"}
+                value={selectedQuestionCount ? String(selectedQuestionCount) : "auto"}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSelectedQuestionCount(val === "auto" ? undefined : parseInt(val, 10));
+                }}
+                className="h-8 rounded-lg border border-border/60 bg-secondary/40 px-2 text-[11px] font-medium text-foreground focus:border-primary focus:outline-none cursor-pointer"
+              >
+                <option value="auto">{isArabic ? "العدد: تلقائي" : "Count: Auto"}</option>
+                <option value="5">{isArabic ? "حتى 5 أسئلة" : "Up to 5 Qs"}</option>
+                <option value="10">{isArabic ? "حتى 10 أسئلة" : "Up to 10 Qs"}</option>
+                <option value="15">{isArabic ? "حتى 15 سؤالاً" : "Up to 15 Qs"}</option>
+                <option value="20">{isArabic ? "حتى 20 سؤالاً" : "Up to 20 Qs"}</option>
+              </select>
 
               <Button
                 variant="outline"
@@ -556,8 +597,8 @@ export default function QuizView() {
                       {/* Question Header */}
                       <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                         <div className="font-medium text-sm sm:text-base text-foreground flex items-start gap-3">
-                          {/* Distinct Red Highlight Badge with Subtle Glow */}
-                          <span className="inline-flex items-center justify-center px-2.5 py-1 rounded-lg text-xs font-mono font-bold border border-rose-500/50 bg-rose-500/15 text-rose-300 shadow-[0_0_12px_rgba(244,63,94,0.35)] shrink-0 mt-0.5">
+                          {/* Distinct Red/Rose Highlight Badge with Crisp Contrast across All Themes */}
+                          <span className="inline-flex items-center justify-center px-2.5 py-1 rounded-lg text-xs font-mono font-bold border border-rose-500/50 bg-rose-500/15 text-rose-600 dark:text-rose-300 shadow-[0_0_12px_rgba(244,63,94,0.28)] shrink-0 mt-0.5">
                             {isQuestionArabic ? `السؤال ${qIndex + 1}` : `Question ${qIndex + 1}`}
                           </span>
                           <div className="space-y-1">

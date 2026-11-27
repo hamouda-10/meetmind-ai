@@ -101,7 +101,7 @@ export default function TranscriptView() {
       ? urlTab
       : "transcript",
   );
-  const [viewMode, setViewMode] = useState<"continuous" | "segments">("continuous");
+  const [viewMode, setViewMode] = useState<"continuous" | "segments" | "raw">("continuous");
   const [searchQuery, setSearchQuery] = useState("");
   const [speakerFilter, setSpeakerFilter] = useState<string>("ALL");
   const [editingSegId, setEditingSegId] = useState<string | null>(null);
@@ -658,8 +658,8 @@ export default function TranscriptView() {
     const toastId = "retranscribe-whisper";
     toast.loading(
       isArabic
-        ? "جاري إعادة التفريغ الصوتي بدقة عالية عبر Whisper AI..."
-        : "Starting fresh transcription with built-in Whisper AI...",
+        ? "جاري إعادة التفريغ الصوتي بدقة عالية عبر محرك التعرف الصوتي المخصص..."
+        : "Starting fresh high-accuracy speech-to-text transcription...",
       { id: toastId },
     );
 
@@ -1484,8 +1484,8 @@ export default function TranscriptView() {
                         ? "الملف الصوتي غير متاح على القرص لإعادة التفريغ"
                         : "Original audio file is not available on disk"
                       : isArabic
-                        ? "إعادة التفريغ الصوتي من الملف الأصلي باستخدام Whisper AI المدمج"
-                        : "Re-transcribe original audio from scratch using Built-in Whisper AI"
+                        ? "إعادة التفريغ الصوتي من الملف الأصلي باستخدام محرك ASR عالي الدقة (AssemblyAI)"
+                        : "Re-transcribe original audio from scratch using high-accuracy dedicated ASR"
                   }
                 >
                   <RefreshCw
@@ -1496,8 +1496,8 @@ export default function TranscriptView() {
                       ? `جاري التفريغ (${retranscribeProgress ?? 0}%)...`
                       : `Transcribing (${retranscribeProgress ?? 0}%)...`
                     : isArabic
-                      ? "إعادة التفريغ الصوتي بـ Whisper"
-                      : "Re-transcribe with Whisper AI"}
+                      ? "إعادة التفريغ الصوتي بدقة عالية"
+                      : "Re-transcribe (High-Accuracy ASR)"}
                 </Button>
 
                 {/* 1. تلخيص النص */}
@@ -1749,9 +1749,79 @@ export default function TranscriptView() {
                     >
                       {isArabic ? "المقاطع" : "Segments"}
                     </button>
+                    <button
+                      onClick={() => setViewMode("raw")}
+                      className={`px-3 py-1 text-xs font-semibold rounded-lg transition cursor-pointer ${
+                        viewMode === "raw"
+                          ? "bg-primary text-primary-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      {isArabic ? "الخام مقابل النهائي" : "Raw vs Final"}
+                    </button>
                   </div>
                 </div>
               </GlassCard>
+
+              {/* Honest Live vs Final Verified Status + ASR Metadata Strip */}
+              {currentSelection && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/50 bg-card/50 px-3.5 py-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {currentSelection.item.transcriptStatus === "live" ||
+                    currentSelection.item.transcriptionStatus === "Processing" ? (
+                      <Badge
+                        variant="outline"
+                        className="border-amber-500/50 bg-amber-500/15 text-amber-400 font-mono text-[11px] gap-1.5"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                        {isArabic
+                          ? "تفريغ مباشر (قيد المعالجة — غير نهائي)"
+                          : "Live Transcript (In Progress — Not Final)"}
+                      </Badge>
+                    ) : (
+                      <Badge
+                        variant="outline"
+                        className="border-emerald-500/40 bg-emerald-500/10 text-emerald-400 font-mono text-[11px] gap-1.5"
+                      >
+                        <CheckCircle2 className="h-3 w-3" />
+                        {isArabic ? "تفريغ نهائي معتمد" : "Final Verified Transcript"}
+                      </Badge>
+                    )}
+                    {(currentSelection.item.asrModel ||
+                      currentSelection.item.transcriptionProvider) && (
+                      <Badge variant="outline" className="font-mono text-[10.5px]">
+                        ASR:{" "}
+                        {currentSelection.item.asrModel ||
+                          currentSelection.item.transcriptionProvider}
+                      </Badge>
+                    )}
+                    {(currentSelection.item.languageConfig || currentSelection.item.language) && (
+                      <Badge variant="outline" className="font-mono text-[10.5px]">
+                        {isArabic ? "اللغة" : "Lang"}:{" "}
+                        {currentSelection.item.languageConfig || currentSelection.item.language}
+                      </Badge>
+                    )}
+                    {typeof currentSelection.item.diarizationEnabled === "boolean" && (
+                      <Badge variant="outline" className="font-mono text-[10.5px]">
+                        {isArabic ? "فصل المتحدثين" : "Diarization"}:{" "}
+                        {currentSelection.item.diarizationEnabled ? "ON" : "OFF"}
+                      </Badge>
+                    )}
+                    {typeof currentSelection.item.averageConfidence === "number" && (
+                      <Badge
+                        variant="outline"
+                        className="font-mono text-[10.5px] border-cyan-500/40 text-cyan-400"
+                      >
+                        {isArabic ? "متوسط الثقة" : "Avg Conf"}:{" "}
+                        {(currentSelection.item.averageConfidence * 100).toFixed(1)}%
+                      </Badge>
+                    )}
+                  </div>
+                  <span className="text-[10.5px] text-muted-foreground font-mono">
+                    {segments.length} {isArabic ? "مقطع" : "segments"}
+                  </span>
+                </div>
+              )}
 
               {/* View 1: ONE Main Continuous Transcript Block (Default) */}
               {viewMode === "continuous" ? (
@@ -1773,8 +1843,23 @@ export default function TranscriptView() {
                         {isArabic ? "النص الموحد الكامل" : "Continuous Full Transcript"}
                         <FileText className="h-4 w-4 text-primary" />
                       </h3>
-                      <Badge variant="outline" className="text-xs font-mono">
-                        {isArabic ? "تفريغ معتمد" : "Verified Transcript"}
+                      <Badge
+                        variant="outline"
+                        className={`text-xs font-mono ${
+                          currentSelection?.item.transcriptStatus === "live" ||
+                          currentSelection?.item.transcriptionStatus === "Processing"
+                            ? "border-amber-500/50 text-amber-400"
+                            : "border-emerald-500/40 text-emerald-400"
+                        }`}
+                      >
+                        {currentSelection?.item.transcriptStatus === "live" ||
+                        currentSelection?.item.transcriptionStatus === "Processing"
+                          ? isArabic
+                            ? "تفريغ مباشر"
+                            : "Live Transcript"
+                          : isArabic
+                            ? "تفريغ نهائي معتمد"
+                            : "Final Verified Transcript"}
                       </Badge>
                     </div>
                   </div>
@@ -1850,7 +1935,16 @@ export default function TranscriptView() {
                     </div>
                   ) : (
                     <div
-                      className={`prose prose-sm dark:prose-invert max-w-none ${isRtl ? "text-right" : "text-left"} font-sans leading-relaxed text-foreground/90 space-y-4 text-base selection:bg-primary/20`}
+                      dir={
+                        /[\u0600-\u06FF]/.test(filteredSegments.map((s) => s.text).join(" "))
+                          ? "rtl"
+                          : "ltr"
+                      }
+                      className={`prose prose-sm dark:prose-invert max-w-none ${
+                        /[\u0600-\u06FF]/.test(filteredSegments.map((s) => s.text).join(" "))
+                          ? "text-right"
+                          : "text-left"
+                      } font-sans leading-relaxed text-foreground/90 space-y-4 text-base selection:bg-primary/20`}
                     >
                       <p className="inline leading-loose">
                         {filteredSegments.map((seg, idx) => {
@@ -1895,6 +1989,88 @@ export default function TranscriptView() {
                     </div>
                   )}
                 </GlassCard>
+              ) : viewMode === "raw" ? (
+                /* View 3: RAW ASR vs Final Display Comparison Debugger (UTF-8 & Verbatim Integrity) */
+                <div className="space-y-4">
+                  <GlassCard className="p-4 space-y-2 border-cyan-500/30 bg-cyan-500/5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="font-display font-semibold text-sm text-foreground">
+                        {isArabic
+                          ? "فحص ومقارنة مسار التفريغ الصوتي: RAW ASR ← تنسيق غير مغير ← النص النهائي"
+                          : "ASR Pipeline Comparison: RAW ASR → Non-Destructive Formatting → Final Display"}
+                      </h3>
+                      <Badge
+                        variant="outline"
+                        className="font-mono text-[10.5px] text-cyan-400 border-cyan-500/40"
+                      >
+                        UTF-8 · أ إ آ ة ى ؤ ئ ء · Zero LLM Rewriting
+                      </Badge>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {isArabic
+                        ? "يُحفظ النص الخام الصادر مباشرة عن محرك التعرف الصوتي كمرجع أساسي غير معدّل. تقتصر المعالجة اللاحقة على المسافات وعلامات الترقيم وتسمية المتحدثين دون تغيير أي كلمة منطوقة."
+                        : "The verbatim RAW ASR output is preserved untouched as the source of truth. Formatting only tidies spacing, punctuation spacing, and speaker labels — never rewriting spoken words."}
+                    </p>
+                  </GlassCard>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <GlassCard className="p-5 space-y-3 border-amber-500/30">
+                      <div className="flex items-center justify-between border-b border-border/40 pb-2">
+                        <span className="text-xs font-bold text-amber-400 font-mono">
+                          1. RAW ASR TRANSCRIPT
+                        </span>
+                        <span className="text-[11px] text-muted-foreground font-mono">
+                          {currentSelection?.item.asrModel ||
+                            currentSelection?.item.transcriptionProvider ||
+                            "ASR"}
+                        </span>
+                      </div>
+                      <div
+                        dir={
+                          /[\u0600-\u06FF]/.test(
+                            currentSelection?.item.rawTranscript ||
+                              segments.map((s) => s.text).join(" "),
+                          )
+                            ? "rtl"
+                            : "ltr"
+                        }
+                        className="max-h-[420px] overflow-y-auto text-sm leading-loose whitespace-pre-wrap select-text text-foreground/90 font-sans"
+                      >
+                        {currentSelection?.item.rawTranscript ||
+                          segments.map((s) => s.text).join(" ")}
+                      </div>
+                    </GlassCard>
+
+                    <GlassCard className="p-5 space-y-3 border-emerald-500/30">
+                      <div className="flex items-center justify-between border-b border-border/40 pb-2">
+                        <span className="text-xs font-bold text-emerald-400 font-mono">
+                          2. FINAL DISPLAY TRANSCRIPT
+                        </span>
+                        <span className="text-[11px] text-muted-foreground font-mono">
+                          {currentSelection?.item.languageConfig ||
+                            currentSelection?.item.language ||
+                            "auto"}
+                        </span>
+                      </div>
+                      <div
+                        dir={
+                          /[\u0600-\u06FF]/.test(
+                            currentSelection?.item.processedTranscript ||
+                              currentSelection?.item.fullText ||
+                              segments.map((s) => `${s.speaker}: ${s.text}`).join("\n"),
+                          )
+                            ? "rtl"
+                            : "ltr"
+                        }
+                        className="max-h-[420px] overflow-y-auto text-sm leading-loose whitespace-pre-wrap select-text text-foreground/90 font-sans"
+                      >
+                        {currentSelection?.item.processedTranscript ||
+                          currentSelection?.item.fullText ||
+                          segments.map((s) => `${s.speaker}: ${s.text}`).join("\n")}
+                      </div>
+                    </GlassCard>
+                  </div>
+                </div>
               ) : (
                 /* View 2: Detailed Speaker Segments List */
                 <div className="space-y-3">

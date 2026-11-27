@@ -39,6 +39,10 @@ dist-ssr
 .env
 .env.*
 !.env.example
+data/.jwt_secret
+data/.provider_secrets.json
+data/audio_transcript_cache.json
+data/*.tmp.*
 
 # Runtime data & AI models
 data/recordings/*

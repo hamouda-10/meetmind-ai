@@ -61,6 +61,12 @@ export interface Meeting {
   participantsCount: number;
   status: "Completed" | "Processing" | "Queued" | "Failed";
   transcriptionStatus?: "Completed" | "Processing" | "Failed";
+  transcriptStatus?: "live" | "final_verified";
+  transcriptionProvider?: "n8n" | "assemblyai" | "gemini" | "whisper-local" | "live";
+  asrModel?: string;
+  languageConfig?: string;
+  diarizationEnabled?: boolean;
+  averageConfidence?: number;
   analysisStatus?: "Completed" | "Processing" | "Unavailable" | "Failed";
   analysisError?: string;
   analysisRetryable?: boolean;
@@ -78,6 +84,10 @@ export interface Meeting {
   keywords?: KeywordItem[];
   highlights?: HighlightItem[];
   analysis?: AnalysisRecord;
+  rawTranscript?: string;
+  processedTranscript?: string;
+  rawSegments?: TranscriptSegmentItem[];
+  fullText?: string;
   segments: TranscriptSegmentItem[];
 }
 
@@ -92,6 +102,12 @@ export interface Lecture {
   durationSeconds: number;
   status: "Completed" | "Processing" | "Queued" | "Failed";
   transcriptionStatus?: "Completed" | "Processing" | "Failed";
+  transcriptStatus?: "live" | "final_verified";
+  transcriptionProvider?: "n8n" | "assemblyai" | "gemini" | "whisper-local" | "live";
+  asrModel?: string;
+  languageConfig?: string;
+  diarizationEnabled?: boolean;
+  averageConfidence?: number;
   analysisStatus?: "Completed" | "Processing" | "Unavailable" | "Failed";
   analysisError?: string;
   analysisRetryable?: boolean;
@@ -110,6 +126,10 @@ export interface Lecture {
   keywords?: KeywordItem[];
   highlights?: HighlightItem[];
   analysis?: AnalysisRecord;
+  rawTranscript?: string;
+  processedTranscript?: string;
+  rawSegments?: TranscriptSegmentItem[];
+  fullText?: string;
   segments: TranscriptSegmentItem[];
 }
 
@@ -233,17 +253,185 @@ export interface DashboardMetrics {
   tasks: ActionItem[];
 }
 
+export interface StageTelemetryItem {
+  stage: string;
+  status: "pending" | "running" | "completed" | "failed";
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+  detail?: string;
+  error?: string;
+}
+
+export interface JobTimings {
+  uploadMs?: number;
+  validationMs?: number;
+  n8nWebhookMs?: number;
+  assemblyAiUploadMs?: number;
+  transcriptionMs?: number;
+  pollingWaitMs?: number;
+  pollCount?: number;
+  transcriptFetchMs?: number;
+  webhookTriggered?: boolean;
+  geminiAnalysisMs?: number;
+  summaryMs?: number;
+  keywordsMs?: number;
+  tasksMs?: number;
+  quizMs?: number;
+  flashcardsMs?: number;
+  databaseSaveMs?: number;
+  firstResultMs?: number;
+  totalMs?: number;
+  transcriptCacheHit?: boolean;
+  analysisCacheHit?: boolean;
+  pipelineMode?: "direct" | "n8n" | "local" | "cache";
+  audioHash?: string;
+  transcriptHash?: string;
+  analysisHash?: string;
+  transcriptionProvider?: string;
+  analysisProvider?: string;
+}
+
+export interface PipelinePerformanceJobEntry {
+  jobId: string;
+  correlationId?: string;
+  recordingId: string;
+  resourceType: "meeting" | "lecture";
+  title: string;
+  fileName: string;
+  status: string;
+  durationSeconds: number;
+  transcriptId?: string;
+  transcriptionProvider?: string;
+  transcriptStatus?: "live" | "final_verified";
+  asrModel?: string;
+  languageConfig?: string;
+  diarizationEnabled?: boolean;
+  averageConfidence?: number;
+  analysisProvider?: string;
+  timings: JobTimings;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PipelinePerformanceReport {
+  config: {
+    pipelineMode: string;
+    assemblyAiConfigured: boolean;
+    assemblyAiSpeechModel: string;
+    assemblyAiWebhookActive: boolean;
+    n8nConfigured: boolean;
+    geminiConfigured: boolean;
+    localWhisperWorkers: number;
+    localWhisperLongModel: string;
+  };
+  averages: {
+    sampleCount: number;
+    avgUploadMs: number;
+    avgTranscriptionMs: number;
+    avgAiAnalysisMs: number;
+    avgDatabaseSaveMs: number;
+    avgTotalMs: number;
+    cacheHitRatePercent: number;
+  };
+  recentJobs: PipelinePerformanceJobEntry[];
+}
+
+export interface JobMilestones {
+  uploadComplete?: boolean;
+  audioValidated?: boolean;
+  transcriptionStarted?: boolean;
+  languageDetected?: boolean;
+  transcriptionCompleted?: boolean;
+  transcriptSaved?: boolean;
+  analysisStarted?: boolean;
+  summaryReady?: boolean;
+  keywordsReady?: boolean;
+  tasksReady?: boolean;
+  quizReady?: boolean;
+  flashcardsReady?: boolean;
+  databaseSaved?: boolean;
+  completed?: boolean;
+}
+
 export interface Job {
   id: string;
+  correlationId?: string;
   status: string;
+  canonicalStatus?:
+    | "uploading"
+    | "validating"
+    | "transcribing"
+    | "analyzing"
+    | "saving"
+    | "completed"
+    | "failed"
+    | "cancelled";
   progressPercent: number;
+  progress?: number;
+  stageProgress?: number;
+  currentOperation?: string;
+  currentOperationAr?: string;
+  fileSizeBytes?: number;
+  audioDurationSeconds?: number;
+  detectedLanguage?: string;
+  segmentsReceived?: number;
+  wordsReceived?: number;
+  transcriptAvailable?: boolean;
+  transcriptCompleted?: boolean;
+  analysisStarted?: boolean;
+  elapsedSeconds?: number;
+  lastUpdatedSecondsAgo?: number;
+  estimatedRemainingSeconds?: number | null;
+  delayed?: boolean;
+  delayReason?: string | null;
   resourceType: string;
   resourceId: string;
+  recordingId?: string;
+  retryable?: boolean;
+  failureCategory?: string;
   errorMessage?: string;
+  error?: string | null;
   stage?: string;
+  transcriptId?: string;
+  transcriptionProvider?: string;
+  transcriptStatus?: "live" | "final_verified";
+  asrModel?: string;
+  languageConfig?: string;
+  diarizationEnabled?: boolean;
+  averageConfidence?: number;
+  analysisProvider?: string;
   partialSegmentsCount?: number;
   latestTextPreview?: string;
   latestSegments?: TranscriptSegmentItem[];
+  timings?: JobTimings;
+  milestones?: JobMilestones;
+  stageLedger?: Record<string, StageTelemetryItem>;
+  progressiveSummary?: string;
+  progressiveKeywords?: string[];
+  progressiveKeywordsCount?: number;
+  progressiveTasks?: Array<{ title: string; ownerName?: string; dueDate?: string }>;
+  progressiveTasksCount?: number;
+  progressiveQuizCount?: number;
+  progressiveFlashcardsCount?: number;
+}
+
+export interface ProviderSecretStatus {
+  configured: boolean;
+  source: "env" | "runtime" | "none";
+  hint: string;
+}
+
+export interface SystemProvidersResponse {
+  providers: {
+    assemblyAi: ProviderSecretStatus;
+    gemini: ProviderSecretStatus;
+    n8nWebhookUrl: ProviderSecretStatus;
+    n8nWebhookSecret: ProviderSecretStatus;
+  };
+  assemblyAiConfigured: boolean;
+  geminiConfigured: boolean;
+  n8nConfigured: boolean;
 }
 
 export interface AiEngineStatus {
@@ -1044,16 +1232,54 @@ class ApiClient {
     uploadId: string,
     index: number,
     chunk: Blob,
+    onChunkProgress?: (loadedBytes: number) => void,
   ): Promise<{ uploadId: string; receivedBytes: number; expectedSize: number }> {
-    return this.request(
-      `/api/v1/recordings/upload/chunk?uploadId=${encodeURIComponent(uploadId)}&index=${index}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: chunk,
-        timeoutMs: 120000,
-      },
-    );
+    const endpoint = `/api/v1/recordings/upload/chunk?uploadId=${encodeURIComponent(uploadId)}&index=${index}`;
+    if (typeof XMLHttpRequest !== "undefined" && onChunkProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", resolveApiEndpoint(endpoint), true);
+        xhr.withCredentials = true;
+        const headers = this.buildHeaders(
+          { "Content-Type": "application/octet-stream" },
+          { isFormData: true },
+        );
+        for (const [k, v] of Object.entries(headers)) {
+          xhr.setRequestHeader(k, v);
+        }
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) onChunkProgress(e.loaded);
+        };
+        xhr.onload = () => {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            if (xhr.status >= 200 && xhr.status < 300) {
+              onChunkProgress(chunk.size);
+              resolve(data);
+            } else {
+              reject(new Error(data.error || `Chunk upload failed (${xhr.status})`));
+            }
+          } catch {
+            reject(new Error(`Chunk upload failed (${xhr.status})`));
+          }
+        };
+        xhr.onerror = () => reject(new Error("Network error during chunk upload."));
+        xhr.ontimeout = () => reject(new Error("Chunk upload timed out."));
+        xhr.timeout = 120000;
+        xhr.send(chunk);
+      });
+    }
+
+    return this.request(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: chunk,
+      timeoutMs: 120000,
+    });
+  }
+
+  async getPipelinePerformance(): Promise<PipelinePerformanceReport> {
+    return this.request<PipelinePerformanceReport>("/api/v1/system/performance", { retries: 0 });
   }
 
   async completeChunkedUpload(uploadId: string): Promise<{
@@ -1079,15 +1305,98 @@ class ApiClient {
 
   async reprocessRecording(
     id: string,
+    language?: string,
   ): Promise<{ success: boolean; jobId: string; resourceId: string; status: string }> {
     return this.request(`/api/v1/recordings/${id}/reprocess`, {
       method: "POST",
+      ...(language ? { body: JSON.stringify({ language }) } : {}),
     });
   }
 
-  // Jobs
+  // Jobs & Real-Time Recording Processing Status (SSE + Short Polling)
   async getJob(id: string): Promise<Job> {
-    return this.request(`/api/v1/jobs/${id}`);
+    return this.request(`/api/v1/jobs/${encodeURIComponent(id)}`, { retries: 0 });
+  }
+
+  async getRecordingStatus(recordingOrJobId: string): Promise<Job> {
+    return this.request(`/api/v1/recordings/${encodeURIComponent(recordingOrJobId)}/status`, {
+      retries: 0,
+    });
+  }
+
+  streamRecordingStatus(
+    recordingOrJobId: string,
+    callbacks: {
+      onUpdate: (status: Job) => void;
+      onError?: (err: Error) => void;
+    },
+  ): () => void {
+    const controller = new AbortController();
+    const endpoint = resolveApiEndpoint(
+      `/api/v1/recordings/${encodeURIComponent(recordingOrJobId)}/stream`,
+    );
+
+    void (async () => {
+      try {
+        let res = await fetch(endpoint, {
+          method: "GET",
+          credentials: "include",
+          headers: this.buildHeaders({ Accept: "text/event-stream" }, { isFormData: true }),
+          signal: controller.signal,
+        });
+        if (res.status === 401) {
+          const renewed = await this.tryRefreshSession();
+          if (renewed) {
+            res = await fetch(endpoint, {
+              method: "GET",
+              credentials: "include",
+              headers: this.buildHeaders({ Accept: "text/event-stream" }, { isFormData: true }),
+              signal: controller.signal,
+            });
+          }
+        }
+        if (!res.ok || !res.body) {
+          throw new Error(`Status stream unavailable (${res.status})`);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (!controller.signal.aborted) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const blocks = buffer.split("\n\n");
+          buffer = blocks.pop() || "";
+          for (const block of blocks) {
+            const lines = block.split(/\r?\n/);
+            for (const line of lines) {
+              if (line.startsWith("data:")) {
+                const raw = line.slice(5).trim();
+                if (!raw) continue;
+                try {
+                  const parsed = JSON.parse(raw) as Job;
+                  if (parsed && (parsed.id || parsed.recordingId || parsed.resourceId)) {
+                    callbacks.onUpdate(parsed);
+                  }
+                } catch {
+                  // ignore non-JSON frames
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          callbacks.onError?.(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+    })();
+
+    return () => {
+      controller.abort();
+    };
   }
 
   async cancelJob(id: string): Promise<{ success: boolean; job: Job }> {
@@ -1096,11 +1405,42 @@ class ApiClient {
     });
   }
 
+  async getSystemProviders(): Promise<SystemProvidersResponse> {
+    return this.request<SystemProvidersResponse>("/api/v1/system/providers", { retries: 0 });
+  }
+
+  async updateSystemProviders(
+    payload: Partial<{
+      assemblyAiApiKey: string | null;
+      geminiApiKey: string | null;
+      n8nWebhookUrl: string | null;
+      n8nWebhookSecret: string | null;
+    }>,
+  ): Promise<SystemProvidersResponse & { success: boolean }> {
+    return this.request<SystemProvidersResponse & { success: boolean }>(
+      "/api/v1/system/providers",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+        retries: 0,
+      },
+    );
+  }
+
   // Transcripts
   async getTranscript(id: string): Promise<{
     id: string;
     title: string;
     type: string;
+    transcriptStatus?: "live" | "final_verified";
+    transcriptionProvider?: string;
+    asrModel?: string;
+    languageConfig?: string;
+    diarizationEnabled?: boolean;
+    averageConfidence?: number;
+    rawTranscript?: string;
+    processedTranscript?: string;
+    rawSegments?: TranscriptSegmentItem[];
     segments: TranscriptSegmentItem[];
     keywords?: KeywordItem[];
     highlights?: HighlightItem[];
@@ -1276,6 +1616,16 @@ class ApiClient {
     language?: string;
     status: string;
     resourceStatus?: string;
+    transcriptionStatus?: "Completed" | "Processing" | "Failed";
+    transcriptStatus?: "live" | "final_verified";
+    transcriptionProvider?: string;
+    asrModel?: string;
+    languageConfig?: string;
+    diarizationEnabled?: boolean;
+    averageConfidence?: number;
+    rawTranscript?: string;
+    processedTranscript?: string;
+    rawSegments?: Meeting["segments"];
     segments: Meeting["segments"];
     fullText: string;
     durationSeconds: number;

@@ -44,8 +44,24 @@ import {
   transcribeAudioWithLocalWhisper,
   warmupWhisperModel,
   getAsrEngineStatus,
+  getWhisperPoolDiagnostics,
 } from "./whisper-asr";
 import { warmupLocalLlm, getLocalLlmStatus } from "./local-llm";
+import { getN8nConfig } from "./n8n-integration";
+import {
+  getConfiguredAssemblyAiSpeechModels,
+  isAssemblyAiConfigured,
+  notifyAssemblyAiWebhook,
+  resolveAssemblyAiWebhookUrl,
+  transcribeAudioWithAssemblyAi,
+} from "./assemblyai";
+import { createCorrelationId, logObservabilityEvent, logStageTiming } from "./pipeline-logger";
+import {
+  getProviderSecretsPublicStatus,
+  updateProviderSecrets,
+  type SupportedProviderSecretKey,
+} from "./provider-secrets";
+import { computeFileSha256 } from "./pipeline-cache";
 import {
   deleteStoredAvatarFile,
   getAvatarsDir,
@@ -208,6 +224,8 @@ async function finalizeUploadedRecording(params: {
   appLanguage?: "en" | "ar";
   idempotencyKey: string;
   user: UserRecord | null;
+  uploadStartedAtMs?: number;
+  correlationId?: string;
 }): Promise<Response> {
   const {
     savedPath,
@@ -219,9 +237,13 @@ async function finalizeUploadedRecording(params: {
     appLanguage,
     idempotencyKey,
     user,
+    uploadStartedAtMs,
+    correlationId: incomingCorrId,
   } = params;
 
+  const valStartedAt = Date.now();
   const probe = await validateMediaFile(savedPath, originalFilename);
+  const validationMs = Date.now() - valStartedAt;
   if (!probe.valid) {
     try {
       if (fs.existsSync(savedPath)) fs.unlinkSync(savedPath);
@@ -251,9 +273,8 @@ async function finalizeUploadedRecording(params: {
   let fileSha256 = "";
   let fileSize = 0;
   try {
-    const fileBuf = fs.readFileSync(effectivePath);
-    fileSha256 = crypto.createHash("sha256").update(fileBuf).digest("hex");
-    fileSize = fileBuf.length;
+    fileSize = fs.statSync(effectivePath).size;
+    fileSha256 = computeFileSha256(effectivePath);
   } catch {
     /* fallback */
   }
@@ -352,14 +373,42 @@ async function finalizeUploadedRecording(params: {
     ]);
   }
 
+  const correlationId = incomingCorrId || createCorrelationId("upl");
+  const uploadMs = uploadStartedAtMs ? Math.max(1, Date.now() - uploadStartedAtMs) : validationMs;
+  logStageTiming(correlationId, "UPLOAD_COMPLETE", uploadMs, {
+    fileSize,
+    validationMs,
+  });
+
   const job = createJob(resourceType, resourceId, originalFilename, effectivePath, language, {
     userId: user?.id || "usr_admin",
     idempotencyKey: idempotencyKey || undefined,
     appLanguage: resolvedAppLang,
   });
-  if (fileSha256) {
-    db.update("jobs", (jobs) => jobs.map((j) => (j.id === job.id ? { ...j, fileSha256 } : j)));
-  }
+  db.update("jobs", (jobs) =>
+    jobs.map((j) =>
+      j.id === job.id
+        ? {
+            ...j,
+            correlationId,
+            timings: { uploadMs, validationMs },
+            milestones: { uploadComplete: true },
+            ...(fileSha256 ? { fileSha256 } : {}),
+          }
+        : j,
+    ),
+  );
+  logObservabilityEvent("info", "upload_completed", {
+    correlationId,
+    jobId: job.id,
+    resourceId,
+    resourceType,
+    originalFilename,
+    fileSize,
+    uploadMs,
+    validationMs,
+    durationSeconds: probe.durationSeconds,
+  });
 
   setTimeout(() => {
     void processRecordingJob(
@@ -369,18 +418,30 @@ async function finalizeUploadedRecording(params: {
       effectivePath,
       originalFilename,
       language,
+      {
+        durationSeconds: probe.durationSeconds,
+        detectedMimeType: probe.detectedMimeType,
+        hasVideo: probe.hasVideo,
+        fileSha256: fileSha256 || undefined,
+        uploadMs,
+        validationMs,
+      },
     );
-  }, 50);
+  }, 10);
 
   return Response.json(
     {
       message: "Recording accepted for transcription and analysis",
       jobId: job.id,
+      recordingId: resourceId,
+      correlationId,
       resourceId,
       resourceType,
+      fileSizeBytes: fileSize,
       durationSeconds: probe.durationSeconds,
+      uploadMs,
       repaired: Boolean(probe.repairedPath),
-      status: "Queued",
+      status: "processing",
     },
     { status: 202 },
   );
@@ -502,13 +563,28 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       const asr = getAsrEngineStatus();
       const llm = getLocalLlmStatus();
       const geminiCfg = getGeminiConfig();
+      const n8nCfg = getN8nConfig();
       const persistence = db.getPersistenceStatus();
       return Response.json({
         status: "healthy",
         service: "meetmind-api",
         timestamp: new Date().toISOString(),
         aiConfigured: true,
-        aiEngine: isGeminiConfigured() ? "gemini+local-onnx" : "local-onnx",
+        aiEngine: n8nCfg.usableInCurrentEnv
+          ? "n8n+assemblyai+gemini"
+          : isAssemblyAiConfigured()
+            ? "assemblyai+gemini+local-onnx"
+            : isGeminiConfigured()
+              ? "gemini+local-onnx"
+              : "local-onnx",
+        n8n: {
+          configured: n8nCfg.configured,
+          mode: !n8nCfg.configured ? "unconfigured" : n8nCfg.isLocalhost ? "local" : "remote",
+          usableInCurrentEnv: n8nCfg.usableInCurrentEnv,
+          host: n8nCfg.hostLabel,
+          fallbackToDirect: n8nCfg.fallbackToDirect,
+        },
+        assemblyAiConfigured: isAssemblyAiConfigured(),
         models: {
           geminiText: geminiCfg.textModel,
           geminiFallback: geminiCfg.fallbackTextModel,
@@ -533,13 +609,17 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       const llm = getLocalLlmStatus();
       const cloudGemini = isGeminiConfigured();
       const geminiCfg = getGeminiConfig();
+      const n8nCfg = getN8nConfig();
       const warming = asr.state === "loading" || llm.state === "loading";
       const hasError = asr.state === "error" || llm.state === "error";
       const ready =
         !warming &&
         !hasError &&
-        (asr.state === "ready" || asr.cachedOnDisk) &&
-        (llm.state === "ready" || llm.cachedOnDisk || cloudGemini);
+        (n8nCfg.usableInCurrentEnv ||
+          isAssemblyAiConfigured() ||
+          asr.state === "ready" ||
+          asr.cachedOnDisk) &&
+        (n8nCfg.usableInCurrentEnv || llm.state === "ready" || llm.cachedOnDisk || cloudGemini);
 
       return Response.json(
         {
@@ -548,6 +628,13 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
           asr,
           llm,
           cloudGemini,
+          assemblyAiConfigured: isAssemblyAiConfigured(),
+          n8n: {
+            configured: n8nCfg.configured,
+            mode: !n8nCfg.configured ? "unconfigured" : n8nCfg.isLocalhost ? "local" : "remote",
+            usableInCurrentEnv: n8nCfg.usableInCurrentEnv,
+            host: n8nCfg.hostLabel,
+          },
           streamingSupported: true,
           geminiModels: {
             textModel: geminiCfg.textModel,
@@ -1058,6 +1145,41 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     }
 
     // ----------------------------------------------------
+    // PUBLIC WEBHOOK CALLBACK: ASSEMBLYAI TRANSCRIPTION READY
+    // Immediately wakes awaiting transcription jobs with zero polling delay
+    // ----------------------------------------------------
+    if (pathname === "/api/v1/webhooks/assemblyai" && method === "POST") {
+      const configuredSecret = (process.env.ASSEMBLYAI_WEBHOOK_SECRET || "").trim();
+      if (configuredSecret) {
+        const providedSecret = (req.headers.get("x-meetmind-webhook-secret") || "").trim();
+        if (providedSecret !== configuredSecret) {
+          return Response.json({ error: "Unauthorized webhook signature." }, { status: 401 });
+        }
+      }
+      const payload = (await req.json().catch(() => ({}))) as {
+        transcript_id?: string;
+        status?: "completed" | "error";
+        error?: string;
+      };
+      const transcriptId = String(payload.transcript_id || "").trim();
+      const status = payload.status === "error" ? "error" : "completed";
+      if (!transcriptId) {
+        return Response.json({ error: "Missing transcript_id" }, { status: 400 });
+      }
+      const matched = notifyAssemblyAiWebhook({
+        transcript_id: transcriptId,
+        status,
+        error: payload.error,
+      });
+      logObservabilityEvent("info", "assemblyai_webhook_received", {
+        transcriptId,
+        status,
+        wokeActiveJob: matched,
+      });
+      return Response.json({ received: true, transcriptId, wokeActiveJob: matched });
+    }
+
+    // ----------------------------------------------------
     // CENTRAL AUTHENTICATION GATE (ALL ROUTES BELOW REQUIRE VALID SESSION)
     // ----------------------------------------------------
     const auth = authenticateRequest(req);
@@ -1564,6 +1686,41 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       const hoursSaved =
         totalAudioDurationSeconds > 0 ? Math.round((totalAudioDurationSeconds / 3600) * 3) : 0;
 
+      // Slim dashboard summary cards: omit heavy rawTranscript / rawSegments / htmlReport blobs
+      // to keep /api/v1/dashboard/metrics payload ultra-light (<15KB instead of >500KB)
+      const slimDashboardRecording = <
+        T extends {
+          segments?: TranscriptSegment[];
+          rawSegments?: TranscriptSegment[];
+          rawTranscript?: string;
+          processedTranscript?: string;
+          htmlReport?: string;
+          fullText?: string;
+          detailedSummary?: string;
+        },
+      >(
+        rec: T,
+      ) => {
+        const {
+          rawSegments: _rs,
+          rawTranscript: _rt,
+          processedTranscript: _pt,
+          htmlReport: _hr,
+          detailedSummary: _ds,
+          ...rest
+        } = rec;
+        void _rs;
+        void _rt;
+        void _pt;
+        void _hr;
+        void _ds;
+        return {
+          ...rest,
+          fullText: rec.fullText ? rec.fullText.slice(0, 420) : undefined,
+          segments: Array.isArray(rec.segments) ? rec.segments.slice(0, 3) : [],
+        };
+      };
+
       return Response.json(
         {
           totalMeetings: meetings.length,
@@ -1578,8 +1735,8 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
           pendingTasks,
           processingJobs,
           hoursSaved,
-          recentMeetings: meetings.slice(0, 4),
-          recentLectures: lectures.slice(0, 3),
+          recentMeetings: meetings.slice(0, 4).map(slimDashboardRecording),
+          recentLectures: lectures.slice(0, 3).map(slimDashboardRecording),
           tasks: tasks.slice(0, 5),
         },
         {
@@ -1721,12 +1878,16 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     if (pathname === "/api/v1/meetings" && method === "GET") {
       const user = getAuthUser(req);
       const allMeetings = db.get("meetings");
-      const scoped = isUserAdmin(user)
-        ? allMeetings
-        : allMeetings.filter((m) => m.hostId === user?.id);
+      const scoped = (
+        isUserAdmin(user) ? allMeetings : allMeetings.filter((m) => m.hostId === user?.id)
+      ).map(({ rawSegments: _rs, htmlReport: _hr, ...rest }) => {
+        void _rs;
+        void _hr;
+        return rest;
+      });
       return Response.json(scoped, {
         headers: {
-          "Cache-Control": "private, max-age=5, stale-while-revalidate=15",
+          "Cache-Control": "private, max-age=10, stale-while-revalidate=30",
         },
       });
     }
@@ -1904,12 +2065,16 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
     if (pathname === "/api/v1/lectures" && method === "GET") {
       const user = getAuthUser(req);
       const allLectures = db.get("lectures");
-      const scoped = isUserAdmin(user)
-        ? allLectures
-        : allLectures.filter((l) => l.instructorId === user?.id);
+      const scoped = (
+        isUserAdmin(user) ? allLectures : allLectures.filter((l) => l.instructorId === user?.id)
+      ).map(({ rawSegments: _rs, htmlReport: _hr, ...rest }) => {
+        void _rs;
+        void _hr;
+        return rest;
+      });
       return Response.json(scoped, {
         headers: {
-          "Cache-Control": "private, max-age=5, stale-while-revalidate=15",
+          "Cache-Control": "private, max-age=10, stale-while-revalidate=30",
         },
       });
     }
@@ -2298,11 +2463,27 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
         appLanguage,
         idempotencyKey: session.idempotencyKey,
         user,
+        uploadStartedAtMs: session.createdAt,
+        correlationId: session.uploadId,
       });
     }
 
-    if (pathname === "/api/v1/recordings/upload" && method === "POST") {
+    if (
+      (pathname === "/api/v1/recordings/upload" || pathname === "/api/v1/recordings") &&
+      method === "POST"
+    ) {
+      const uploadStartedAtMs = Date.now();
       const user = getAuthUser(req);
+      const reqCorrelationId =
+        req.headers.get("X-Correlation-ID")?.trim() ||
+        req.headers.get("X-Request-ID")?.trim() ||
+        createCorrelationId("upl");
+      logStageTiming(reqCorrelationId, "UPLOAD_START");
+      logObservabilityEvent("info", "upload_started", {
+        correlationId: reqCorrelationId,
+        userId: user?.id || "anonymous",
+        contentType: req.headers.get("content-type") || "",
+      });
       const headerIdemKey = req.headers.get("Idempotency-Key")?.trim();
       const contentType = req.headers.get("content-type") || "";
       let resourceType: "meeting" | "lecture" = "meeting";
@@ -2425,6 +2606,8 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
         appLanguage,
         idempotencyKey,
         user,
+        uploadStartedAtMs,
+        correlationId: reqCorrelationId,
       });
     }
 
@@ -2538,13 +2721,18 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       }
 
       const rType = meeting ? "meeting" : "lecture";
+      const body = await req.json().catch(() => ({}) as { language?: string });
+      const requestedLanguage =
+        typeof body?.language === "string" && body.language.trim()
+          ? body.language.trim()
+          : item.language || "auto";
       const rawAppLang = req.headers.get("x-app-language");
       const appLanguage: "en" | "ar" =
         rawAppLang === "ar"
           ? "ar"
           : rawAppLang === "en"
             ? "en"
-            : item.appLanguage || (item.language?.startsWith("en") ? "en" : "ar");
+            : item.appLanguage || (requestedLanguage.startsWith("en") ? "en" : "ar");
 
       const nowIso = new Date().toISOString();
       if (meeting) {
@@ -2554,8 +2742,10 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
               ? {
                   ...m,
                   recordingPath: resolvedAudioPath,
+                  language: requestedLanguage,
                   status: "Processing",
                   transcriptionStatus: "Processing",
+                  transcriptStatus: "live",
                   updatedAt: nowIso,
                 }
               : m,
@@ -2568,8 +2758,10 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
               ? {
                   ...l,
                   recordingPath: resolvedAudioPath,
+                  language: requestedLanguage,
                   status: "Processing",
                   transcriptionStatus: "Processing",
+                  transcriptStatus: "live",
                   updatedAt: nowIso,
                 }
               : l,
@@ -2582,7 +2774,7 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
         id,
         item.recordingFileName || path.basename(resolvedAudioPath),
         resolvedAudioPath,
-        item.language || "auto",
+        requestedLanguage,
         {
           userId: user?.id || "usr_admin",
           appLanguage,
@@ -2596,7 +2788,11 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
           id,
           resolvedAudioPath,
           item.recordingFileName || item.title,
-          item.language || "auto",
+          requestedLanguage,
+          {
+            durationSeconds: item.durationSeconds || 1,
+            forceRetranscribe: true,
+          },
         );
       }, 50);
 
@@ -2775,31 +2971,321 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
       }
     }
 
-    if (pathname.startsWith("/api/v1/jobs/") && method === "GET") {
-      const id = pathname.replace("/api/v1/jobs/", "");
-      const job = db
-        .get("jobs")
-        .find((j) => j.id === id && (currentIsAdmin || j.userId === currentUser.id));
-      if (!job) return Response.json({ error: "Job not found" }, { status: 404 });
-
+    const buildCanonicalJobStatus = (lookupId: string) => {
+      const jobs = db.get("jobs");
+      const job = jobs.find(
+        (j) =>
+          (j.id === lookupId || j.resourceId === lookupId) &&
+          (currentIsAdmin || j.userId === currentUser.id),
+      );
+      const linkedMeeting = db.get("meetings").find((m) => m.id === (job?.resourceId || lookupId));
+      const linkedLecture = db.get("lectures").find((l) => l.id === (job?.resourceId || lookupId));
       const linkedResource =
-        job.resourceType === "lecture"
-          ? db.get("lectures").find((l) => l.id === job.resourceId)
-          : db.get("meetings").find((m) => m.id === job.resourceId);
+        job?.resourceType === "lecture"
+          ? linkedLecture
+          : job?.resourceType === "meeting"
+            ? linkedMeeting
+            : linkedMeeting || linkedLecture;
+
+      if (!job && !linkedResource) return null;
+      if (!job && linkedResource) {
+        const ownerId =
+          "hostId" in linkedResource ? linkedResource.hostId : linkedResource.instructorId;
+        if (!currentIsAdmin && ownerId !== currentUser.id) return null;
+      }
+
       const resourceSegments = linkedResource?.segments || [];
-      const latestSegments = resourceSegments.slice(-4);
-      const latestTextPreview = latestSegments
+      const latestSegments = resourceSegments.slice(-8);
+      const latestTextPreview = resourceSegments
+        .slice(-4)
         .map((s) => s.text)
         .join(" ")
         .trim()
-        .slice(-280);
+        .slice(-320);
 
-      return Response.json({
-        ...job,
-        partialSegmentsCount: resourceSegments.length,
+      const wordsFromResource = resourceSegments.length
+        ? resourceSegments
+            .map((s) => s.text)
+            .join(" ")
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean).length
+        : 0;
+      const segmentsReceived = Math.max(job?.segmentsReceived || 0, resourceSegments.length);
+      const wordsReceived = Math.max(job?.wordsReceived || 0, wordsFromResource);
+
+      const rawStatus =
+        job?.status || (linkedResource?.status === "Completed" ? "Completed" : "Processing");
+      const canonicalStatus:
+        | "uploading"
+        | "validating"
+        | "transcribing"
+        | "analyzing"
+        | "saving"
+        | "completed"
+        | "failed"
+        | "cancelled" =
+        rawStatus === "Uploaded"
+          ? "uploading"
+          : rawStatus === "Validating" || rawStatus === "ExtractingAudio" || rawStatus === "Queued"
+            ? "validating"
+            : rawStatus === "Transcribing" || rawStatus === "Translating" || rawStatus === "Merging"
+              ? "transcribing"
+              : rawStatus === "Analyzing" || rawStatus === "Generating Quiz"
+                ? "analyzing"
+                : rawStatus === "Generating Results"
+                  ? "saving"
+                  : rawStatus === "Completed"
+                    ? "completed"
+                    : rawStatus === "Failed"
+                      ? "failed"
+                      : "cancelled";
+
+      const canonicalStage =
+        canonicalStatus === "uploading"
+          ? "upload"
+          : canonicalStatus === "validating"
+            ? "validation"
+            : canonicalStatus === "transcribing"
+              ? "transcription"
+              : canonicalStatus === "analyzing"
+                ? "analysis"
+                : canonicalStatus === "saving"
+                  ? "database"
+                  : canonicalStatus;
+
+      const progressPercent = job?.progressPercent ?? (canonicalStatus === "completed" ? 100 : 25);
+      const stageProgress =
+        typeof job?.stageProgress === "number"
+          ? job.stageProgress
+          : canonicalStatus === "completed"
+            ? 100
+            : progressPercent;
+
+      const createdAtMs =
+        Date.parse(job?.createdAt || linkedResource?.createdAt || "") || Date.now();
+      const updatedAtMs =
+        Date.parse(job?.updatedAt || linkedResource?.updatedAt || "") || Date.now();
+      const nowMs = Date.now();
+      const elapsedSeconds =
+        canonicalStatus === "completed" && typeof job?.timings?.totalMs === "number"
+          ? Math.max(1, Math.round(job.timings.totalMs / 1000))
+          : Math.max(0, Math.round((nowMs - createdAtMs) / 1000));
+      const lastUpdatedSecondsAgo = Math.max(0, Math.round((nowMs - updatedAtMs) / 1000));
+
+      const transcriptCompleted = Boolean(
+        job?.milestones?.transcriptionCompleted ||
+        linkedResource?.transcriptionStatus === "Completed" ||
+        canonicalStatus === "analyzing" ||
+        canonicalStatus === "saving" ||
+        canonicalStatus === "completed",
+      );
+      const transcriptAvailable = segmentsReceived > 0 || transcriptCompleted;
+      const analysisStarted = Boolean(
+        job?.milestones?.analysisStarted ||
+        canonicalStatus === "analyzing" ||
+        canonicalStatus === "saving" ||
+        canonicalStatus === "completed",
+      );
+
+      // Compute honest estimated remaining time strictly from real measured rate (null when not yet measurable)
+      let estimatedRemainingSeconds: number | null = null;
+      if (
+        canonicalStatus === "completed" ||
+        canonicalStatus === "failed" ||
+        canonicalStatus === "cancelled"
+      ) {
+        estimatedRemainingSeconds = 0;
+      } else if (
+        canonicalStatus === "transcribing" &&
+        stageProgress >= 8 &&
+        stageProgress < 100 &&
+        elapsedSeconds >= 2
+      ) {
+        const estTransRem = Math.round((elapsedSeconds * (100 - stageProgress)) / stageProgress);
+        estimatedRemainingSeconds = Math.max(3, estTransRem + 5);
+      } else if (canonicalStatus === "analyzing") {
+        const doneCount = [
+          job?.milestones?.keywordsReady,
+          job?.milestones?.summaryReady,
+          job?.milestones?.quizReady,
+          job?.milestones?.flashcardsReady,
+        ].filter(Boolean).length;
+        estimatedRemainingSeconds = Math.max(2, (4 - doneCount) * 3);
+      }
+
+      const delayed =
+        canonicalStatus === "transcribing" && lastUpdatedSecondsAgo >= 22 && !job?.errorMessage;
+      const providerLabel =
+        job?.transcriptionProvider === "assemblyai"
+          ? "AssemblyAI"
+          : job?.transcriptionProvider === "n8n"
+            ? "n8n + AssemblyAI"
+            : "local Whisper ASR";
+      const delayReason = delayed ? `${providerLabel} is still processing the audio stream.` : null;
+
+      return {
+        ...(job || {}),
+        id: job?.id || `job_${linkedResource?.id}`,
+        jobId: job?.id || `job_${linkedResource?.id}`,
+        recordingId: job?.resourceId || linkedResource?.id || lookupId,
+        resourceId: job?.resourceId || linkedResource?.id || lookupId,
+        resourceType: job?.resourceType || (linkedLecture ? "lecture" : "meeting"),
+        status: job?.status || rawStatus,
+        canonicalStatus,
+        progress: progressPercent,
+        progressPercent,
+        stage: job?.stage || canonicalStage,
+        canonicalStage,
+        stageProgress,
+        currentOperation: job?.currentOperation || undefined,
+        currentOperationAr: job?.currentOperationAr || undefined,
+        fileSizeBytes: job?.fileSizeBytes || linkedResource?.fileSize,
+        audioDurationSeconds: job?.audioDurationSeconds || linkedResource?.durationSeconds,
+        detectedLanguage: job?.detectedLanguage || linkedResource?.language,
+        segmentsReceived,
+        wordsReceived,
+        transcriptAvailable,
+        transcriptCompleted,
+        analysisStarted,
+        elapsedSeconds,
+        lastUpdatedSecondsAgo,
+        estimatedRemainingSeconds,
+        delayed,
+        delayReason,
+        error: job?.errorMessage || null,
+        errorMessage: job?.errorMessage,
+        retryable: job?.retryable ?? false,
+        transcriptStatus:
+          job?.transcriptStatus ||
+          linkedResource?.transcriptStatus ||
+          (transcriptCompleted ? "final_verified" : "live"),
+        asrModel: job?.asrModel || linkedResource?.asrModel,
+        languageConfig: job?.languageConfig || linkedResource?.languageConfig,
+        diarizationEnabled: job?.diarizationEnabled ?? linkedResource?.diarizationEnabled,
+        averageConfidence: job?.averageConfidence ?? linkedResource?.averageConfidence,
+        partialSegmentsCount: segmentsReceived,
         latestTextPreview,
         latestSegments,
+      };
+    };
+
+    const createJobStatusSseResponse = (lookupId: string) => {
+      const initial = buildCanonicalJobStatus(lookupId);
+      if (!initial) {
+        return Response.json({ error: "Recording or job not found" }, { status: 404 });
+      }
+      const targetJobId = initial.jobId;
+      const targetResourceId = initial.resourceId;
+
+      const stream = new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          let closed = false;
+          const sendSnapshot = () => {
+            if (closed) return;
+            const snap = buildCanonicalJobStatus(lookupId);
+            if (!snap) return;
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(snap)}\n\n`));
+              if (
+                snap.canonicalStatus === "completed" ||
+                snap.canonicalStatus === "failed" ||
+                snap.canonicalStatus === "cancelled"
+              ) {
+                cleanup();
+                try {
+                  controller.close();
+                } catch {
+                  // already closed
+                }
+              }
+            } catch {
+              cleanup();
+            }
+          };
+
+          const unsubscribe = subscribeSync((evt) => {
+            if (
+              evt.id === targetJobId ||
+              evt.jobId === targetJobId ||
+              evt.id === targetResourceId ||
+              evt.resourceId === targetResourceId
+            ) {
+              sendSnapshot();
+            }
+          });
+
+          const ticker = setInterval(() => {
+            sendSnapshot();
+          }, 1000);
+
+          const cleanup = () => {
+            if (closed) return;
+            closed = true;
+            clearInterval(ticker);
+            unsubscribe();
+          };
+
+          req.signal.addEventListener("abort", cleanup);
+          sendSnapshot();
+        },
       });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+        },
+      });
+    };
+
+    if (
+      pathname.startsWith("/api/v1/recordings/") &&
+      pathname.endsWith("/status") &&
+      !pathname.startsWith("/api/v1/recordings/session/") &&
+      method === "GET"
+    ) {
+      const recId = decodeURIComponent(
+        pathname.slice("/api/v1/recordings/".length, -"/status".length),
+      ).trim();
+      const payload = buildCanonicalJobStatus(recId);
+      if (!payload) return Response.json({ error: "Recording not found" }, { status: 404 });
+      return Response.json(
+        {
+          ...payload,
+          status: payload.canonicalStatus,
+          rawStatus: payload.status,
+          stage: payload.canonicalStage,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+
+    if (
+      pathname.startsWith("/api/v1/recordings/") &&
+      pathname.endsWith("/stream") &&
+      method === "GET"
+    ) {
+      const recId = decodeURIComponent(
+        pathname.slice("/api/v1/recordings/".length, -"/stream".length),
+      ).trim();
+      return createJobStatusSseResponse(recId);
+    }
+
+    if (pathname.startsWith("/api/v1/jobs/") && pathname.endsWith("/stream") && method === "GET") {
+      const jobId = decodeURIComponent(
+        pathname.slice("/api/v1/jobs/".length, -"/stream".length),
+      ).trim();
+      return createJobStatusSseResponse(jobId);
+    }
+
+    if (pathname.startsWith("/api/v1/jobs/") && method === "GET") {
+      const id = pathname.replace("/api/v1/jobs/", "");
+      const payload = buildCanonicalJobStatus(id);
+      if (!payload) return Response.json({ error: "Job not found" }, { status: 404 });
+      return Response.json(payload, { headers: { "Cache-Control": "no-store" } });
     }
 
     // ----------------------------------------------------
@@ -2842,6 +3328,18 @@ export async function handleApiRequest(req: Request): Promise<Response | null> {
         language: item.language || sessionMeta?.language || "auto",
         status: sessionMeta?.status || item.status,
         resourceStatus: item.status,
+        transcriptionStatus: item.transcriptionStatus,
+        transcriptStatus:
+          item.transcriptStatus ||
+          (item.transcriptionStatus === "Completed" ? "final_verified" : "live"),
+        transcriptionProvider: item.transcriptionProvider,
+        asrModel: item.asrModel,
+        languageConfig: item.languageConfig,
+        diarizationEnabled: item.diarizationEnabled,
+        averageConfidence: item.averageConfidence,
+        rawTranscript: item.rawTranscript,
+        processedTranscript: item.processedTranscript || item.fullText,
+        rawSegments: item.rawSegments,
         segments: sortedSegments,
         fullText: item.fullText || sortedSegments.map((s) => s.text).join(" "),
         durationSeconds: Math.max(item.durationSeconds || 0, sessionMeta?.durationSeconds || 0),
@@ -3054,6 +3552,17 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
           id: meeting.id,
           title: meeting.title,
           type: "meeting",
+          transcriptStatus:
+            meeting.transcriptStatus ||
+            (meeting.transcriptionStatus === "Completed" ? "final_verified" : "live"),
+          transcriptionProvider: meeting.transcriptionProvider,
+          asrModel: meeting.asrModel,
+          languageConfig: meeting.languageConfig,
+          diarizationEnabled: meeting.diarizationEnabled,
+          averageConfidence: meeting.averageConfidence,
+          rawTranscript: meeting.rawTranscript,
+          processedTranscript: meeting.processedTranscript || meeting.fullText,
+          rawSegments: meeting.rawSegments,
           segments: meeting.segments,
           keywords: meeting.keywords || [],
           highlights: meeting.highlights || [],
@@ -3064,6 +3573,17 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
           id: lecture.id,
           title: lecture.title,
           type: "lecture",
+          transcriptStatus:
+            lecture.transcriptStatus ||
+            (lecture.transcriptionStatus === "Completed" ? "final_verified" : "live"),
+          transcriptionProvider: lecture.transcriptionProvider,
+          asrModel: lecture.asrModel,
+          languageConfig: lecture.languageConfig,
+          diarizationEnabled: lecture.diarizationEnabled,
+          averageConfidence: lecture.averageConfidence,
+          rawTranscript: lecture.rawTranscript,
+          processedTranscript: lecture.processedTranscript || lecture.fullText,
+          rawSegments: lecture.rawSegments,
           segments: lecture.segments,
           keywords: lecture.keywords || [],
           highlights: lecture.highlights || [],
@@ -4138,44 +4658,76 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
 
         if (candidatePath && fs.existsSync(candidatePath)) {
           try {
-            const whisperRes = await transcribeAudioWithLocalWhisper({
-              filePath: candidatePath,
-              resourceType: resType,
-              language: target.language || "auto",
-              jobId: `retrans_${target.id}`,
-            });
-            if (whisperRes.segments.length > 0) {
-              const fullText = whisperRes.segments.map((s) => s.text).join(" ");
+            let freshSegments: TranscriptSegment[] = [];
+            let freshFullText = "";
+            let freshRawTranscript = "";
+            let freshProvider: "assemblyai" | "whisper-local" = "whisper-local";
+            let freshModel: string | undefined;
+            let freshLangCfg: string | undefined;
+            let freshDiarization = false;
+            let freshConf: number | undefined;
+
+            if (isAssemblyAiConfigured()) {
+              const aaiRes = await transcribeAudioWithAssemblyAi({
+                filePath: candidatePath,
+                resourceType: resType,
+                language: target.language || "auto",
+                jobId: `retrans_${target.id}`,
+              });
+              if (aaiRes.segments.length > 0) {
+                freshSegments = aaiRes.segments;
+                freshFullText = aaiRes.processedTranscript || aaiRes.fullText;
+                freshRawTranscript = aaiRes.rawTranscript;
+                freshProvider = "assemblyai";
+                freshModel = aaiRes.speechModel;
+                freshLangCfg = aaiRes.languageConfig;
+                freshDiarization = aaiRes.speakerLabelsEnabled;
+                freshConf = aaiRes.averageConfidence;
+              }
+            } else {
+              const whisperRes = await transcribeAudioWithLocalWhisper({
+                filePath: candidatePath,
+                resourceType: resType,
+                language: target.language || "auto",
+                jobId: `retrans_${target.id}`,
+              });
+              if (whisperRes.segments.length > 0) {
+                freshSegments = whisperRes.segments;
+                freshFullText = whisperRes.segments.map((s) => s.text).join(" ");
+                freshRawTranscript = whisperRes.rawTranscript || freshFullText;
+                freshProvider = "whisper-local";
+                freshModel = whisperRes.model;
+                freshLangCfg = target.language || "auto";
+                freshDiarization = false;
+              }
+            }
+
+            if (freshSegments.length > 0) {
+              const updatedFields = {
+                segments: freshSegments,
+                rawSegments: freshSegments,
+                rawTranscript: freshRawTranscript,
+                processedTranscript: freshFullText,
+                fullText: freshFullText,
+                transcriptionProvider: freshProvider,
+                asrModel: freshModel,
+                languageConfig: freshLangCfg,
+                diarizationEnabled: freshDiarization,
+                averageConfidence: freshConf,
+                transcriptionStatus: "Completed" as const,
+                transcriptStatus: "final_verified" as const,
+                updatedAt: new Date().toISOString(),
+              };
               if (resType === "meeting") {
                 db.update("meetings", (list) =>
-                  list.map((m) =>
-                    m.id === target.id
-                      ? {
-                          ...m,
-                          segments: whisperRes.segments,
-                          fullText,
-                          transcriptionStatus: "Completed",
-                          updatedAt: new Date().toISOString(),
-                        }
-                      : m,
-                  ),
+                  list.map((m) => (m.id === target.id ? { ...m, ...updatedFields } : m)),
                 );
               } else {
                 db.update("lectures", (list) =>
-                  list.map((l) =>
-                    l.id === target.id
-                      ? {
-                          ...l,
-                          segments: whisperRes.segments,
-                          fullText,
-                          transcriptionStatus: "Completed",
-                          updatedAt: new Date().toISOString(),
-                        }
-                      : l,
-                  ),
+                  list.map((l) => (l.id === target.id ? { ...l, ...updatedFields } : l)),
                 );
               }
-              return whisperRes.segments;
+              return freshSegments;
             }
           } catch {
             // continue to fullText or existing segments
@@ -5793,6 +6345,141 @@ ${segments.map((s) => `<div class="seg"><div class="meta">[${fmtTime(s.startTime
         return Response.json({ error: "User not found." }, { status: 404 });
       }
       return Response.json(sanitizePublicUser(target));
+    }
+
+    if (pathname === "/api/v1/system/providers" && method === "GET") {
+      const n8nCfg = getN8nConfig();
+      const raw = getProviderSecretsPublicStatus();
+      return Response.json({
+        providers: {
+          assemblyAi: raw.ASSEMBLYAI_API_KEY,
+          gemini: raw.GEMINI_API_KEY,
+          n8nWebhookUrl: raw.N8N_WEBHOOK_URL,
+          n8nWebhookSecret: raw.N8N_WEBHOOK_SECRET,
+        },
+        assemblyAiConfigured: isAssemblyAiConfigured(),
+        geminiConfigured: isGeminiConfigured(),
+        n8nConfigured: n8nCfg.configured && n8nCfg.usableInCurrentEnv,
+      });
+    }
+
+    if (pathname === "/api/v1/system/providers" && method === "POST") {
+      if (currentIsGuest) {
+        return Response.json(
+          { error: "Guest accounts cannot modify provider secrets." },
+          { status: 403 },
+        );
+      }
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+      const keyMap: Record<string, SupportedProviderSecretKey> = {
+        assemblyAiApiKey: "ASSEMBLYAI_API_KEY",
+        ASSEMBLYAI_API_KEY: "ASSEMBLYAI_API_KEY",
+        geminiApiKey: "GEMINI_API_KEY",
+        GEMINI_API_KEY: "GEMINI_API_KEY",
+        n8nWebhookUrl: "N8N_WEBHOOK_URL",
+        N8N_WEBHOOK_URL: "N8N_WEBHOOK_URL",
+        n8nWebhookSecret: "N8N_WEBHOOK_SECRET",
+        N8N_WEBHOOK_SECRET: "N8N_WEBHOOK_SECRET",
+      };
+      const patch: Partial<Record<SupportedProviderSecretKey, string | null>> = {};
+      for (const [field, envKey] of Object.entries(keyMap)) {
+        if (field in body) {
+          const v = body[field];
+          if (v === null) patch[envKey] = null;
+          else if (typeof v === "string") patch[envKey] = v;
+        }
+      }
+      updateProviderSecrets(patch);
+      const n8nCfg = getN8nConfig();
+      const raw = getProviderSecretsPublicStatus();
+      return Response.json({
+        success: true,
+        providers: {
+          assemblyAi: raw.ASSEMBLYAI_API_KEY,
+          gemini: raw.GEMINI_API_KEY,
+          n8nWebhookUrl: raw.N8N_WEBHOOK_URL,
+          n8nWebhookSecret: raw.N8N_WEBHOOK_SECRET,
+        },
+        assemblyAiConfigured: isAssemblyAiConfigured(),
+        geminiConfigured: isGeminiConfigured(),
+        n8nConfigured: n8nCfg.configured && n8nCfg.usableInCurrentEnv,
+      });
+    }
+
+    // ----------------------------------------------------
+    // INTERNAL PIPELINE PERFORMANCE DEBUGGING DASHBOARD
+    // ----------------------------------------------------
+    if (pathname === "/api/v1/system/performance" && method === "GET") {
+      const jobs = (db.get("jobs") || []).filter(
+        (j) => currentIsAdmin || j.userId === currentUser.id,
+      );
+      const meetingsById = new Map((db.get("meetings") || []).map((m) => [m.id, m]));
+      const lecturesById = new Map((db.get("lectures") || []).map((l) => [l.id, l]));
+
+      const timedJobs = jobs
+        .filter((j) => j.timings && typeof j.timings.totalMs === "number")
+        .slice(0, 25)
+        .map((j) => {
+          const rec =
+            j.resourceType === "lecture"
+              ? lecturesById.get(j.resourceId)
+              : meetingsById.get(j.resourceId);
+          return {
+            jobId: j.id,
+            correlationId: j.correlationId || rec?.correlationId,
+            recordingId: j.resourceId,
+            resourceType: j.resourceType,
+            title: rec?.title || j.originalFilename || j.fileName,
+            fileName: j.originalFilename || j.fileName,
+            status: j.status,
+            durationSeconds: rec?.durationSeconds || 0,
+            transcriptId: j.transcriptId || rec?.transcriptId,
+            transcriptionProvider:
+              j.transcriptionProvider ||
+              j.timings?.transcriptionProvider ||
+              rec?.transcriptionProvider,
+            analysisProvider:
+              j.analysisProvider || j.timings?.analysisProvider || rec?.analysisProvider,
+            timings: j.timings || {},
+            createdAt: j.createdAt,
+            updatedAt: j.updatedAt,
+          };
+        });
+
+      const avgOf = (getter: (x: (typeof timedJobs)[number]) => number | undefined) => {
+        const vals = timedJobs
+          .map(getter)
+          .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0);
+        if (vals.length === 0) return 0;
+        return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+      };
+      const cacheHits = timedJobs.filter((x) => x.timings.transcriptCacheHit).length;
+      const poolDiag = getWhisperPoolDiagnostics();
+      const n8nCfg = getN8nConfig();
+
+      return Response.json({
+        config: {
+          pipelineMode: (process.env.PIPELINE_MODE || "auto").trim().toLowerCase(),
+          assemblyAiConfigured: isAssemblyAiConfigured(),
+          assemblyAiSpeechModel: getConfiguredAssemblyAiSpeechModels().join(","),
+          assemblyAiWebhookActive: Boolean(resolveAssemblyAiWebhookUrl()),
+          n8nConfigured: n8nCfg.configured && n8nCfg.usableInCurrentEnv,
+          geminiConfigured: isGeminiConfigured(),
+          localWhisperWorkers: poolDiag.workerCount,
+          localWhisperLongModel: poolDiag.longAudioModel,
+        },
+        averages: {
+          sampleCount: timedJobs.length,
+          avgUploadMs: avgOf((x) => x.timings.uploadMs),
+          avgTranscriptionMs: avgOf((x) => x.timings.transcriptionMs),
+          avgAiAnalysisMs: avgOf((x) => x.timings.geminiAnalysisMs),
+          avgDatabaseSaveMs: avgOf((x) => x.timings.databaseSaveMs),
+          avgTotalMs: avgOf((x) => x.timings.totalMs),
+          cacheHitRatePercent:
+            timedJobs.length > 0 ? Math.round((cacheHits / timedJobs.length) * 100) : 0,
+        },
+        recentJobs: timedJobs,
+      });
     }
 
     // ----------------------------------------------------

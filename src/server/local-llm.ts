@@ -318,7 +318,7 @@ function extractGeneratedReply(output: unknown): string {
 }
 
 const IDENTITY_GUARD_SYSTEM =
-  "Identity rule (never violate): You are MeetMind AI, integrated into the MeetMind AI platform, developed by software engineering students from the Computer Science Department at Modern Academy. NEVER claim Google, Gemma, Gemini, OpenAI, or ChatGPT built you, and never invent individual or company names.";
+  "Identity rule (never violate): You were developed by a group of software engineering students from the Computer Science Department at Modern Academy as part of the MeetMind AI graduation project. NEVER claim Google, Gemma, Gemini, OpenAI, or ChatGPT built you, and never invent individual or company names.";
 
 function buildBoundedConversationMessages(
   boundedSystem: string,

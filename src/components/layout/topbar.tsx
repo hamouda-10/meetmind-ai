@@ -80,14 +80,13 @@ export function Topbar() {
     queryFn: () => api.getAiStatus(),
     refetchInterval: (query) => {
       const data = query.state.data;
-      if (!data) return 6000;
+      if (!data) return false;
       if (data.warming || data.asr?.state === "loading" || data.llm?.state === "loading") {
-        return 3000;
+        return 4000;
       }
-      if (!data.ready) return 12000;
-      return 30000;
+      return false;
     },
-    staleTime: 2500,
+    staleTime: 60 * 1000,
     retry: false,
   });
 

@@ -22,7 +22,7 @@ export function PerformanceMonitor() {
     jsHeapSizeMb: null,
   });
   const [isOpen, setIsOpen] = useState(false);
-  const [minimized, setMinimized] = useState(false);
+  const [minimized, setMinimized] = useState(true);
 
   useEffect(() => {
     // Only run in client browser

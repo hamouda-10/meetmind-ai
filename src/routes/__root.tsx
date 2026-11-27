@@ -18,6 +18,7 @@ import { Logo } from "@/components/common/logo";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ErrorState } from "@/components/error/error-state";
+import { SectionErrorBoundary } from "@/components/error/section-error-boundary";
 import { THEME_STORAGE_KEY, useUIStore } from "@/stores/ui-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useI18nStore } from "@/lib/i18n";
@@ -230,6 +231,9 @@ function RootComponent() {
   const hydrateUiLanguage = useUIStore((s) => s.hydrateLanguage);
   const resolvedTheme = useUIStore((s) => s.resolvedTheme);
   const language = useUIStore((s) => s.language);
+  const commandOpen = useUIStore((s) => s.commandOpen);
+  const toggleCommand = useUIStore((s) => s.toggleCommand);
+  const notificationsOpen = useUIStore((s) => s.notificationsOpen);
   const recordingDialogOpen = useUIStore((s) => s.recordingDialogOpen);
   const setRecordingDialogOpen = useUIStore((s) => s.setRecordingDialogOpen);
   const hydrateI18nLanguage = useI18nStore((s) => s.hydrateLanguage);
@@ -299,35 +303,40 @@ function RootComponent() {
     }
   }, [authStatus, isAuthPublicPath, isGuestRestrictedPath, pathname, searchStr, navigate]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        toggleCommand();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [toggleCommand]);
+
   const toasterTheme = resolvedTheme === "black-gold" ? "dark" : "light";
   const loadingText = language === "AR" ? "جارٍ التحقق من الجلسة..." : "Restoring session...";
 
-  // Public authentication routes (/login, /register)
-  if (isAuthPublicPath) {
-    return (
-      <QueryClientProvider client={queryClient}>
-        <TooltipProvider delayDuration={200}>
-          {authStatus === "loading" || authStatus === "authenticated" ? (
+  const showProtectedLoading =
+    !isAuthPublicPath &&
+    (authStatus === "loading" ||
+      authStatus === "unauthenticated" ||
+      authStatus === "session_expired" ||
+      (authStatus === "guest" && isGuestRestrictedPath));
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider delayDuration={200}>
+        {isAuthPublicPath ? (
+          authStatus === "loading" || authStatus === "authenticated" ? (
             <SessionLoadingScreen message={loadingText} />
           ) : (
-            <Outlet />
-          )}
-          <Toaster position="top-right" richColors theme={toasterTheme} />
-        </TooltipProvider>
-      </QueryClientProvider>
-    );
-  }
-
-  // Protected application routes: zero-flicker guard before session verification completes
-  if (
-    authStatus === "loading" ||
-    authStatus === "unauthenticated" ||
-    authStatus === "session_expired" ||
-    (authStatus === "guest" && isGuestRestrictedPath)
-  ) {
-    return (
-      <QueryClientProvider client={queryClient}>
-        <TooltipProvider delayDuration={200}>
+            <SectionErrorBoundary>
+              <Outlet />
+            </SectionErrorBoundary>
+          )
+        ) : showProtectedLoading ? (
           <SessionLoadingScreen
             message={
               authStatus === "loading"
@@ -337,39 +346,40 @@ function RootComponent() {
                   : "Redirecting to sign in..."
             }
           />
-          <Toaster position="top-right" richColors theme={toasterTheme} />
-        </TooltipProvider>
-      </QueryClientProvider>
-    );
-  }
-
-  return (
-    <QueryClientProvider client={queryClient}>
-      <DataSyncListener />
-      <TooltipProvider delayDuration={200}>
-        <Shell>
-          <Outlet />
-        </Shell>
-        <Suspense fallback={null}>
-          <CommandPalette />
-          <NotificationCenter />
-          <FloatingAIAssistant />
-        </Suspense>
-        <Toaster position="top-right" richColors theme={toasterTheme} />
-        {recordingDialogOpen && (
-          <Suspense fallback={null}>
-            <UploadRecordingDialog
-              open={recordingDialogOpen}
-              onOpenChange={setRecordingDialogOpen}
-              onSuccess={() => {
-                queryClient.invalidateQueries({ queryKey: ["meetings"] });
-                queryClient.invalidateQueries({ queryKey: ["lectures"] });
-                queryClient.invalidateQueries({ queryKey: ["dashboardMetrics"] });
-                queryClient.invalidateQueries({ queryKey: ["transcripts"] });
-              }}
-            />
-          </Suspense>
+        ) : (
+          <>
+            <DataSyncListener />
+            <Shell>
+              <SectionErrorBoundary>
+                <Outlet />
+              </SectionErrorBoundary>
+            </Shell>
+            <SectionErrorBoundary silent>
+              <Suspense fallback={null}>
+                {commandOpen && <CommandPalette />}
+                {notificationsOpen && <NotificationCenter />}
+                <FloatingAIAssistant />
+              </Suspense>
+            </SectionErrorBoundary>
+            {recordingDialogOpen && (
+              <SectionErrorBoundary silent>
+                <Suspense fallback={null}>
+                  <UploadRecordingDialog
+                    open={recordingDialogOpen}
+                    onOpenChange={setRecordingDialogOpen}
+                    onSuccess={() => {
+                      queryClient.invalidateQueries({ queryKey: ["meetings"] });
+                      queryClient.invalidateQueries({ queryKey: ["lectures"] });
+                      queryClient.invalidateQueries({ queryKey: ["dashboardMetrics"] });
+                      queryClient.invalidateQueries({ queryKey: ["transcripts"] });
+                    }}
+                  />
+                </Suspense>
+              </SectionErrorBoundary>
+            )}
+          </>
         )}
+        <Toaster position="top-right" richColors theme={toasterTheme} />
       </TooltipProvider>
     </QueryClientProvider>
   );

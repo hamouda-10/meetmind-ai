@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { GoogleGenAI } from "@google/genai";
+import { getProviderSecret } from "./provider-secrets";
 
 let aiInstance: GoogleGenAI | null = null;
 let cachedApiKey: string | null = null;
@@ -49,7 +50,12 @@ function isPlaceholderKey(key: string): boolean {
 
 export function getResolvedGeminiApiKey(): string | null {
   loadEnvFileDirectly();
-  const raw = (process.env.GEMINI_API_KEY || process.env.API_KEY || "").trim();
+  const raw = (
+    process.env.GEMINI_API_KEY ||
+    process.env.API_KEY ||
+    getProviderSecret("GEMINI_API_KEY") ||
+    ""
+  ).trim();
   if (!raw || isPlaceholderKey(raw)) {
     return null;
   }

@@ -1,7 +1,10 @@
 import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { api } from "@/lib/api-client";
+import { clearSavedActiveUploadJob, getSavedActiveUploadJob } from "@/lib/media-processor";
 import { useAuthStore } from "@/stores/auth-store";
+import { useUIStore } from "@/stores/ui-store";
 
 const EVENT_QUERY_MAP: Record<string, string[][]> = {
   TranscriptSegmentAvailable: [["transcript"], ["recordingSessions"]],
@@ -38,6 +41,21 @@ const EVENT_QUERY_MAP: Record<string, string[][]> = {
     ["dashboard-metrics"],
     ["notifications"],
   ],
+  ProcessingCompleted: [
+    ["jobs"],
+    ["meetings"],
+    ["lectures"],
+    ["transcript"],
+    ["quizzes"],
+    ["flashcards"],
+    ["tasks"],
+    ["actionItems"],
+    ["dashboardMetrics"],
+    ["dashboard-metrics"],
+    ["notifications"],
+  ],
+  TranscriptionCompleted: [["meetings"], ["lectures"], ["transcript"], ["jobs"]],
+  ProcessingFailed: [["jobs"], ["meetings"], ["lectures"], ["notifications"]],
   JOB_FAILED: [["jobs"], ["meetings"], ["lectures"], ["notifications"]],
   NOTIFICATION_CREATED: [["notifications"]],
   NOTIFICATION_READ: [["notifications"]],
@@ -95,12 +113,55 @@ export function useDataSync() {
       }
     };
 
-    const handleSyncEvent = (eventData: { type: string; id?: string; timestamp?: number }) => {
+    const handleSyncEvent = (eventData: {
+      type: string;
+      id?: string;
+      jobId?: string;
+      resourceId?: string;
+      timestamp?: number;
+    }) => {
       if (eventData.timestamp && eventData.timestamp <= lastSyncTimestampRef.current) {
         return;
       }
       if (eventData.timestamp) {
         lastSyncTimestampRef.current = eventData.timestamp;
+      }
+
+      if (eventData.type === "ProcessingCompleted" || eventData.type === "JOB_COMPLETED") {
+        const savedJob = getSavedActiveUploadJob();
+        const matchesSaved =
+          savedJob &&
+          (savedJob.jobId === eventData.jobId ||
+            savedJob.jobId === eventData.id ||
+            savedJob.resourceId === eventData.resourceId ||
+            savedJob.resourceId === eventData.id);
+        const dialogOpen = useUIStore.getState().recordingDialogOpen;
+        if (matchesSaved && !dialogOpen) {
+          const targetId = eventData.resourceId || savedJob.resourceId;
+          const isAr =
+            typeof window !== "undefined" && localStorage.getItem("meetmind-lang") === "AR";
+          clearSavedActiveUploadJob();
+          useUIStore.getState().setAudioSystemState("Completed", 100);
+          setTimeout(() => {
+            useUIStore.getState().setAudioSystemState("Ready", 0);
+          }, 4000);
+          toast.success(
+            isAr
+              ? `اكتملت المعالجة بنجاح: "${savedJob.title}"`
+              : `Processing completed: "${savedJob.title}"`,
+            {
+              duration: 8000,
+              action: targetId
+                ? {
+                    label: isAr ? "فتح التفريغ" : "Open Transcript",
+                    onClick: () => {
+                      window.location.href = `/transcript?id=${encodeURIComponent(targetId)}`;
+                    },
+                  }
+                : undefined,
+            },
+          );
+        }
       }
 
       const targetKeys = EVENT_QUERY_MAP[eventData.type] || FALLBACK_KEYS;

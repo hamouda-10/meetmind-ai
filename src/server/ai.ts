@@ -27,6 +27,7 @@ import {
   buildSmartChatContext,
   type ChatScope,
 } from "./chat-context";
+import { logObservabilityEvent } from "./pipeline-logger";
 import {
   answerBuiltInChat,
   buildBuiltInSummary,
@@ -419,6 +420,79 @@ export function extractKeywordsWithFrequency(
     "النهارده",
     "النهاردة",
     "اليوم",
+    "انا",
+    "انتي",
+    "انتم",
+    "هم",
+    "هن",
+    "دلوقتي",
+    "عندي",
+    "عندك",
+    "عندنا",
+    "طيب",
+    "واحد",
+    "واحده",
+    "تاني",
+    "تانيه",
+    "حاجه",
+    "حاجات",
+    "بقي",
+    "بقيت",
+    "مثلا",
+    "طبعا",
+    "اكيد",
+    "خلاص",
+    "ببساطه",
+    "ليه",
+    "ازاي",
+    "ممكن",
+    "لازم",
+    "كمان",
+    "برضو",
+    "اوي",
+    "فقط",
+    "ايضا",
+    "بدون",
+    "خلال",
+    "حوالي",
+    "اقولك",
+    "تقول",
+    "يقول",
+    "نقول",
+    "تعال",
+    "بيعمل",
+    "هتكون",
+    "هيكون",
+    "لو",
+    "بس",
+    "او",
+    "ولا",
+    "مش",
+    "ما",
+    "لم",
+    "لن",
+    "قد",
+    "كل",
+    "اي",
+    "ايه",
+    "شخص",
+    "فاهم",
+    "تتعلم",
+    "يتعلم",
+    "بيتعلم",
+    "السبب",
+    "غالبا",
+    "حرفيا",
+    "عباره",
+    "سوال",
+    "اجابه",
+    "الاجابه",
+    "بشكل",
+    "طريقه",
+    "موجود",
+    "موجوده",
+    "مختلفه",
+    "مختلف",
     "the",
     "and",
     "for",
@@ -605,7 +679,7 @@ async function prepareTranscriptForLlm(
   ai: ReturnType<typeof getGeminiClient>,
   title: string,
   segments: TranscriptSegment[],
-  maxDirectChars = 24000,
+  maxDirectChars = 36000,
 ): Promise<string> {
   const fullText = segments
     .map(
@@ -620,31 +694,48 @@ async function prepareTranscriptForLlm(
     return fullText.slice(0, maxDirectChars);
   }
 
-  // Long recording: hierarchically synthesize each overlapping chunk before global analysis
-  const chunks = chunkTranscriptSegments(segments, 20000, 2);
-  const chunkSummaries: string[] = [];
-  for (let idx = 0; idx < chunks.length; idx++) {
-    try {
-      const { result: resp } = await executeWithRetryAndFallback(
-        "prepareTranscriptChunk",
-        async (model) => {
-          return ai.models.generateContent({
-            model,
-            contents: `Extract all key facts, definitions, technical terms, decisions, tasks, speakers, and timestamps from part ${idx + 1}/${chunks.length} of "${title}". Be faithful to the transcript and omit nothing important:\n\n${chunks[idx]}`,
-            config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
-          });
-        },
-        { primaryModel: TEXT_MODEL, fallbackModel: FALLBACK_TEXT_MODEL },
-      );
-      const text = (resp.text || "").trim();
-      if (text) {
-        chunkSummaries.push(`--- Section ${idx + 1}/${chunks.length} ---\n${text}`);
+  // Long recording (>36k chars): hierarchically synthesize overlapping chunks in PARALLEL (concurrency = 4)
+  const chunks = chunkTranscriptSegments(segments, 24000, 2);
+  const chunkSummaries: string[] = new Array(chunks.length);
+  let nextIdx = 0;
+  const concurrency = Math.min(4, chunks.length);
+
+  const worker = async () => {
+    while (nextIdx < chunks.length) {
+      const idx = nextIdx++;
+      try {
+        const { result: resp } = await executeWithRetryAndFallback(
+          "prepareTranscriptChunk",
+          async (model) => {
+            return ai.models.generateContent({
+              model,
+              contents: `Extract all key facts, definitions, technical terms, decisions, tasks, deadlines, speakers, and timestamps from part ${idx + 1}/${chunks.length} of "${title}". Be concise and strictly faithful to the transcript:\n\n${chunks[idx]}`,
+              config: {
+                maxOutputTokens: 1200,
+                temperature: 0.1,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            });
+          },
+          {
+            primaryModel: TEXT_MODEL,
+            fallbackModel: FALLBACK_TEXT_MODEL,
+            maxRetries: 1,
+            timeoutMs: 25000,
+          },
+        );
+        const text = (resp.text || "").trim();
+        chunkSummaries[idx] = text
+          ? `--- Section ${idx + 1}/${chunks.length} ---\n${text}`
+          : chunks[idx].slice(0, Math.floor(maxDirectChars / chunks.length));
+      } catch {
+        chunkSummaries[idx] = chunks[idx].slice(0, Math.floor(maxDirectChars / chunks.length));
       }
-    } catch {
-      chunkSummaries.push(chunks[idx].slice(0, Math.floor(maxDirectChars / chunks.length)));
     }
-  }
-  return chunkSummaries.join("\n\n").slice(0, maxDirectChars);
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return chunkSummaries.filter(Boolean).join("\n\n").slice(0, maxDirectChars);
 }
 
 /**
@@ -1102,6 +1193,7 @@ export async function generateAiSummary(
   type: "meeting" | "lecture" = "lecture",
   courseCode?: string,
   appLanguage?: "en" | "ar",
+  options?: { fastFallback?: boolean },
 ): Promise<{
   summary: string;
   executiveSummary?: string;
@@ -1346,7 +1438,9 @@ ${preparedTranscript}
   // Tier 2: Hybrid Fast Local LLM Summary — crisp plain-text abstractive executive overview
   // from Gemma 3 1B (~7-10s, zero JSON syntax overhead) combined with instant grounded facts/actions.
   const builtInRef = buildBuiltInSummary(title, segments, type, courseCode, appLanguage);
-  const localTranscript = formatCompactTranscriptForLocalLlm(segments, 1800);
+  const allowLocalLlm =
+    !options?.fastFallback || process.env.ENABLE_LOCAL_LLM_BATCH_ANALYSIS === "true";
+  const localTranscript = allowLocalLlm ? formatCompactTranscriptForLocalLlm(segments, 1800) : "";
   if (localTranscript) {
     const factsHint =
       builtInRef.keyPoints.length > 0
@@ -1549,6 +1643,7 @@ export async function generateAiQuiz(
     difficulty?: "all" | "easy" | "medium" | "hard";
     appLanguage?: "en" | "ar";
     numQuestions?: number;
+    fastFallback?: boolean;
   },
 ): Promise<{
   title: string;
@@ -1587,6 +1682,13 @@ export async function generateAiQuiz(
     typeof options?.numQuestions === "number" && Number.isFinite(options.numQuestions)
       ? Math.min(20, Math.max(1, Math.round(options.numQuestions)))
       : defaultQuestionCount;
+
+  logObservabilityEvent("info", "quiz_generation_started", {
+    title,
+    segmentsCount: segments.length,
+    requestedCount,
+    targetLang,
+  });
 
   const cacheHash = computeTranscriptHash(
     "quiz",
@@ -1646,10 +1748,10 @@ ZERO HALLUCINATION & TRANSCRIPT GROUNDING RULES:
 1. Every question and its correct answer MUST be 100% grounded in facts explicitly stated in the transcript below.
 2. If the transcript is brief, do NOT invent questions. Produce only as many questions as the transcript legitimately supports.
 3. Include the "sourceTranscriptSegment" field with an exact verbatim quote from the transcript proving the answer.
-4. Accepted types:
-   - "multiple_choice": question with 4 distinct options (1 correct, 3 plausible but incorrect distractors from context).
+4. Accepted types ONLY:
+   - "multiple_choice": question with EXACTLY 4 unique options (1 correct, 3 plausible distractors grounded in context).
    - "true_false": unambiguous declarative statement, options: ["True", "False"].
-   - "short_answer": concise analytical/recall question answered directly from transcript (options: [], provide grounded "correctAnswerText" and 2-3 key terms in "acceptableAnswers").
+   Do NOT invent filler questions just to reach a target number — if the transcript supports only fewer questions, return only those.
 5. Include sectionRef, timestampRef, and difficulty ("easy" | "medium" | "hard")${options?.difficulty && options.difficulty !== "all" ? ` — focus on "${options.difficulty}" difficulty` : " — mix easy, medium, and hard"}.
 6. ${avoidList ? `Avoid repeating these questions: ${avoidList}` : `This is variant ${variant} of the quiz.`}
 
@@ -1688,9 +1790,9 @@ ${langDirective}
 2. إذا كان النص المفرغ قصيراً فلا تخترع أسئلة إضافية من خارج النص إطلاقاً — اكتفِ بعدد الأسئلة التي يدعمها النص فعلياً فقط (مثلاً 14 أو 10 أسئلة ولا تملأ بفراغ وهمي).
 3. أدرج لكل سؤال الحقل "sourceTranscriptSegment" بنص حرفي مقتبس مباشرة من النص المفرغ يثبت الإجابة الصحيحة.
 4. الأنواع المعتمدة حصراً:
-   - "multiple_choice": سؤال مع 4 خيارات دقيقة ومتباينة (خيار واحد صحيح و3 مشتتات منطقية من سياق المحتوى ولكنها خاطئة بدقة).
-   - "true_false": عبارة قاطعة لا لبس فيها، والخيارات ["صح (صواب)", "خطأ"].
-   - "short_answer": سؤال مقالي/إجابة قصيرة مستند للنص المفرغ (options: [] مع إجابة نموذجية موثقة في "correctAnswerText" وكلمات مفتاحية مقبولة في "acceptableAnswers").
+   - "multiple_choice": سؤال مع 4 خيارات فريدة دقيقة (خيار واحد صحيح و3 مشتتات منطقية من سياق المحتوى ولكنها خاطئة).
+   - "true_false": عبارة قاطعة لا لبس فيها، والخيارات ["صح", "خطأ"].
+   ممنوع اختلاق أسئلة إضافية لملء العدد؛ إذا كان النص يدعم عدداً أقل فأرجع هذا العدد فقط.
 5. حدد القسم والزمن الفعلي (sectionRef، timestampRef) ومستوى الصعوبة (easy | medium | hard)${options?.difficulty && options.difficulty !== "all" ? ` مع التركيز على مستوى "${options.difficulty}"` : ""}.
 6. ${avoidList ? `تجنب تكرار هذه الأسئلة التي طُرحت سابقاً: ${avoidList}` : `هذا الإصدار ${variant} من الاختبار.`}
 
@@ -1773,12 +1875,8 @@ ${summaryText || ""}
             if (seenQuestions.has(normQ)) return null;
             seenQuestions.add(normQ);
 
-            const qType: "multiple_choice" | "true_false" | "short_answer" =
-              q.type === "true_false"
-                ? "true_false"
-                : q.type === "short_answer"
-                  ? "short_answer"
-                  : "multiple_choice";
+            const qType: "multiple_choice" | "true_false" =
+              q.type === "true_false" ? "true_false" : "multiple_choice";
 
             let qOptions: string[] = [];
             let correctOptionIndex =
@@ -1794,13 +1892,9 @@ ${summaryText || ""}
               if (uniqueOpts.length < 4) return null; // Reject incomplete or duplicate options
               qOptions = uniqueOpts.slice(0, 4);
               if (correctOptionIndex < 0 || correctOptionIndex >= 4) correctOptionIndex = 0;
-            } else if (qType === "true_false") {
-              qOptions = isEnglish ? ["True", "False"] : ["صح (صواب)", "خطأ"];
-              if (correctOptionIndex !== 0 && correctOptionIndex !== 1) correctOptionIndex = 0;
             } else {
-              qOptions = [];
-              correctOptionIndex = 0;
-              if (!q.correctAnswerText || !q.correctAnswerText.trim()) return null;
+              qOptions = isEnglish ? ["True", "False"] : ["صح", "خطأ"];
+              if (correctOptionIndex !== 0 && correctOptionIndex !== 1) correctOptionIndex = 0;
             }
 
             const verification = verifyQuizQuestionGrounding(
@@ -1850,14 +1944,20 @@ ${summaryText || ""}
           .filter((item): item is NonNullable<typeof item> => Boolean(item && item.question));
 
         if (verifiedQuestions.length > 0) {
+          const cappedQuestions = verifiedQuestions.slice(0, Math.min(20, requestedCount));
           const finalResult = {
             title:
               detectedLang === "en"
                 ? `Comprehension Quiz (${variant > 1 ? `Variant ${variant}` : "Main"}): ${title}`
                 : `اختبار الفهم الشامل (${variant > 1 ? `النموذج ${variant}` : "النموذج الرئيسي"}): ${title}`,
             courseCode,
-            questions: verifiedQuestions,
+            questions: cappedQuestions,
           };
+          logObservabilityEvent("info", "quiz_generation_completed", {
+            title,
+            provider: "gemini",
+            questionsCount: cappedQuestions.length,
+          });
           if (canUseCache) {
             setCachedAiAnalysis(cacheHash, "quiz", config.textModel, finalResult);
           }
@@ -1866,6 +1966,11 @@ ${summaryText || ""}
       }
     } catch (e) {
       suspendGeminiIfUnavailableError(e);
+      logObservabilityEvent("warn", "gemini_failed", {
+        operation: "generateAiQuiz",
+        title,
+        error: e instanceof Error ? e.message : String(e),
+      });
       console.warn("Gemini quiz generation error, using grounded generator:", e);
     }
   }
@@ -1894,7 +1999,11 @@ ${summaryText || ""}
   }
 
   // Tier 2: Real Embedded Local LLM Quiz Generator (for prose/conceptual transcripts lacking structured specs)
-  const localTranscript = formatCompactTranscriptForLocalLlm(segments, 1500);
+  const allowLocalQuizLlm =
+    !options?.fastFallback || process.env.ENABLE_LOCAL_LLM_BATCH_ANALYSIS === "true";
+  const localTranscript = allowLocalQuizLlm
+    ? formatCompactTranscriptForLocalLlm(segments, 1500)
+    : "";
   if (localTranscript && segments.length > 0) {
     const llmQuestionCount = Math.min(requestedCount, 2);
     const localQuizSystem = isEnglish
@@ -3422,4 +3531,587 @@ ${summaryText || ""}
   const builtInMap = buildBuiltInMindMap(title, segments, courseCode, appLanguage);
   setCachedAiAnalysis(cacheHash, "mindmap", "meetmind-analytical-hybrid", builtInMap);
   return builtInMap;
+}
+
+export interface UnifiedRecordingAnalysisResult {
+  provider: "gemini" | "analytical";
+  cacheHit: boolean;
+  transcriptHash: string;
+  analysisHash: string;
+  summary: {
+    summary: string;
+    executiveSummary: string;
+    detailedSummary: string;
+    keyPoints: string[];
+    decisions: string[];
+    actionItems: Array<{
+      title: string;
+      ownerName?: string;
+      dueDate?: string;
+      sourceTimestamp?: string;
+      priority: "high" | "medium" | "low";
+    }>;
+  };
+  deepAnalysis: {
+    overview: string;
+    topics: string[];
+    keywords: string[];
+    definitions: Array<{ term: string; definition: string; timestamp?: string }>;
+    questionsAsked: Array<{ question: string; answer?: string; timestamp?: string }>;
+    actionItems: Array<{ task: string; owner?: string; deadline?: string }>;
+    emphasizedPoints: string[];
+    importantSentences: string[];
+    reviewAreas: string[];
+  };
+  deadlines: string[];
+  examHints: string[];
+  notes: string[];
+  quiz: {
+    title: string;
+    courseCode?: string;
+    questions: Array<{
+      id: string;
+      question: string;
+      type: "multiple_choice" | "true_false" | "short_answer" | "fill_in_the_blank";
+      options: string[];
+      correctOptionIndex: number;
+      correctAnswerText?: string;
+      acceptableAnswers?: string[];
+      explanation: string;
+      difficulty: "easy" | "medium" | "hard";
+      sectionRef: string;
+      timestampRef?: string;
+      sourceReference?: string;
+      sourceTranscriptSegment?: string;
+      groundingVerified?: boolean;
+    }>;
+  };
+  flashcards: Array<{
+    front: string;
+    back: string;
+    sourceReference?: string;
+    topic?: string;
+    difficulty?: "easy" | "medium" | "hard";
+  }>;
+  mindMap: MindMapNode;
+}
+
+function buildMindMapLocallyFromAnalysis(
+  title: string,
+  topics: string[],
+  keyPoints: string[],
+  definitions: Array<{ term: string; definition: string }>,
+  notes: string[],
+): MindMapNode {
+  const branches: MindMapNode[] = [];
+  const safeTopics = topics.slice(0, 5);
+  safeTopics.forEach((topic, idx) => {
+    const childPoints = keyPoints
+      .slice(idx * 2, idx * 2 + 2)
+      .concat(notes.slice(idx, idx + 1))
+      .filter(Boolean)
+      .slice(0, 3);
+    branches.push({
+      id: `mm_t_${idx + 1}`,
+      label: topic.slice(0, 70),
+      children: childPoints.map((pt, j) => ({
+        id: `mm_t_${idx + 1}_${j + 1}`,
+        label: pt.slice(0, 90),
+      })),
+    });
+  });
+
+  if (definitions.length > 0 && branches.length < 5) {
+    branches.push({
+      id: "mm_defs",
+      label: "Key Concepts",
+      children: definitions.slice(0, 4).map((d, idx) => ({
+        id: `mm_def_${idx + 1}`,
+        label: d.term.slice(0, 60),
+        description: d.definition.slice(0, 120),
+      })),
+    });
+  }
+
+  return {
+    id: "mm_root",
+    label: title.slice(0, 80),
+    children:
+      branches.length > 0
+        ? branches
+        : keyPoints.slice(0, 4).map((kp, idx) => ({
+            id: `mm_kp_${idx + 1}`,
+            label: kp.slice(0, 80),
+          })),
+  };
+}
+
+function formatDetailedSummaryLocally(params: {
+  isEnglish: boolean;
+  executiveSummary: string;
+  keyPoints: string[];
+  topics: string[];
+  decisions: string[];
+  actionItems: Array<{ title: string; ownerName?: string; dueDate?: string }>;
+  notes: string[];
+}): string {
+  const { isEnglish, executiveSummary, keyPoints, topics, decisions, actionItems, notes } = params;
+  const blocks: string[] = [];
+  if (executiveSummary) {
+    blocks.push(
+      isEnglish
+        ? `# Executive Summary\n${executiveSummary}`
+        : `# الملخص التنفيذي\n${executiveSummary}`,
+    );
+  }
+  if (keyPoints.length > 0) {
+    blocks.push(
+      isEnglish
+        ? `## Key Points\n${keyPoints.map((p) => `- ${p}`).join("\n")}`
+        : `## أبرز النقاط المستخلصة\n${keyPoints.map((p) => `- ${p}`).join("\n")}`,
+    );
+  }
+  if (topics.length > 0) {
+    blocks.push(
+      isEnglish
+        ? `## Main Topics\n${topics.map((t) => `- ${t}`).join("\n")}`
+        : `## المحاور الرئيسية\n${topics.map((t) => `- ${t}`).join("\n")}`,
+    );
+  }
+  if (notes.length > 0) {
+    blocks.push(
+      isEnglish
+        ? `## Structured Notes\n${notes.map((n) => `- ${n}`).join("\n")}`
+        : `## ملاحظات منظمة\n${notes.map((n) => `- ${n}`).join("\n")}`,
+    );
+  }
+  if (decisions.length > 0) {
+    blocks.push(
+      isEnglish
+        ? `## Decisions\n${decisions.map((d) => `- ${d}`).join("\n")}`
+        : `## القرارات\n${decisions.map((d) => `- ${d}`).join("\n")}`,
+    );
+  }
+  if (actionItems.length > 0) {
+    blocks.push(
+      isEnglish
+        ? `## Action Items\n${actionItems.map((a) => `- ${a.title}${a.ownerName && a.ownerName !== "Not specified" ? ` (${a.ownerName})` : ""}${a.dueDate && a.dueDate !== "Not specified" ? ` — ${a.dueDate}` : ""}`).join("\n")}`
+        : `## المهام المطلوبة\n${actionItems.map((a) => `- ${a.title}${a.ownerName && a.ownerName !== "Not specified" ? ` (${a.ownerName})` : ""}${a.dueDate && a.dueDate !== "Not specified" ? ` — ${a.dueDate}` : ""}`).join("\n")}`,
+    );
+  }
+  return blocks.join("\n\n");
+}
+
+/**
+ * OPTION A — SINGLE UNIFIED COMPACT STRUCTURED JSON AI ENGINE
+ * Sends the transcript ONCE (never 5 separate times) to Gemini with strict compact JSON output
+ * (`responseMimeType: "application/json"`, `maxOutputTokens: 4096`, zero HTML/CSS/Markdown report,
+ * zero duplicated transcript), then renders formatted summary & mind map locally in <1ms.
+ * When Cloud Gemini is unavailable, falls back to sub-50ms real grounded analytical synthesis
+ * instead of queuing 5 slow single-threaded local ONNX LLM calls.
+ */
+export async function generateUnifiedRecordingAnalysis(params: {
+  title: string;
+  segments: TranscriptSegment[];
+  resourceType: "meeting" | "lecture";
+  courseCode?: string;
+  appLanguage?: "en" | "ar";
+}): Promise<UnifiedRecordingAnalysisResult> {
+  const { title, segments, resourceType, courseCode, appLanguage } = params;
+  const detectedLang = detectTranscriptLanguage(title, segments);
+  const targetLang = appLanguage || detectedLang || "en";
+  const isEnglish = targetLang === "en";
+
+  const transcriptHash = computeTranscriptHash("transcript", "", segments, "");
+  const analysisHash = computeTranscriptHash(
+    "unified_analysis",
+    title,
+    segments,
+    `${resourceType}:${courseCode || ""}:${targetLang}`,
+  );
+
+  const cached = getCachedAiAnalysis<UnifiedRecordingAnalysisResult>(analysisHash);
+  if (cached) {
+    return { ...cached, cacheHit: true, transcriptHash, analysisHash };
+  }
+
+  const totalWords = segments
+    .map((s) => s.text)
+    .join(" ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const targetQuizCount = totalWords < 60 ? 4 : totalWords < 180 ? 6 : totalWords < 400 ? 8 : 10;
+
+  const ai = getGeminiClient();
+  if (ai && segments.length > 0) {
+    try {
+      const preparedTranscript = await prepareTranscriptForLlm(ai, title, segments, 36000);
+      const langRule = isEnglish
+        ? "Write ALL values in concise, fluent English while preserving technical terms verbatim."
+        : "اكتب جميع القيم باللغة العربية الفصحى الموجزة مع الحفاظ على المصطلحات التقنية الإنجليزية كما وردت.";
+
+      const prompt = `You are MeetMind AI. Analyze ONLY the transcript below for "${title}" (${resourceType}${courseCode ? `, ${courseCode}` : ""}).
+${langRule}
+STRICT RULES:
+1. Return STRICT compact JSON ONLY — NO HTML, NO CSS, NO Markdown formatting, and DO NOT repeat the transcript.
+2. Ground 100% of facts, names, dates, numbers, tasks, and quiz answers strictly in the transcript. Never invent filler.
+3. For quiz: generate up to ${targetQuizCount} grounded questions (max 20) using ONLY "multiple_choice" (EXACTLY 4 unique options) or "true_false" (2 options). Include a short verbatim "sourceTranscriptSegment" quote from the transcript.
+4. Keep every field concise for minimal output token latency.
+
+JSON SCHEMA:
+{
+  "executive_summary": "2-4 concise sentences",
+  "summary": ["concise takeaway 1", "takeaway 2"],
+  "key_points": ["point 1", "point 2"],
+  "keywords": ["keyword 1", "keyword 2"],
+  "important_sentences": ["exact key quote from transcript"],
+  "topics": ["topic 1", "topic 2"],
+  "decisions": ["explicit decision or empty"],
+  "definitions": [{"term": "term", "definition": "short definition", "timestamp": "MM:SS"}],
+  "action_items": [{"title": "task", "owner": "person or Not specified", "deadline": "date or Not specified", "priority": "high|medium|low", "timestamp": "MM:SS"}],
+  "deadlines": ["deadline or empty"],
+  "exam_hints": ["emphasized exam/review point"],
+  "notes": ["concise bullet note"],
+  "flashcards": [{"front": "concise question", "back": "concise answer", "topic": "topic"}],
+  "quiz": [{"question": "...", "type": "multiple_choice", "options": ["A","B","C","D"], "correctOptionIndex": 0, "explanation": "1 short sentence", "difficulty": "medium", "timestamp": "MM:SS", "sourceTranscriptSegment": "exact quote"}]
+}
+
+TRANSCRIPT:
+"""
+${preparedTranscript}
+"""`;
+
+      const config = getGeminiConfig();
+      const { result: response } = await executeWithRetryAndFallback(
+        "generateUnifiedRecordingAnalysis",
+        async (model) =>
+          ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              maxOutputTokens: 4096,
+              temperature: 0.1,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          }),
+        {
+          primaryModel: config.textModel,
+          fallbackModel: config.fallbackTextModel,
+          maxRetries: 1,
+          baseDelayMs: 400,
+          maxDelayMs: 1500,
+          timeoutMs: 40000,
+        },
+      );
+
+      const raw = extractJsonFromLlmOutput<Record<string, unknown>>(response.text || "");
+      if (raw && typeof raw === "object") {
+        const toStrArray = (v: unknown): string[] =>
+          Array.isArray(v)
+            ? v.map((x) => String(x || "").trim()).filter(Boolean)
+            : typeof v === "string" && v.trim()
+              ? [v.trim()]
+              : [];
+
+        const summaryBullets = toStrArray(raw.summary);
+        const keyPoints = toStrArray(raw.key_points || raw.keyPoints);
+        const mergedKeyPoints = keyPoints.length > 0 ? keyPoints : summaryBullets;
+        const executiveSummary = String(
+          raw.executive_summary ||
+            raw.executiveSummary ||
+            summaryBullets.join(" ") ||
+            mergedKeyPoints.slice(0, 3).join(" "),
+        ).trim();
+        const topics = toStrArray(raw.topics);
+        const keywords = toStrArray(raw.keywords);
+        const importantSentences = toStrArray(raw.important_sentences || raw.importantSentences);
+        const decisions = toStrArray(raw.decisions);
+        const deadlines = toStrArray(raw.deadlines);
+        const examHints = toStrArray(raw.exam_hints || raw.examHints);
+        const notes = toStrArray(raw.notes);
+
+        const definitions = Array.isArray(raw.definitions)
+          ? raw.definitions
+              .filter((d): d is Record<string, unknown> => Boolean(d && typeof d === "object"))
+              .map((d) => ({
+                term: String(d.term || "").trim(),
+                definition: String(d.definition || "").trim(),
+                timestamp: d.timestamp ? String(d.timestamp).trim() : undefined,
+              }))
+              .filter((d) => d.term && d.definition)
+          : [];
+
+        const rawActions = Array.isArray(raw.action_items)
+          ? raw.action_items
+          : Array.isArray(raw.actionItems)
+            ? raw.actionItems
+            : [];
+        const actionItems = rawActions
+          .map((a) => {
+            if (typeof a === "string" && a.trim()) {
+              return {
+                title: a.trim(),
+                ownerName: "Not specified",
+                dueDate: "Not specified",
+                priority: "medium" as const,
+              };
+            }
+            if (!a || typeof a !== "object") return null;
+            const obj = a as Record<string, unknown>;
+            const t = String(obj.title || obj.task || "").trim();
+            if (!t) return null;
+            const ownerRaw = String(obj.ownerName || obj.owner || "").trim();
+            const dueRaw = String(obj.dueDate || obj.deadline || "").trim();
+            const prioRaw = String(obj.priority || "medium").toLowerCase();
+            return {
+              title: t,
+              ownerName: ownerRaw && ownerRaw !== "null" ? ownerRaw : "Not specified",
+              dueDate: dueRaw && dueRaw !== "null" ? dueRaw : "Not specified",
+              sourceTimestamp: obj.timestamp ? String(obj.timestamp).trim() : undefined,
+              priority: (prioRaw === "high" || prioRaw === "low" ? prioRaw : "medium") as
+                "high" | "medium" | "low",
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => Boolean(x));
+
+        const flashcards = Array.isArray(raw.flashcards)
+          ? raw.flashcards
+              .filter((f): f is Record<string, unknown> => Boolean(f && typeof f === "object"))
+              .map((f) => ({
+                front: String(f.front || f.question || "").trim(),
+                back: String(f.back || f.answer || "").trim(),
+                topic: f.topic ? String(f.topic).trim() : undefined,
+                difficulty: (["easy", "medium", "hard"].includes(String(f.difficulty || ""))
+                  ? String(f.difficulty)
+                  : "medium") as "easy" | "medium" | "hard",
+              }))
+              .filter((f) => f.front && f.back)
+              .slice(0, 12)
+          : [];
+
+        const rawQuiz = Array.isArray(raw.quiz) ? raw.quiz : [];
+        const seenQ = new Set<string>();
+        const verifiedQuizQuestions = rawQuiz
+          .map((qObj, idx) => {
+            if (!qObj || typeof qObj !== "object") return null;
+            const q = qObj as Record<string, unknown>;
+            const rawQ = String(q.question || "").trim();
+            if (rawQ.length < 5) return null;
+            const normQ = normalizeArabicAndLatin(rawQ);
+            if (seenQ.has(normQ)) return null;
+            seenQ.add(normQ);
+
+            const qType: "multiple_choice" | "true_false" =
+              q.type === "true_false" ? "true_false" : "multiple_choice";
+            let qOptions: string[];
+            let correctIdx =
+              typeof q.correctOptionIndex === "number" && Number.isInteger(q.correctOptionIndex)
+                ? q.correctOptionIndex
+                : 0;
+
+            if (qType === "multiple_choice") {
+              const opts = Array.isArray(q.options)
+                ? Array.from(new Set(q.options.map((o) => String(o || "").trim()).filter(Boolean)))
+                : [];
+              if (opts.length < 4) return null;
+              qOptions = opts.slice(0, 4);
+              if (correctIdx < 0 || correctIdx >= 4) correctIdx = 0;
+            } else {
+              qOptions = isEnglish ? ["True", "False"] : ["صح", "خطأ"];
+              if (correctIdx !== 0 && correctIdx !== 1) correctIdx = 0;
+            }
+
+            const verification = verifyQuizQuestionGrounding(
+              {
+                question: rawQ,
+                type: qType,
+                options: qOptions,
+                correctOptionIndex: correctIdx,
+                correctAnswerText: qOptions[correctIdx],
+                explanation: typeof q.explanation === "string" ? q.explanation : undefined,
+                sourceTranscriptSegment:
+                  typeof q.sourceTranscriptSegment === "string"
+                    ? q.sourceTranscriptSegment
+                    : undefined,
+              },
+              segments,
+            );
+            if (!verification.grounded) return null;
+
+            const ts =
+              (typeof q.timestamp === "string" && q.timestamp.trim()) ||
+              verification.matchedTimestamp ||
+              "00:00";
+            return {
+              id: `q_uni_${Date.now()}_${idx + 1}`,
+              question: rawQ,
+              type: qType,
+              options: qOptions,
+              correctOptionIndex: correctIdx,
+              correctAnswerText: qOptions[correctIdx],
+              acceptableAnswers: [qOptions[correctIdx]],
+              explanation:
+                (typeof q.explanation === "string" && q.explanation.trim()) ||
+                (isEnglish
+                  ? `Verified directly at [${ts}] from the transcript.`
+                  : `موثق مباشرة من النص المفرغ عند [${ts}].`),
+              difficulty: (["easy", "medium", "hard"].includes(String(q.difficulty || ""))
+                ? String(q.difficulty)
+                : "medium") as "easy" | "medium" | "hard",
+              sectionRef: topics[0] || (isEnglish ? "Recording Transcript" : "محاور الجلسة"),
+              timestampRef: ts,
+              sourceReference: `${isEnglish ? "Transcript" : "النص المفرغ"} [${ts}]`,
+              sourceTranscriptSegment:
+                (typeof q.sourceTranscriptSegment === "string" &&
+                  q.sourceTranscriptSegment.trim()) ||
+                verification.matchedSegmentText ||
+                "",
+              groundingVerified: true,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => Boolean(x))
+          .slice(0, 20);
+
+        const detailedSummary = formatDetailedSummaryLocally({
+          isEnglish,
+          executiveSummary,
+          keyPoints: mergedKeyPoints.slice(0, 8),
+          topics,
+          decisions,
+          actionItems,
+          notes,
+        });
+
+        const mindMap = buildMindMapLocallyFromAnalysis(
+          title,
+          topics.length > 0 ? topics : keywords.slice(0, 5),
+          mergedKeyPoints,
+          definitions,
+          notes,
+        );
+
+        const unifiedResult: UnifiedRecordingAnalysisResult = {
+          provider: "gemini",
+          cacheHit: false,
+          transcriptHash,
+          analysisHash,
+          summary: {
+            summary: detailedSummary || executiveSummary,
+            executiveSummary: executiveSummary || detailedSummary,
+            detailedSummary: detailedSummary || executiveSummary,
+            keyPoints: mergedKeyPoints.slice(0, 8),
+            decisions,
+            actionItems,
+          },
+          deepAnalysis: {
+            overview: executiveSummary,
+            topics: topics.length > 0 ? topics : [title],
+            keywords,
+            definitions,
+            questionsAsked: [],
+            actionItems: actionItems.map((a) => ({
+              task: a.title,
+              owner: a.ownerName === "Not specified" ? undefined : a.ownerName,
+              deadline: a.dueDate === "Not specified" ? undefined : a.dueDate,
+            })),
+            emphasizedPoints: examHints.length > 0 ? examHints : mergedKeyPoints.slice(0, 4),
+            importantSentences,
+            reviewAreas: topics.slice(0, 5),
+          },
+          deadlines,
+          examHints,
+          notes,
+          quiz: {
+            title: isEnglish ? `Comprehension Quiz: ${title}` : `اختبار الفهم الشامل: ${title}`,
+            courseCode,
+            questions:
+              verifiedQuizQuestions.length > 0
+                ? verifiedQuizQuestions
+                : buildBuiltInQuiz(title, segments, {
+                    courseCode,
+                    appLanguage: isEnglish ? "en" : "ar",
+                    numQuestions: targetQuizCount,
+                  }).questions,
+          },
+          flashcards:
+            flashcards.length > 0
+              ? flashcards
+              : buildBuiltInFlashcards(title, segments, courseCode, isEnglish ? "en" : "ar"),
+          mindMap,
+        };
+
+        setCachedAiAnalysis(analysisHash, "unified_analysis", config.textModel, unifiedResult);
+        return unifiedResult;
+      }
+    } catch (err) {
+      suspendGeminiIfUnavailableError(err);
+      logGeminiStructured({
+        level: "warn",
+        event: "gemini_unified_analysis_fallback_analytical",
+        operation: "generateUnifiedRecordingAnalysis",
+        model: getGeminiConfig().textModel,
+        status: extractHttpStatus(err),
+        finalFailureReason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Ultra-fast grounded deterministic analytical fallback (<50ms on a 14-min transcript — ZERO 25s CPU LLM queue stall!)
+  const builtInSummary = buildBuiltInSummary(
+    title,
+    segments,
+    resourceType,
+    courseCode,
+    appLanguage,
+  );
+  const builtInDeep = buildBuiltInLectureAnalysis(
+    title,
+    segments,
+    resourceType,
+    courseCode,
+    appLanguage,
+  );
+  const builtInQuiz = buildBuiltInQuiz(title, segments, {
+    courseCode,
+    appLanguage: isEnglish ? "en" : "ar",
+    numQuestions: targetQuizCount,
+  });
+  const builtInFlashcards = buildBuiltInFlashcards(
+    title,
+    segments,
+    courseCode,
+    isEnglish ? "en" : "ar",
+  );
+  const builtInMindMap = buildBuiltInMindMap(title, segments, courseCode, appLanguage);
+
+  const deadlines = builtInSummary.actionItems
+    .map((a) => a.dueDate)
+    .filter((d): d is string =>
+      Boolean(d && d !== "Not specified" && d !== "Deadline not specified."),
+    );
+
+  const analyticalResult: UnifiedRecordingAnalysisResult = {
+    provider: "analytical",
+    cacheHit: false,
+    transcriptHash,
+    analysisHash,
+    summary: builtInSummary,
+    deepAnalysis: builtInDeep,
+    deadlines,
+    examHints: builtInDeep.emphasizedPoints || [],
+    notes: builtInSummary.keyPoints || [],
+    quiz: builtInQuiz,
+    flashcards: builtInFlashcards,
+    mindMap: builtInMindMap,
+  };
+
+  setCachedAiAnalysis(
+    analysisHash,
+    "unified_analysis",
+    "meetmind-grounded-analytical",
+    analyticalResult,
+  );
+  return analyticalResult;
 }

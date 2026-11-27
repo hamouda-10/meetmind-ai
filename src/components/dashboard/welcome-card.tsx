@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import {
   ArrowRight,
   Mic,
@@ -17,13 +17,22 @@ import { Link } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { GlassCard } from "@/components/common/glass-card";
-import { UploadRecordingDialog } from "@/components/common/upload-recording-dialog";
-import { LiveArabicRecorder } from "@/components/recording/live-arabic-recorder";
 import { AudioCenterCard } from "@/components/dashboard/audio-center-card";
 import { AIRadar3DCard } from "@/components/dashboard/ai-radar-3d-card";
 import { CentralMicCore } from "@/components/dashboard/central-mic-core";
 import { useTranslation } from "@/lib/i18n";
 import { useUIStore } from "@/stores/ui-store";
+
+const UploadRecordingDialog = lazy(() =>
+  import("@/components/common/upload-recording-dialog").then((m) => ({
+    default: m.UploadRecordingDialog,
+  })),
+);
+const LiveArabicRecorder = lazy(() =>
+  import("@/components/recording/live-arabic-recorder").then((m) => ({
+    default: m.LiveArabicRecorder,
+  })),
+);
 
 export function WelcomeCard() {
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -200,26 +209,34 @@ export function WelcomeCard() {
         </div>
       </GlassCard>
 
-      <UploadRecordingDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        onSuccess={refreshDashboard}
-      />
+      {dialogOpen && (
+        <Suspense fallback={null}>
+          <UploadRecordingDialog
+            open={dialogOpen}
+            onOpenChange={setDialogOpen}
+            onSuccess={refreshDashboard}
+          />
+        </Suspense>
+      )}
 
-      <LiveArabicRecorder
-        open={liveRecorderOpen}
-        onOpenChange={(open) => {
-          setLiveRecorderOpen(open);
-          if (!open) {
-            const current = useUIStore.getState().audioSystemMode;
-            if (current === "Listening" || current === "Recording") {
-              setAudioSystemState("Ready", 0);
-            }
-          }
-        }}
-        defaultType="meeting"
-        onCompleted={refreshDashboard}
-      />
+      {liveRecorderOpen && (
+        <Suspense fallback={null}>
+          <LiveArabicRecorder
+            open={liveRecorderOpen}
+            onOpenChange={(open) => {
+              setLiveRecorderOpen(open);
+              if (!open) {
+                const current = useUIStore.getState().audioSystemMode;
+                if (current === "Listening" || current === "Recording") {
+                  setAudioSystemState("Ready", 0);
+                }
+              }
+            }}
+            defaultType="meeting"
+            onCompleted={refreshDashboard}
+          />
+        </Suspense>
+      )}
     </>
   );
 }

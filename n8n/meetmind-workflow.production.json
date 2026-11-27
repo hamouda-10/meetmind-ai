@@ -1,0 +1,311 @@
+{
+  "name": "MeetMind AI — Ultra-Fast Production Audio Pipeline (Adaptive Polling + Compact JSON)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meeting-upload",
+        "responseMode": "responseNode",
+        "options": {
+          "binaryPropertyName": "audio"
+        }
+      },
+      "id": "985e0f53-c99c-4e66-996b-8fa4cf67099b",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [-400, 0],
+      "webhookId": "1e18a069-5d5a-492a-8880-c0dc76ea3830"
+    },
+    {
+      "parameters": {
+        "jsCode": "const startedAt = Date.now();\nconst binaryData = items[0].binary || {};\nconst firstKey = binaryData.audio ? 'audio' : Object.keys(binaryData)[0];\nif (!firstKey) {\n  throw new Error('Missing audio binary upload');\n}\nreturn [{\n  json: {\n    ...(items[0].json || {}),\n    _pipelineStartedAt: startedAt,\n    _uploadStartedAt: Date.now()\n  },\n  binary: { audio: binaryData[firstKey] }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-200, 0],
+      "id": "3a080b38-513f-48cb-995d-e5c5f4b3475a",
+      "name": "Normalize Binary & Start Timer"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.assemblyai.com/v2/upload",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "authorization",
+              "value": "={{ $env.ASSEMBLYAI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/octet-stream"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "audio",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [0, 0],
+      "id": "da8998a8-7662-4319-96c7-afe6fce00b49",
+      "name": "AssemblyAI Upload"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.assemblyai.com/v2/transcript",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "authorization",
+              "value": "={{ $env.ASSEMBLYAI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify((() => { const rawLang = String($('Normalize Binary & Start Timer').first().json?.body?.language || $('Normalize Binary & Start Timer').first().json?.language || 'auto').trim().toLowerCase(); const langCfg = rawLang === 'ar' || rawLang.startsWith('ar-') ? { language_code: 'ar' } : rawLang === 'en' || rawLang.startsWith('en-') ? { language_code: 'en' } : rawLang === 'mixed' ? { language_detection: true, language_detection_options: { code_switching: true } } : { language_detection: true }; return { audio_url: $json.upload_url, speech_models: ['assemblyai-stt-3-7', 'universal-2'], speaker_labels: true, punctuate: true, format_text: true, ...langCfg }; })()) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [220, 0],
+      "id": "b8bee5ac-3868-41c8-93a1-3aaaaee556dc",
+      "name": "Start AssemblyAI Transcription"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = items[0].json || {};\nconst startNode = $('Normalize Binary & Start Timer').first().json;\nconst attempt = Number(prev._pollAttempt || 0);\nconst scheduleSec = [2, 3, 5, 8, 10];\nconst waitSeconds = scheduleSec[Math.min(attempt, scheduleSec.length - 1)];\nconst now = Date.now();\nreturn [{\n  json: {\n    ...prev,\n    _pollAttempt: attempt + 1,\n    _waitSeconds: waitSeconds,\n    _pollingWaitMs: Number(prev._pollingWaitMs || 0) + waitSeconds * 1000,\n    _assemblyAiUploadMs: prev._assemblyAiUploadMs || (now - (startNode._uploadStartedAt || now)),\n    _transcriptionStartedAt: prev._transcriptionStartedAt || now\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0],
+      "id": "c1f2e3d4-1111-4222-8333-444455556666",
+      "name": "Adaptive Poll Scheduler (2s-3s-5s-8s-10s)"
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json._waitSeconds || 2 }}",
+        "unit": "seconds"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [660, 0],
+      "id": "b9eb9b7e-bf41-4196-b19c-cdff81f47adf",
+      "name": "Adaptive Wait"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.assemblyai.com/v2/transcript/{{ $json.id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "authorization",
+              "value": "={{ $env.ASSEMBLYAI_API_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [880, 0],
+      "id": "daa1f774-e53f-4996-ac89-21c4355576a5",
+      "name": "Check Transcript Status"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "5d2b2e7f-089f-48d3-8ccb-f62030449547",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "completed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [1100, 0],
+      "id": "fd948cd4-418b-48db-9c56-c1cfad47e8e1",
+      "name": "Is Completed?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "9a1c3e2f-8d4b-4a51-9b3e-0f1d2c3b4a5e",
+              "leftValue": "={{ $json.status === 'error' || ($('Adaptive Poll Scheduler (2s-3s-5s-8s-10s)').first().json._pollAttempt || 0) >= 60 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [1100, 220],
+      "id": "35ecf978-1909-45f6-86c1-e12220aaadc6",
+      "name": "Is Error or Max Timeout?"
+    },
+    {
+      "parameters": {
+        "jsCode": "const tr = items[0].json;\nconst pollMeta = $('Adaptive Poll Scheduler (2s-3s-5s-8s-10s)').first().json;\nconst now = Date.now();\nconst words = Array.isArray(tr.words) ? tr.words : [];\nconst avgConf = words.length ? Math.round((words.reduce((s, w) => s + (Number(w.confidence) || 0), 0) / words.length) * 10000) / 10000 : (typeof tr.confidence === 'number' ? tr.confidence : null);\nreturn [{\n  json: {\n    transcript_id: tr.id,\n    transcript_text: tr.text || '',\n    raw_transcript: tr.text || '',\n    transcript_utterances: tr.utterances || [],\n    language_code: tr.language_code || 'auto',\n    speech_model_used: tr.speech_model_used || tr.speech_model || 'assemblyai-stt-3-7',\n    average_confidence: avgConf,\n    diarization_enabled: true,\n    audio_duration: tr.audio_duration || 0,\n    _assemblyAiUploadMs: pollMeta._assemblyAiUploadMs || 0,\n    _pollingWaitMs: pollMeta._pollingWaitMs || 0,\n    _pollCount: pollMeta._pollAttempt || 0,\n    _transcriptionMs: Math.max(1, now - (pollMeta._transcriptionStartedAt || now)),\n    _geminiStartedAt: now\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, -80],
+      "id": "dbcd0b3f-17db-4873-8496-8b1a60bb7284",
+      "name": "Prepare Transcript & Timing"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + ($env.GEMINI_MODEL || 'gemini-2.5-flash') + ':generateContent' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contents\": [\n    {\n      \"parts\": [\n        {\n          \"text\": \"You are MeetMind AI. Analyze ONLY the provided transcript. Return STRICT compact JSON ONLY (no HTML, no CSS, no Markdown, do NOT repeat the transcript). Match the transcript language.\\nSchema:\\n{\\n  \\\"summary\\\": \\\"concise 3-5 sentence summary\\\",\\n  \\\"key_points\\\": [\\\"short point\\\"],\\n  \\\"important_sentences\\\": [\\\"exact key quote from transcript\\\"],\\n  \\\"topics\\\": [\\\"topic\\\"],\\n  \\\"keywords\\\": [\\\"keyword\\\"],\\n  \\\"decisions\\\": [\\\"decision\\\"],\\n  \\\"action_items\\\": [{ \\\"title\\\": \\\"task\\\", \\\"ownerName\\\": \\\"owner or null\\\", \\\"dueDate\\\": \\\"deadline or null\\\", \\\"priority\\\": \\\"high|medium|low\\\" }],\\n  \\\"deadlines\\\": [\\\"deadline\\\"],\\n  \\\"exam_hints\\\": [\\\"hint\\\"],\\n  \\\"notes\\\": [\\\"concise bullet note\\\"],\\n  \\\"flashcards\\\": [{ \\\"front\\\": \\\"question\\\", \\\"back\\\": \\\"concise answer\\\" }],\\n  \\\"essayQuestions\\\": [{ \\\"question\\\": \\\"question\\\" }],\\n  \\\"quiz\\\": [\\n    { \\\"question\\\": \\\"...\\\", \\\"type\\\": \\\"multiple_choice\\\", \\\"options\\\": [\\\"A\\\",\\\"B\\\",\\\"C\\\",\\\"D\\\"], \\\"correctOptionIndex\\\": 0, \\\"explanation\\\": \\\"1 short sentence\\\" },\\n    { \\\"question\\\": \\\"...\\\", \\\"type\\\": \\\"true_false\\\", \\\"options\\\": [\\\"True\\\",\\\"False\\\"], \\\"correctOptionIndex\\\": 0, \\\"explanation\\\": \\\"1 short sentence\\\" }\\n  ]\\n}\\nRules: Ground 100% in the transcript. Max 20 quiz questions (MCQ with 4 unique options + True/False with 2 options). Never invent filler questions.\\n\\nTRANSCRIPT:\\n{{ $json.transcript_text }}\"\n        }\n      ]\n    }\n  ],\n  \"generationConfig\": {\n    \"responseMimeType\": \"application/json\",\n    \"maxOutputTokens\": 4096,\n    \"temperature\": 0.1\n  }\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [1540, -80],
+      "id": "ea6362ae-5543-4eed-9732-f719b605faef",
+      "name": "Gemini Compact JSON Analyzer"
+    },
+    {
+      "parameters": {
+        "jsCode": "const trNode = $('Prepare Transcript & Timing').first().json;\nconst rawText = items[0].json?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';\nlet analysis = {};\ntry {\n  analysis = JSON.parse(rawText);\n} catch {\n  analysis = { summary: rawText };\n}\nconst geminiAnalysisMs = Math.max(1, Date.now() - (trNode._geminiStartedAt || Date.now()));\nreturn [{\n  json: {\n    success: true,\n    timings: {\n      assemblyAiUploadMs: trNode._assemblyAiUploadMs || 0,\n      transcriptionMs: trNode._transcriptionMs || 0,\n      pollingWaitMs: trNode._pollingWaitMs || 0,\n      pollCount: trNode._pollCount || 0,\n      geminiAnalysisMs\n    },\n    transcript: {\n      id: trNode.transcript_id,\n      text: trNode.transcript_text,\n      rawText: trNode.raw_transcript || trNode.transcript_text,\n      utterances: trNode.transcript_utterances || [],\n      language: trNode.language_code || 'auto',\n      asrModel: trNode.speech_model_used || 'assemblyai-stt-3-7',\n      averageConfidence: trNode.average_confidence,\n      diarizationEnabled: trNode.diarization_enabled !== false,\n      durationSeconds: trNode.audio_duration || 0\n    },\n    analysis\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, -80],
+      "id": "2b88687e-bf1a-460f-bd85-6d2c112b1712",
+      "name": "Build Compact JSON Response"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1980, -80],
+      "id": "e4f76255-df78-4fb5-a060-96705b0c3fc6",
+      "name": "Respond to MeetMind"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: false, error: $json.error || 'AssemblyAI transcription failed or timed out' } }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1320, 220],
+      "id": "a1b2c3d4-e5f6-4789-a012-3456789abcde",
+      "name": "Respond Error"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Normalize Binary & Start Timer", "type": "main", "index": 0 }]]
+    },
+    "Normalize Binary & Start Timer": {
+      "main": [[{ "node": "AssemblyAI Upload", "type": "main", "index": 0 }]]
+    },
+    "AssemblyAI Upload": {
+      "main": [[{ "node": "Start AssemblyAI Transcription", "type": "main", "index": 0 }]]
+    },
+    "Start AssemblyAI Transcription": {
+      "main": [
+        [{ "node": "Adaptive Poll Scheduler (2s-3s-5s-8s-10s)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Adaptive Poll Scheduler (2s-3s-5s-8s-10s)": {
+      "main": [[{ "node": "Adaptive Wait", "type": "main", "index": 0 }]]
+    },
+    "Adaptive Wait": {
+      "main": [[{ "node": "Check Transcript Status", "type": "main", "index": 0 }]]
+    },
+    "Check Transcript Status": {
+      "main": [[{ "node": "Is Completed?", "type": "main", "index": 0 }]]
+    },
+    "Is Completed?": {
+      "main": [
+        [{ "node": "Prepare Transcript & Timing", "type": "main", "index": 0 }],
+        [{ "node": "Is Error or Max Timeout?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Error or Max Timeout?": {
+      "main": [
+        [{ "node": "Respond Error", "type": "main", "index": 0 }],
+        [{ "node": "Adaptive Poll Scheduler (2s-3s-5s-8s-10s)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepare Transcript & Timing": {
+      "main": [[{ "node": "Gemini Compact JSON Analyzer", "type": "main", "index": 0 }]]
+    },
+    "Gemini Compact JSON Analyzer": {
+      "main": [[{ "node": "Build Compact JSON Response", "type": "main", "index": 0 }]]
+    },
+    "Build Compact JSON Response": {
+      "main": [[{ "node": "Respond to MeetMind", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  }
+}

@@ -37,6 +37,8 @@ import {
   generateAiQuiz,
   generateAiFlashcards,
   generateAiMindMap,
+  generateUnifiedRecordingAnalysis,
+  type UnifiedRecordingAnalysisResult,
 } from "./ai";
 import {
   extractGeminiTranscriptText,
@@ -50,6 +52,30 @@ import {
 } from "./gemini";
 import { getChunksDir, inspectMediaContainerSignature } from "./storage";
 import { notifySync } from "./sync";
+import {
+  computeSpeakerBreakdown,
+  getConfiguredAssemblyAiSpeechModels,
+  isAssemblyAiConfigured,
+  transcribeAudioWithAssemblyAi,
+  type AssemblyAiSpeakerStat,
+} from "./assemblyai";
+import { buildTranscriptArtifacts } from "./transcript-format";
+import { executeN8nAudioWorkflow, getN8nConfig, type N8nWorkflowResult } from "./n8n-integration";
+import {
+  createCorrelationId,
+  logObservabilityEvent,
+  logStageTiming,
+  type CanonicalPipelineStage,
+  type StageTelemetryEntry,
+  type StageTimings,
+} from "./pipeline-logger";
+import {
+  attachCachedAnalysisToAudioHash,
+  computeFileSha256,
+  computeTranscriptSha256,
+  getCachedTranscriptByAudioHash,
+  setCachedTranscriptByAudioHash,
+} from "./pipeline-cache";
 
 const TEXT_MODEL = "gemini-3.5-flash";
 
@@ -1039,6 +1065,7 @@ Return ONLY a JSON array: [{"speaker":"${isMeeting ? "Speaker 1" : "Lecturer"}",
 function classifyFailureCategory(errMessage: string): { category: string; transient: boolean } {
   const lower = errMessage.toLowerCase();
   if (lower.includes("cancelled")) return { category: "CancelledByUser", transient: false };
+  if (lower.includes("n8n")) return { category: "N8nUnavailable", transient: false };
   if (
     lower.includes("api_key_invalid") ||
     lower.includes("api key") ||
@@ -1073,6 +1100,307 @@ function assertNotCancelled(jobId: string) {
   }
 }
 
+async function persistN8nWorkflowResult(params: {
+  n8nResult: N8nWorkflowResult;
+  jobId: string;
+  correlationId: string;
+  resourceType: "meeting" | "lecture";
+  resourceId: string;
+  title: string;
+  courseCode?: string;
+  userId: string;
+  appLanguage?: "en" | "ar";
+}): Promise<void> {
+  const {
+    n8nResult,
+    jobId,
+    correlationId,
+    resourceType,
+    resourceId,
+    title,
+    courseCode,
+    userId,
+    appLanguage,
+  } = params;
+
+  const { transcript, analysis, htmlReport } = n8nResult;
+  const artifacts = buildTranscriptArtifacts({
+    rawFullText: transcript.rawText || transcript.text,
+    rawSegments: transcript.rawSegments || transcript.segments,
+  });
+  const segments = artifacts.processedSegments;
+  const rawSegments = artifacts.rawSegments;
+  const rawTranscript = artifacts.rawTranscript;
+  const processedTranscript = artifacts.processedTranscript;
+  const averageConfidence = transcript.averageConfidence ?? artifacts.averageConfidence;
+  const asrModel = transcript.asrModel || getConfiguredAssemblyAiSpeechModels().join(",");
+  const diarizationEnabled = transcript.diarizationEnabled !== false;
+  const fullText = processedTranscript || segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
+  const keywords = extractKeywordsWithFrequency(segments, 12);
+  const cueHighlights = extractHighlightsFromSegments(segments);
+  const now = new Date().toISOString();
+  const speakerBreakdown =
+    analysis.speakerBreakdown.length > 0
+      ? analysis.speakerBreakdown
+      : computeSpeakerBreakdown(segments);
+
+  updateJob(jobId, {
+    status: "Generating Results",
+    stage: "GeneratingResults",
+    progressPercent: 88,
+  });
+
+  const deepBlock = {
+    overview: analysis.summary || undefined,
+    topics: analysis.topics.length ? analysis.topics : keywords.slice(0, 5).map((k) => k.term),
+    keywords: analysis.keywords.length ? analysis.keywords : keywords.map((k) => k.term),
+    definitions: [],
+    questionsAsked: [],
+    actionItems: analysis.actionItems.map((a) => ({
+      task: a.title,
+      owner: a.ownerName,
+      deadline: a.dueDate,
+    })),
+    emphasizedPoints: analysis.examHints.length ? analysis.examHints : analysis.keyPoints,
+    importantSentences: analysis.importantSentences,
+    reviewAreas: analysis.notes,
+  };
+
+  if (resourceType === "meeting") {
+    db.update("meetings", (meetings) =>
+      meetings.map((m) =>
+        m.id === resourceId
+          ? {
+              ...m,
+              status: "Completed",
+              transcriptionStatus: "Completed",
+              transcriptStatus: "final_verified",
+              analysisStatus: analysis.summary ? "Completed" : "Unavailable",
+              analysisRetryable: !analysis.summary,
+              analyzedAt: now,
+              transcriptId: transcript.id,
+              transcriptionProvider: "n8n",
+              asrModel,
+              languageConfig: transcript.language,
+              diarizationEnabled,
+              averageConfidence,
+              analysisProvider: "n8n",
+              correlationId,
+              language: transcript.language,
+              appLanguage: appLanguage || m.appLanguage,
+              durationSeconds: Math.max(1, transcript.durationSeconds, m.durationSeconds || 1),
+              summary: analysis.summary || undefined,
+              executiveSummary: analysis.summary || undefined,
+              detailedSummary: analysis.notes.length
+                ? `${analysis.summary}\n\n${analysis.notes.map((n) => `- ${n}`).join("\n")}`.trim()
+                : analysis.summary || undefined,
+              keyPoints: analysis.keyPoints.length
+                ? analysis.keyPoints
+                : analysis.notes.slice(0, 6),
+              decisions: analysis.decisions,
+              deadlines: analysis.deadlines,
+              examHints: analysis.examHints,
+              essayQuestions: analysis.essayQuestions,
+              speakerBreakdown,
+              htmlReport,
+              topics: deepBlock.topics,
+              keywords,
+              highlights: cueHighlights,
+              analysis: deepBlock,
+              rawTranscript,
+              processedTranscript,
+              rawSegments,
+              fullText,
+              segments,
+              updatedAt: now,
+            }
+          : m,
+      ),
+    );
+  } else {
+    db.update("lectures", (lectures) =>
+      lectures.map((l) =>
+        l.id === resourceId
+          ? {
+              ...l,
+              status: "Completed",
+              transcriptionStatus: "Completed",
+              transcriptStatus: "final_verified",
+              analysisStatus: analysis.summary ? "Completed" : "Unavailable",
+              analysisRetryable: !analysis.summary,
+              analyzedAt: now,
+              transcriptId: transcript.id,
+              transcriptionProvider: "n8n",
+              asrModel,
+              languageConfig: transcript.language,
+              diarizationEnabled,
+              averageConfidence,
+              analysisProvider: "n8n",
+              correlationId,
+              language: transcript.language,
+              appLanguage: appLanguage || l.appLanguage,
+              durationSeconds: Math.max(1, transcript.durationSeconds, l.durationSeconds || 1),
+              studyNotes: analysis.notes.length ? analysis.notes.join("\n") : analysis.summary,
+              summary: analysis.summary || undefined,
+              executiveSummary: analysis.summary || undefined,
+              detailedSummary: analysis.notes.length
+                ? `${analysis.summary}\n\n${analysis.notes.map((n) => `- ${n}`).join("\n")}`.trim()
+                : analysis.summary || undefined,
+              examHighlights: analysis.examHints.length ? analysis.examHints : analysis.keyPoints,
+              deadlines: analysis.deadlines,
+              examHints: analysis.examHints,
+              essayQuestions: analysis.essayQuestions,
+              speakerBreakdown,
+              htmlReport,
+              topics: deepBlock.topics,
+              keywords,
+              highlights: cueHighlights,
+              analysis: deepBlock,
+              rawTranscript,
+              processedTranscript,
+              rawSegments,
+              fullText,
+              segments,
+              updatedAt: now,
+            }
+          : l,
+      ),
+    );
+  }
+
+  if (analysis.actionItems.length > 0) {
+    db.update("actionItems", (items) => [
+      ...items.filter((i) =>
+        resourceType === "meeting" ? i.meetingId !== resourceId : i.lectureId !== resourceId,
+      ),
+      ...analysis.actionItems.map((t, idx) => ({
+        id: `task_n8n_${jobId}_${idx + 1}`,
+        userId,
+        ...(resourceType === "meeting" ? { meetingId: resourceId } : { lectureId: resourceId }),
+        title: t.title,
+        ownerName: t.ownerName || "Not specified",
+        dueDate: t.dueDate,
+        deadlineText: t.dueDate || "Not specified",
+        priority: t.priority || "medium",
+        completed: false,
+        createdAt: now,
+      })),
+    ]);
+  }
+
+  if (analysis.quiz.length > 0) {
+    const isAr = transcript.language.startsWith("ar") || /[\u0600-\u06FF]/.test(transcript.text);
+    db.update("quizzes", (quizzes) => [
+      {
+        id: `quiz_n8n_${jobId}`,
+        ...(resourceType === "meeting" ? { meetingId: resourceId } : { lectureId: resourceId }),
+        title: isAr ? `اختبار الفهم: ${title}` : `Comprehension Quiz: ${title}`,
+        courseCode,
+        questions: analysis.quiz,
+        attemptsCount: 0,
+        createdAt: now,
+      },
+      ...quizzes.filter((q) =>
+        resourceType === "meeting" ? q.meetingId !== resourceId : q.lectureId !== resourceId,
+      ),
+    ]);
+    logObservabilityEvent("info", "quiz_generation_completed", {
+      correlationId,
+      jobId,
+      resourceId,
+      provider: "n8n",
+      questionsCount: analysis.quiz.length,
+    });
+  }
+
+  if (analysis.flashcards.length > 0) {
+    db.update("flashcards", (cards) => [
+      ...analysis.flashcards.map((c, idx) => ({
+        id: `fc_n8n_${jobId}_${idx + 1}`,
+        deckId: `deck_${resourceId}`,
+        deckTitle: title.length > 35 ? `${title.slice(0, 35)}...` : title,
+        ...(resourceType === "meeting" ? { meetingId: resourceId } : { lectureId: resourceId }),
+        front: c.front,
+        back: c.back,
+        topic: c.topic,
+        difficulty: c.difficulty || "medium",
+        mastered: false,
+        reviewCount: 0,
+        createdAt: now,
+      })),
+      ...cards.filter((c) =>
+        resourceType === "meeting" ? c.meetingId !== resourceId : c.lectureId !== resourceId,
+      ),
+    ]);
+  }
+
+  logObservabilityEvent("info", "ai_analysis_completed", {
+    correlationId,
+    jobId,
+    resourceId,
+    provider: "n8n",
+    summaryChars: analysis.summary.length,
+    quizCount: analysis.quiz.length,
+    flashcardsCount: analysis.flashcards.length,
+    tasksCount: analysis.actionItems.length,
+  });
+}
+
+export interface PreValidatedMediaMeta {
+  durationSeconds: number;
+  detectedMimeType?: string;
+  hasVideo?: boolean;
+  fileSha256?: string;
+  uploadMs?: number;
+  validationMs?: number;
+  forceRetranscribe?: boolean;
+}
+
+function markStageLedger(
+  ledger: Record<string, StageTelemetryEntry>,
+  correlationId: string,
+  jobId: string | undefined,
+  recordingId: string,
+  stage: CanonicalPipelineStage | string,
+  status: "pending" | "running" | "completed" | "failed",
+  opts?: { durationMs?: number; detail?: string; error?: string; startedAtIso?: string },
+): void {
+  const nowIso = new Date().toISOString();
+  const prev = ledger[stage];
+  const startedAt = opts?.startedAtIso || prev?.startedAt || nowIso;
+  const durationMs =
+    typeof opts?.durationMs === "number"
+      ? Math.max(0, Math.round(opts.durationMs))
+      : status === "completed" || status === "failed"
+        ? Math.max(0, Date.now() - Date.parse(startedAt))
+        : prev?.durationMs;
+
+  ledger[stage] = {
+    stage,
+    status,
+    startedAt,
+    ...(status === "completed" || status === "failed" ? { endedAt: nowIso } : {}),
+    ...(typeof durationMs === "number" ? { durationMs } : {}),
+    ...(opts?.detail ? { detail: opts.detail } : {}),
+    ...(opts?.error ? { error: opts.error } : {}),
+  };
+
+  if (status === "running" || status === "completed" || status === "failed") {
+    logStageTiming(
+      correlationId,
+      stage,
+      status === "completed" || status === "failed" ? durationMs : undefined,
+      {
+        jobId,
+        recordingId,
+        status,
+        ...(opts?.detail ? { detail: opts.detail } : {}),
+        ...(opts?.error ? { error: opts.error } : {}),
+      },
+    );
+  }
+}
+
 export async function processRecordingJob(
   jobId: string,
   resourceType: "meeting" | "lecture",
@@ -1080,10 +1408,32 @@ export async function processRecordingJob(
   filePath: string,
   originalFilename: string,
   language = "auto",
+  preValidated?: PreValidatedMediaMeta,
 ) {
+  const jobStartedAt = Date.now();
   const jobChunkDir = path.join(CHUNKS_BASE_DIR, `job_${jobId}`);
   const normalizedAudioPath = path.join(CHUNKS_BASE_DIR, `norm_${jobId}.wav`);
   const jsonOutputPath = path.join(jobChunkDir, `transcript_${jobId}.json`);
+  const existingJob = db.get("jobs").find((j) => j.id === jobId);
+  const correlationId = existingJob?.correlationId || createCorrelationId("rec");
+  const timings: StageTimings = {
+    uploadMs: preValidated?.uploadMs ?? existingJob?.timings?.uploadMs ?? 0,
+    validationMs: preValidated?.validationMs ?? existingJob?.timings?.validationMs ?? 0,
+  };
+  const stageLedger: Record<string, StageTelemetryEntry> = {
+    ...(existingJob?.stageLedger || {}),
+  };
+  const uploadDurMs = timings.uploadMs || 0;
+  markStageLedger(stageLedger, correlationId, jobId, resourceId, "UPLOAD", "completed", {
+    durationMs: uploadDurMs,
+    startedAtIso: new Date(Date.now() - uploadDurMs).toISOString(),
+  });
+  let fileSizeBytes = existingJob?.fileSizeBytes || 0;
+  try {
+    if (fs.existsSync(filePath)) fileSizeBytes = fs.statSync(filePath).size;
+  } catch {
+    // ignore stat error
+  }
 
   if (!fs.existsSync(jobChunkDir)) {
     fs.mkdirSync(jobChunkDir, { recursive: true });
@@ -1092,6 +1442,7 @@ export async function processRecordingJob(
   try {
     assertNotCancelled(jobId);
     logPipelineEvent("info", "job_started", {
+      correlationId,
       jobId,
       resourceId,
       resourceType,
@@ -1100,33 +1451,485 @@ export async function processRecordingJob(
     });
     notifySync({ type: "ProcessingStarted", id: jobId, resourceId, resourceType, progress: 5 });
 
-    // 1. Validating with FFprobe
-    updateJob(jobId, {
-      status: "Validating",
-      stage: "ValidatingMedia",
-      progressPercent: 10,
-      filePath,
-      originalFilename,
-      language,
-    });
-
-    const probe = await validateMediaFile(filePath, originalFilename);
-    if (!probe.valid) {
-      throw new Error(probe.error || "Invalid media file.");
+    // 1. Validate media (skip redundant ffprobe spawn when finalizeUploadedRecording already verified this file!)
+    let probe: MediaProbeResult;
+    if (preValidated && preValidated.durationSeconds > 0 && fs.existsSync(filePath)) {
+      probe = {
+        valid: true,
+        correlationId,
+        hasAudio: true,
+        hasVideo: Boolean(preValidated.hasVideo),
+        durationSeconds: preValidated.durationSeconds,
+        detectedMimeType: preValidated.detectedMimeType,
+        ffprobeAvailable: true,
+      };
+      updateJob(jobId, {
+        correlationId,
+        status: "Validating",
+        stage: "Validated",
+        progressPercent: 12,
+        filePath,
+        originalFilename,
+        language,
+        timings,
+        milestones: { uploadComplete: true },
+      });
+    } else {
+      updateJob(jobId, {
+        correlationId,
+        status: "Validating",
+        stage: "ValidatingMedia",
+        progressPercent: 10,
+        filePath,
+        originalFilename,
+        language,
+        timings,
+        milestones: { uploadComplete: true },
+      });
+      const valStart = Date.now();
+      probe = await validateMediaFile(filePath, originalFilename);
+      timings.validationMs = (timings.validationMs || 0) + (Date.now() - valStart);
+      if (!probe.valid) {
+        throw new Error(probe.error || "Invalid media file.");
+      }
     }
 
     assertNotCancelled(jobId);
 
+    const jobOwnerId = db.get("jobs").find((j) => j.id === jobId)?.userId || "usr_admin";
+    const jobRecordPre = db.get("jobs").find((j) => j.id === jobId);
+    const audioSha256 =
+      preValidated?.fileSha256 || jobRecordPre?.fileSha256 || computeFileSha256(filePath);
+    const resourceTitlePre =
+      resourceType === "meeting"
+        ? db.get("meetings").find((m) => m.id === resourceId)?.title || originalFilename
+        : db.get("lectures").find((l) => l.id === resourceId)?.title || originalFilename;
+    const courseCodePre =
+      resourceType === "lecture"
+        ? db.get("lectures").find((l) => l.id === resourceId)?.courseCode
+        : undefined;
+
+    // 1A. Persistent Audio Hash -> Real Transcript (+ Analysis) Cache Check
+    // Respects active ASR provider tier (never serves low-accuracy local cache when AssemblyAI/n8n is configured)
+    // and bypasses cache cleanly when the user explicitly requests Re-transcribe.
+    const n8nConfig = getN8nConfig();
+    const pipelineModePref = (process.env.PIPELINE_MODE || "auto").trim().toLowerCase();
+    const preferDirectOverN8n =
+      pipelineModePref === "direct" || (pipelineModePref !== "n8n" && isAssemblyAiConfigured());
+    const shouldUseN8nPrimary = n8nConfig.configured && !preferDirectOverN8n;
+    const preferredProviderForCache: "n8n" | "assemblyai" | "whisper-local" = shouldUseN8nPrimary
+      ? "n8n"
+      : isAssemblyAiConfigured()
+        ? "assemblyai"
+        : "whisper-local";
+
+    timings.audioHash = audioSha256 ? audioSha256.slice(0, 16) : undefined;
+    const cachedTranscript = preValidated?.forceRetranscribe
+      ? null
+      : getCachedTranscriptByAudioHash(
+          audioSha256,
+          language,
+          correlationId,
+          preferredProviderForCache,
+        );
+    if (cachedTranscript && cachedTranscript.segments.length > 0) {
+      timings.pipelineMode = "cache";
+      timings.transcriptCacheHit = true;
+      timings.transcriptionMs = 0;
+      timings.transcriptionProvider = cachedTranscript.provider;
+      timings.transcriptHash =
+        cachedTranscript.transcriptHash?.slice(0, 16) ||
+        computeTranscriptSha256(cachedTranscript.segments).slice(0, 16);
+      logStageTiming(correlationId, "TRANSCRIPTION_COMPLETE", 0, {
+        cacheHit: true,
+        provider: cachedTranscript.provider,
+        segmentsCount: cachedTranscript.segments.length,
+      });
+
+      if (
+        cachedTranscript.cachedN8nAnalysis &&
+        (cachedTranscript.cachedN8nAnalysis.summary ||
+          cachedTranscript.cachedN8nAnalysis.quiz.length > 0)
+      ) {
+        timings.analysisCacheHit = true;
+        timings.geminiAnalysisMs = 0;
+        timings.analysisProvider = "n8n";
+        const dbSaveStart = Date.now();
+        await persistN8nWorkflowResult({
+          n8nResult: {
+            provider: "n8n",
+            latencyMs: 0,
+            transcript: {
+              id: cachedTranscript.transcriptId,
+              text: cachedTranscript.fullText,
+              language: cachedTranscript.detectedLanguage || language,
+              segments: cachedTranscript.segments,
+              durationSeconds: cachedTranscript.durationSeconds || probe.durationSeconds || 10,
+            },
+            analysis: cachedTranscript.cachedN8nAnalysis,
+            htmlReport: cachedTranscript.cachedHtmlReport,
+          },
+          jobId,
+          correlationId,
+          resourceType,
+          resourceId,
+          title: resourceTitlePre,
+          courseCode: courseCodePre,
+          userId: jobOwnerId,
+          appLanguage: jobRecordPre?.appLanguage,
+        });
+        timings.databaseSaveMs = Date.now() - dbSaveStart;
+        timings.firstResultMs = (timings.uploadMs || 0) + (Date.now() - jobStartedAt);
+        timings.totalMs = timings.firstResultMs;
+        logStageTiming(correlationId, "DATABASE_SAVE", timings.databaseSaveMs);
+        logStageTiming(correlationId, "RESULT_READY", timings.totalMs, {
+          transcriptCacheHit: true,
+          analysisCacheHit: true,
+        });
+        if (resourceType === "meeting") {
+          db.update("meetings", (list) =>
+            list.map((m) => (m.id === resourceId ? { ...m, timings } : m)),
+          );
+        } else {
+          db.update("lectures", (list) =>
+            list.map((l) => (l.id === resourceId ? { ...l, timings } : l)),
+          );
+        }
+        updateJob(jobId, {
+          status: "Completed",
+          stage: "Completed",
+          progressPercent: 100,
+          transcriptId: cachedTranscript.transcriptId,
+          transcriptionProvider: cachedTranscript.provider,
+          analysisProvider: "n8n",
+          timings,
+          milestones: {
+            uploadComplete: true,
+            transcriptionStarted: true,
+            transcriptionCompleted: true,
+            summaryReady: Boolean(cachedTranscript.cachedN8nAnalysis.summary),
+            keywordsReady: true,
+            tasksReady: cachedTranscript.cachedN8nAnalysis.actionItems.length > 0,
+            quizReady: cachedTranscript.cachedN8nAnalysis.quiz.length > 0,
+            flashcardsReady: cachedTranscript.cachedN8nAnalysis.flashcards.length > 0,
+            completed: true,
+          },
+          progressiveSummary: cachedTranscript.cachedN8nAnalysis.summary || undefined,
+          progressiveKeywords: cachedTranscript.cachedN8nAnalysis.keywords.slice(0, 12),
+          progressiveKeywordsCount: cachedTranscript.cachedN8nAnalysis.keywords.length,
+          progressiveTasksCount: cachedTranscript.cachedN8nAnalysis.actionItems.length,
+          progressiveQuizCount: cachedTranscript.cachedN8nAnalysis.quiz.length,
+          progressiveFlashcardsCount: cachedTranscript.cachedN8nAnalysis.flashcards.length,
+        });
+        notifySync({
+          type: "ProcessingCompleted",
+          userId: jobOwnerId,
+          id: resourceId,
+          resourceId,
+          resourceType,
+          jobId,
+          progress: 100,
+        });
+        return;
+      }
+
+      updateJob(jobId, {
+        status: "Analyzing",
+        stage: "TranscriptCacheHit",
+        progressPercent: 74,
+        transcriptId: cachedTranscript.transcriptId,
+        transcriptionProvider: cachedTranscript.provider,
+        timings,
+        milestones: {
+          uploadComplete: true,
+          transcriptionStarted: true,
+          transcriptionCompleted: true,
+        },
+      });
+
+      const pipelineResult = await runUnifiedPostTranscriptionPipeline({
+        resourceType,
+        resourceId,
+        title: resourceTitlePre,
+        courseCode: courseCodePre,
+        language: cachedTranscript.detectedLanguage || language,
+        appLanguage: jobRecordPre?.appLanguage,
+        durationSeconds: cachedTranscript.durationSeconds || probe.durationSeconds || 10,
+        segments: cachedTranscript.segments,
+        rawSegments: cachedTranscript.rawSegments,
+        rawTranscript: cachedTranscript.rawTranscript,
+        processedTranscript: cachedTranscript.processedTranscript,
+        asrModel: cachedTranscript.asrModel,
+        languageConfig: cachedTranscript.languageConfig,
+        diarizationEnabled: cachedTranscript.diarizationEnabled,
+        averageConfidence: cachedTranscript.averageConfidence,
+        userId: jobOwnerId,
+        jobId,
+        correlationId,
+        transcriptId: cachedTranscript.transcriptId,
+        transcriptionProvider: cachedTranscript.provider,
+        speakerBreakdown: cachedTranscript.speakerBreakdown,
+        timings,
+        audioSha256,
+        precomputedUnifiedAnalysis: cachedTranscript.cachedUnifiedAnalysis,
+        checkCancelled: () => assertNotCancelled(jobId),
+      });
+
+      timings.totalMs = (timings.uploadMs || 0) + (Date.now() - jobStartedAt);
+      logStageTiming(correlationId, "RESULT_READY", timings.totalMs, {
+        transcriptCacheHit: true,
+        analysisCacheHit: timings.analysisCacheHit,
+      });
+      if (resourceType === "meeting") {
+        db.update("meetings", (list) =>
+          list.map((m) => (m.id === resourceId ? { ...m, timings } : m)),
+        );
+      } else {
+        db.update("lectures", (list) =>
+          list.map((l) => (l.id === resourceId ? { ...l, timings } : l)),
+        );
+      }
+      updateJob(jobId, {
+        status: "Completed",
+        stage: "Completed",
+        progressPercent: 100,
+        transcriptId: cachedTranscript.transcriptId,
+        transcriptionProvider: cachedTranscript.provider,
+        analysisProvider: timings.analysisProvider,
+        timings,
+        errorMessage: pipelineResult.analysisError,
+      });
+      notifySync({
+        type: "ProcessingCompleted",
+        userId: jobOwnerId,
+        id: resourceId,
+        resourceId,
+        resourceType,
+        jobId,
+        progress: 100,
+      });
+      return;
+    }
+
+    // 1B. Architecture Routing (Requirement #9):
+    // - "direct": Backend -> AssemblyAI -> Immediate Progressive Transcript -> Single Unified Gemini JSON -> DB
+    // - "auto" (default): Prefer Direct AssemblyAI when ASSEMBLYAI_API_KEY is set (eliminates redundant n8n audio hop
+    //   and delivers transcript immediately before AI analysis); otherwise use thin n8n if N8N_WEBHOOK_URL is configured.
+    // - "n8n": Always route via N8N_WEBHOOK_URL when configured.
+    if (shouldUseN8nPrimary) {
+      timings.pipelineMode = "n8n";
+      timings.transcriptionProvider = "n8n";
+      updateJob(jobId, {
+        status: "Transcribing",
+        stage: "TranscribingViaN8n",
+        progressPercent: 32,
+        transcriptionProvider: "n8n",
+        milestones: { uploadComplete: true, transcriptionStarted: true },
+      });
+      logStageTiming(correlationId, "TRANSCRIPTION_START", Date.now() - jobStartedAt, {
+        provider: "n8n",
+      });
+      logObservabilityEvent("info", "transcription_started", {
+        correlationId,
+        jobId,
+        resourceId,
+        provider: "n8n",
+      });
+      notifySync({ type: "TranscriptionStarted", id: jobId, resourceId, progress: 32 });
+
+      try {
+        const n8nStart = Date.now();
+        const n8nResult = await executeN8nAudioWorkflow({
+          filePath:
+            probe.repairedPath && fs.existsSync(probe.repairedPath) ? probe.repairedPath : filePath,
+          originalFilename,
+          mimeType: probe.detectedMimeType,
+          resourceId,
+          resourceType,
+          title: resourceTitlePre,
+          language,
+          appLanguage: jobRecordPre?.appLanguage,
+          jobId,
+          correlationId,
+        });
+
+        assertNotCancelled(jobId);
+        timings.n8nWebhookMs = n8nResult.latencyMs || Date.now() - n8nStart;
+        timings.assemblyAiUploadMs = n8nResult.stageTimings?.assemblyAiUploadMs;
+        timings.transcriptionMs = n8nResult.stageTimings?.transcriptionMs ?? timings.n8nWebhookMs;
+        timings.pollingWaitMs = n8nResult.stageTimings?.pollingWaitMs;
+        timings.pollCount = n8nResult.stageTimings?.pollCount;
+        timings.transcriptFetchMs = n8nResult.stageTimings?.transcriptFetchMs;
+        timings.geminiAnalysisMs = n8nResult.stageTimings?.geminiAnalysisMs;
+        timings.transcriptHash = computeTranscriptSha256(n8nResult.transcript.segments).slice(
+          0,
+          16,
+        );
+
+        // Cache verified real transcript (+ structured analysis) by audio SHA-256 for instant repeat reuse
+        setCachedTranscriptByAudioHash({
+          audioSha256,
+          language,
+          transcriptId: n8nResult.transcript.id,
+          provider: "n8n",
+          detectedLanguage: n8nResult.transcript.language || language,
+          durationSeconds: n8nResult.transcript.durationSeconds || probe.durationSeconds || 10,
+          segments: n8nResult.transcript.segments,
+          speakerBreakdown:
+            n8nResult.analysis.speakerBreakdown.length > 0
+              ? n8nResult.analysis.speakerBreakdown
+              : computeSpeakerBreakdown(n8nResult.transcript.segments),
+          cachedN8nAnalysis:
+            n8nResult.analysis.summary || n8nResult.analysis.quiz.length > 0
+              ? n8nResult.analysis
+              : undefined,
+          cachedHtmlReport: n8nResult.htmlReport,
+        });
+
+        logStageTiming(correlationId, "TRANSCRIPTION_COMPLETE", timings.transcriptionMs, {
+          provider: "n8n",
+          transcriptId: n8nResult.transcript.id,
+          segmentsCount: n8nResult.transcript.segments.length,
+        });
+        logObservabilityEvent("info", "transcription_completed", {
+          correlationId,
+          jobId,
+          resourceId,
+          provider: "n8n",
+          transcriptId: n8nResult.transcript.id,
+          segmentsCount: n8nResult.transcript.segments.length,
+        });
+
+        // If n8n returned BOTH transcript and structured analysis, commit directly (ZERO duplicate Gemini calls!)
+        const n8nHasAnalysis = Boolean(
+          n8nResult.analysis.summary ||
+          n8nResult.analysis.quiz.length > 0 ||
+          n8nResult.analysis.flashcards.length > 0,
+        );
+        if (n8nHasAnalysis) {
+          timings.analysisProvider = "n8n";
+          const dbSaveStart = Date.now();
+          await persistN8nWorkflowResult({
+            n8nResult,
+            jobId,
+            correlationId,
+            resourceType,
+            resourceId,
+            title: resourceTitlePre,
+            courseCode: courseCodePre,
+            userId: jobOwnerId,
+            appLanguage: jobRecordPre?.appLanguage,
+          });
+          timings.databaseSaveMs = Date.now() - dbSaveStart;
+          logStageTiming(correlationId, "DATABASE_SAVE", timings.databaseSaveMs);
+        } else {
+          // n8n returned transcript only — run MeetMind's unified post-transcription analysis once
+          await runUnifiedPostTranscriptionPipeline({
+            resourceType,
+            resourceId,
+            title: resourceTitlePre,
+            courseCode: courseCodePre,
+            language: n8nResult.transcript.language || language,
+            appLanguage: jobRecordPre?.appLanguage,
+            durationSeconds: n8nResult.transcript.durationSeconds || probe.durationSeconds || 10,
+            segments: n8nResult.transcript.segments,
+            userId: jobOwnerId,
+            jobId,
+            correlationId,
+            transcriptId: n8nResult.transcript.id,
+            transcriptionProvider: "n8n",
+            speakerBreakdown: n8nResult.analysis.speakerBreakdown,
+            timings,
+            audioSha256,
+            checkCancelled: () => assertNotCancelled(jobId),
+          });
+        }
+
+        timings.firstResultMs =
+          timings.firstResultMs || (timings.uploadMs || 0) + (Date.now() - jobStartedAt);
+        timings.totalMs = (timings.uploadMs || 0) + (Date.now() - jobStartedAt);
+        logStageTiming(correlationId, "RESULT_READY", timings.totalMs, { provider: "n8n" });
+
+        // Persist final timings onto the recording record & job record
+        if (resourceType === "meeting") {
+          db.update("meetings", (list) =>
+            list.map((m) => (m.id === resourceId ? { ...m, timings } : m)),
+          );
+        } else {
+          db.update("lectures", (list) =>
+            list.map((l) => (l.id === resourceId ? { ...l, timings } : l)),
+          );
+        }
+
+        updateJob(jobId, {
+          status: "Completed",
+          stage: "Completed",
+          progressPercent: 100,
+          retryable: false,
+          errorMessage: undefined,
+          transcriptId: n8nResult.transcript.id,
+          transcriptionProvider: "n8n",
+          analysisProvider: timings.analysisProvider || "n8n",
+          timings,
+          milestones: {
+            uploadComplete: true,
+            transcriptionStarted: true,
+            transcriptionCompleted: true,
+            summaryReady: Boolean(n8nResult.analysis.summary),
+            keywordsReady: true,
+            tasksReady: n8nResult.analysis.actionItems.length > 0,
+            quizReady: n8nResult.analysis.quiz.length > 0,
+            flashcardsReady: n8nResult.analysis.flashcards.length > 0,
+            completed: true,
+          },
+          progressiveSummary: n8nResult.analysis.summary || undefined,
+          progressiveKeywords: n8nResult.analysis.keywords.slice(0, 12),
+          progressiveKeywordsCount: n8nResult.analysis.keywords.length,
+          progressiveTasks: n8nResult.analysis.actionItems.slice(0, 8).map((a) => ({
+            title: a.title,
+            ownerName: a.ownerName,
+            dueDate: a.dueDate,
+          })),
+          progressiveTasksCount: n8nResult.analysis.actionItems.length,
+          progressiveQuizCount: n8nResult.analysis.quiz.length,
+          progressiveFlashcardsCount: n8nResult.analysis.flashcards.length,
+        });
+        notifySync({
+          type: "ProcessingCompleted",
+          userId: jobOwnerId,
+          id: resourceId,
+          resourceId,
+          resourceType,
+          jobId,
+          progress: 100,
+        });
+        return;
+      } catch (n8nErr) {
+        if (!n8nConfig.fallbackToDirect) {
+          throw n8nErr;
+        }
+        logPipelineEvent("warn", "n8n_fallback_to_direct_pipeline", {
+          correlationId,
+          jobId,
+          resourceId,
+          reason: n8nErr instanceof Error ? n8nErr.message : String(n8nErr),
+        });
+      }
+    }
+
     // 2. Audio preparation:
-    // When running built-in local Whisper directly (no active Cloud Gemini or external Python service),
-    // skip writing an intermediate WAV to disk so Whisper decodes & conditions the source file in ONE
-    // single FFmpeg pass directly into memory (eliminating double FFmpeg decode + disk I/O + extra ffprobe).
+    // Direct AssemblyAI and Built-in Whisper both accept original M4A/MP3/WAV/OGG/WEBM directly!
+    // Skip writing a 27MB normalized disk WAV unless external Python AI_SERVICE_URL or explicit Gemini ASR is enabled.
     updateJob(jobId, { status: "ExtractingAudio", stage: "AudioExtraction", progressPercent: 22 });
     notifySync({ type: "AudioExtractionStarted", id: jobId, resourceId, progress: 22 });
 
     const sourceAudioPath =
       probe.repairedPath && fs.existsSync(probe.repairedPath) ? probe.repairedPath : filePath;
-    const needsNormalizedDiskWav = Boolean(AI_SERVICE_URL || getGeminiClient());
+    // STRICT SEPARATION OF ASR AND LLM:
+    // NEVER silently fall back to a generic Gemini text/multimodal LLM as a speech-recognition engine.
+    // Primary transcription MUST come from a dedicated ASR engine (AssemblyAI or dedicated Whisper ASR).
+    const shouldTryGeminiAsr = false;
+    const needsNormalizedDiskWav = Boolean(AI_SERVICE_URL);
     let durationSeconds = probe.durationSeconds || 10;
 
     if (needsNormalizedDiskWav) {
@@ -1155,27 +1958,295 @@ export async function processRecordingJob(
 
     assertNotCancelled(jobId);
 
-    // 3. Real Speech-to-Text Pipeline (Python FastAPI -> Cloud Gemini if healthy -> Built-in Local Whisper ONNX)
-    updateJob(jobId, { status: "Transcribing", stage: "Transcribing", progressPercent: 35 });
-    notifySync({ type: "TranscriptionStarted", id: jobId, resourceId, progress: 35 });
+    // 3. Real Speech-to-Text Pipeline (Direct AssemblyAI -> Python FastAPI -> Optional Gemini ASR -> Parallel Multi-Worker Whisper ONNX)
+    const directTranscriptionStart = Date.now();
+    const usingAssemblyAi = isAssemblyAiConfigured();
+    timings.pipelineMode = usingAssemblyAi ? "direct" : "local";
+    markStageLedger(
+      stageLedger,
+      correlationId,
+      jobId,
+      resourceId,
+      "TRANSCRIPTION_STARTED",
+      "completed",
+      {
+        durationMs: Date.now() - jobStartedAt,
+        detail: usingAssemblyAi ? "AssemblyAI" : "Local Whisper ONNX",
+      },
+    );
+    markStageLedger(
+      stageLedger,
+      correlationId,
+      jobId,
+      resourceId,
+      "TRANSCRIPTION_PROCESSING",
+      "running",
+      {
+        detail: usingAssemblyAi ? "AssemblyAI speech-to-text" : "Local Whisper ONNX",
+      },
+    );
+    updateJob(jobId, {
+      status: "Transcribing",
+      stage: "Transcribing",
+      stageProgress: 0,
+      progressPercent: 35,
+      fileSizeBytes,
+      audioDurationSeconds: probe.durationSeconds,
+      currentOperation: usingAssemblyAi
+        ? "Sending audio to AssemblyAI transcription engine..."
+        : "Transcribing speech with local Whisper engine...",
+      currentOperationAr: usingAssemblyAi
+        ? "جاري إرسال الملف الصوتي لبدء التفريغ عبر AssemblyAI..."
+        : "جاري تفريغ الكلام عبر محرك Whisper المحلي...",
+      transcriptionProvider: usingAssemblyAi ? "assemblyai" : "whisper-local",
+      stageLedger,
+      milestones: { uploadComplete: true, audioValidated: true, transcriptionStarted: true },
+    });
+    logStageTiming(correlationId, "TRANSCRIPTION_START", Date.now() - jobStartedAt, {
+      provider: usingAssemblyAi ? "assemblyai" : "whisper-local",
+    });
+    logObservabilityEvent("info", "transcription_started", {
+      correlationId,
+      jobId,
+      resourceId,
+      provider: usingAssemblyAi ? "assemblyai" : "whisper-local",
+    });
+    notifySync({
+      type: "TranscriptionStarted",
+      userId: jobOwnerId,
+      id: jobId,
+      resourceId,
+      resourceType,
+      jobId,
+      progress: 35,
+    });
 
     let segments: TranscriptSegment[] = [];
+    let rawSegments: TranscriptSegment[] = [];
+    let rawTranscriptText = "";
+    let processedTranscriptText = "";
+    let resolvedTranscriptId: string | undefined;
+    let resolvedTranscriptionProvider: "n8n" | "assemblyai" | "gemini" | "whisper-local" =
+      "whisper-local";
+    let resolvedAsrModel: string | undefined;
+    let resolvedLanguageConfig: string | undefined;
+    let resolvedDetectedLanguage = language;
+    let resolvedDiarizationEnabled = false;
+    let resolvedAverageConfidence: number | undefined;
+    let resolvedSpeakerBreakdown: AssemblyAiSpeakerStat[] | undefined;
     const isMeeting = resourceType === "meeting";
     const hasNormalizedWav = needsNormalizedDiskWav && fs.existsSync(normalizedAudioPath);
     const activeAudioFile = hasNormalizedWav ? normalizedAudioPath : sourceAudioPath;
     const activeStat = fs.statSync(activeAudioFile);
 
+    // 3a0. Real Direct AssemblyAI Dedicated ASR (progressive silence-aligned parallel slices + adaptive 2s-10s poll)
+    let assemblyAiErrorMsg: string | undefined;
+    if (usingAssemblyAi) {
+      markStageLedger(
+        stageLedger,
+        correlationId,
+        jobId,
+        resourceId,
+        "ASSEMBLYAI_UPLOAD",
+        "running",
+      );
+      try {
+        const aaiRes = await transcribeAudioWithAssemblyAi({
+          filePath: sourceAudioPath,
+          resourceType,
+          language,
+          durationSecondsHint: probe.durationSeconds,
+          jobId,
+          correlationId,
+          onProgress: (pct, stageLabel) => {
+            updateJob(jobId, {
+              status: "Transcribing",
+              stage: stageLabel,
+              progressPercent: pct,
+              currentOperation: stageLabel,
+              transcriptStatus: "live",
+              stageLedger,
+            });
+          },
+          onPartialTranscript: (partial) => {
+            if (partial.uploadMsSoFar > 0) {
+              timings.assemblyAiUploadMs = partial.uploadMsSoFar;
+              markStageLedger(
+                stageLedger,
+                correlationId,
+                jobId,
+                resourceId,
+                "ASSEMBLYAI_UPLOAD",
+                "completed",
+                { durationMs: partial.uploadMsSoFar },
+              );
+            }
+            markStageLedger(
+              stageLedger,
+              correlationId,
+              jobId,
+              resourceId,
+              "TRANSCRIPTION_PROCESSING",
+              "running",
+              {
+                detail: `${partial.stageProgress}% (${partial.wordsReceived} words, ${partial.segments.length} segments)`,
+              },
+            );
+
+            const partialFullText = partial.segments
+              .map((s) => `${s.speaker}: ${s.text}`)
+              .join("\n");
+            const nowTs = new Date().toISOString();
+            if (partial.segments.length > 0) {
+              if (resourceType === "meeting") {
+                db.update("meetings", (meetings) =>
+                  meetings.map((m) =>
+                    m.id === resourceId
+                      ? {
+                          ...m,
+                          transcriptionStatus: "Processing",
+                          transcriptStatus: "live",
+                          transcriptionProvider: "assemblyai",
+                          asrModel: partial.speechModel || m.asrModel,
+                          language: partial.detectedLanguage || m.language,
+                          rawTranscript: partial.rawTranscript,
+                          rawSegments: partial.rawSegments,
+                          segments: partial.segments.map((s) => ({
+                            ...s,
+                            isPartial: partial.stageProgress < 100,
+                          })),
+                          fullText: partialFullText,
+                          updatedAt: nowTs,
+                        }
+                      : m,
+                  ),
+                );
+              } else {
+                db.update("lectures", (lectures) =>
+                  lectures.map((l) =>
+                    l.id === resourceId
+                      ? {
+                          ...l,
+                          transcriptionStatus: "Processing",
+                          transcriptStatus: "live",
+                          transcriptionProvider: "assemblyai",
+                          asrModel: partial.speechModel || l.asrModel,
+                          language: partial.detectedLanguage || l.language,
+                          rawTranscript: partial.rawTranscript,
+                          rawSegments: partial.rawSegments,
+                          segments: partial.segments.map((s) => ({
+                            ...s,
+                            isPartial: partial.stageProgress < 100,
+                          })),
+                          fullText: partialFullText,
+                          updatedAt: nowTs,
+                        }
+                      : l,
+                  ),
+                );
+              }
+            }
+
+            const mappedJobPct = Math.min(70, 38 + Math.round((partial.stageProgress / 100) * 32));
+            const langBadge =
+              partial.detectedLanguage === "ar"
+                ? "Arabic"
+                : partial.detectedLanguage === "en"
+                  ? "English"
+                  : "speech";
+            updateJob(jobId, {
+              status: "Transcribing",
+              stage: "Transcribing",
+              stageProgress: partial.stageProgress,
+              progressPercent: mappedJobPct,
+              segmentsReceived: partial.segments.length,
+              wordsReceived: partial.wordsReceived,
+              detectedLanguage: partial.detectedLanguage,
+              asrModel: partial.speechModel,
+              currentOperation: `Transcribing ${langBadge} (${partial.stageProgress}% · ${partial.wordsReceived.toLocaleString()} words received)`,
+              currentOperationAr: `جاري تفريغ الكلام (${partial.stageProgress}% · تم استلام ${partial.wordsReceived.toLocaleString()} كلمة)`,
+              transcriptStatus: "live",
+              timings,
+              stageLedger,
+              milestones: {
+                uploadComplete: true,
+                audioValidated: true,
+                transcriptionStarted: true,
+                languageDetected: Boolean(partial.detectedLanguage),
+              },
+            });
+            notifySync({
+              type: "TranscriptSegmentAvailable",
+              userId: jobOwnerId,
+              id: resourceId,
+              resourceId,
+              resourceType,
+              jobId,
+              count: partial.segments.length,
+              progress: mappedJobPct,
+            });
+          },
+        });
+        if (aaiRes.segments.length > 0) {
+          segments = aaiRes.segments;
+          rawSegments = aaiRes.rawSegments;
+          rawTranscriptText = aaiRes.rawTranscript;
+          processedTranscriptText = aaiRes.processedTranscript;
+          resolvedTranscriptId = aaiRes.transcriptId;
+          resolvedTranscriptionProvider = "assemblyai";
+          resolvedAsrModel = aaiRes.speechModel;
+          resolvedLanguageConfig = aaiRes.languageConfig;
+          resolvedDetectedLanguage = aaiRes.detectedLanguage || language;
+          resolvedDiarizationEnabled = aaiRes.speakerLabelsEnabled;
+          resolvedAverageConfidence = aaiRes.averageConfidence;
+          resolvedSpeakerBreakdown = aaiRes.speakerBreakdown;
+          timings.assemblyAiUploadMs = aaiRes.uploadMs;
+          timings.transcriptionMs = aaiRes.transcriptionMs;
+          timings.pollingWaitMs = aaiRes.pollingWaitMs;
+          timings.pollCount = aaiRes.pollCount;
+          timings.transcriptFetchMs = aaiRes.transcriptFetchMs;
+          timings.webhookTriggered = aaiRes.webhookTriggered;
+          timings.transcriptionProvider = "assemblyai";
+          markStageLedger(
+            stageLedger,
+            correlationId,
+            jobId,
+            resourceId,
+            "ASSEMBLYAI_UPLOAD",
+            "completed",
+            { durationMs: aaiRes.uploadMs },
+          );
+          if (aaiRes.durationSeconds > 0) durationSeconds = aaiRes.durationSeconds;
+        }
+      } catch (aaiErr) {
+        assemblyAiErrorMsg = aaiErr instanceof Error ? aaiErr.message : String(aaiErr);
+        markStageLedger(
+          stageLedger,
+          correlationId,
+          jobId,
+          resourceId,
+          "TRANSCRIPTION_PROCESSING",
+          "failed",
+          { error: assemblyAiErrorMsg },
+        );
+        // When AssemblyAI is configured, do NOT silently degrade Arabic accuracy into local fallback
+        // unless the operator explicitly opted into ASSEMBLYAI_ALLOW_LOCAL_FALLBACK=true.
+        if (process.env.ASSEMBLYAI_ALLOW_LOCAL_FALLBACK !== "true") {
+          throw aaiErr;
+        }
+      }
+    }
+
     // 3a. Microservice HTTP contract if configured
-    if (AI_SERVICE_URL) {
+    if (segments.length === 0 && AI_SERVICE_URL) {
       segments = await transcribeWithPythonAiService(activeAudioFile, resourceType, language);
     }
 
     let geminiErrorMsg: string | undefined;
     let geminiObservedSilence = false;
-    const jobOwnerId = db.get("jobs").find((j) => j.id === jobId)?.userId || "usr_admin";
 
-    // 3b. Gemini Multimodal ASR (ONLY if cloud Gemini is configured and not suspended/402; zero wasted delay otherwise)
-    if (segments.length === 0 && Boolean(getGeminiClient())) {
+    // 3b. Optional Gemini Multimodal ASR (only when explicitly enabled via ENABLE_GEMINI_ASR=true)
+    if (segments.length === 0 && shouldTryGeminiAsr && Boolean(getGeminiClient())) {
       if ((activeStat.size > 3.5 * 1024 * 1024 || durationSeconds > 150) && hasNormalizedWav) {
         const chunks = await splitAudioIntoChunks(normalizedAudioPath, jobChunkDir, 120);
         const chunkResults: Array<TranscriptSegment[]> = new Array(chunks.length);
@@ -1291,7 +2362,8 @@ export async function processRecordingJob(
                     ? {
                         ...m,
                         transcriptionStatus: "Processing",
-                        segments: partialSegments,
+                        transcriptStatus: "live",
+                        segments: partialSegments.map((s) => ({ ...s, isPartial: true })),
                         fullText: partialFullText,
                         updatedAt: nowTs,
                       }
@@ -1305,7 +2377,8 @@ export async function processRecordingJob(
                     ? {
                         ...l,
                         transcriptionStatus: "Processing",
-                        segments: partialSegments,
+                        transcriptStatus: "live",
+                        segments: partialSegments.map((s) => ({ ...s, isPartial: true })),
                         fullText: partialFullText,
                         updatedAt: nowTs,
                       }
@@ -1318,6 +2391,7 @@ export async function processRecordingJob(
           updateJob(jobId, {
             status: "Transcribing",
             stage: "Transcribing",
+            transcriptStatus: "live",
             progressPercent: mappedPct,
           });
           notifySync({
@@ -1333,7 +2407,20 @@ export async function processRecordingJob(
         },
       });
       if (localWhisper.segments.length > 0) {
-        segments = localWhisper.segments;
+        const artifacts = buildTranscriptArtifacts({
+          rawFullText: localWhisper.rawTranscript || localWhisper.fullText,
+          rawSegments: localWhisper.segments,
+        });
+        segments = artifacts.processedSegments;
+        rawSegments = artifacts.rawSegments;
+        rawTranscriptText = artifacts.rawTranscript;
+        processedTranscriptText = artifacts.processedTranscript;
+        resolvedAsrModel = localWhisper.model;
+        resolvedLanguageConfig =
+          language && language !== "auto" ? `${language} (explicit)` : "auto (whisper-lang-id)";
+        resolvedDetectedLanguage = localWhisper.detectedLanguage || language;
+        resolvedDiarizationEnabled = false;
+        resolvedAverageConfidence = artifacts.averageConfidence;
         if (localWhisper.durationSeconds > 0) {
           durationSeconds = localWhisper.durationSeconds;
         }
@@ -1412,6 +2499,7 @@ export async function processRecordingJob(
       });
       const detail =
         localWhisperError ||
+        assemblyAiErrorMsg ||
         geminiErrorMsg ||
         "All speech-to-text engines failed to extract speech from this audio file.";
       throw new Error(`Real speech-to-text transcription failed: ${detail}`);
@@ -1420,7 +2508,129 @@ export async function processRecordingJob(
     assertNotCancelled(jobId);
 
     // 4. Merging & Completion of Transcription Stage
-    updateJob(jobId, { status: "Merging", stage: "MergingTranscript", progressPercent: 72 });
+    if (typeof timings.transcriptionMs !== "number") {
+      timings.transcriptionMs = Date.now() - directTranscriptionStart;
+    }
+    const finalArtifacts =
+      rawTranscriptText && rawSegments.length > 0
+        ? {
+            rawTranscript: rawTranscriptText,
+            processedTranscript:
+              processedTranscriptText || segments.map((s) => `${s.speaker}: ${s.text}`).join("\n"),
+            rawSegments,
+            processedSegments: segments,
+            averageConfidence: resolvedAverageConfidence,
+          }
+        : buildTranscriptArtifacts({ rawSegments: segments });
+    segments = finalArtifacts.processedSegments;
+    rawSegments = finalArtifacts.rawSegments;
+    rawTranscriptText = finalArtifacts.rawTranscript;
+    processedTranscriptText = finalArtifacts.processedTranscript;
+    resolvedAverageConfidence = resolvedAverageConfidence ?? finalArtifacts.averageConfidence;
+
+    const finalSpeakerBreakdown = resolvedSpeakerBreakdown || computeSpeakerBreakdown(segments);
+    timings.transcriptionProvider = resolvedTranscriptionProvider;
+    timings.transcriptHash = computeTranscriptSha256(segments).slice(0, 16);
+    timings.firstResultMs = (timings.uploadMs || 0) + (Date.now() - jobStartedAt);
+    setCachedTranscriptByAudioHash({
+      audioSha256,
+      language,
+      transcriptId: resolvedTranscriptId,
+      provider: resolvedTranscriptionProvider,
+      asrModel: resolvedAsrModel,
+      languageConfig: resolvedLanguageConfig,
+      diarizationEnabled: resolvedDiarizationEnabled,
+      averageConfidence: resolvedAverageConfidence,
+      detectedLanguage: resolvedDetectedLanguage || language,
+      durationSeconds,
+      rawTranscript: rawTranscriptText,
+      processedTranscript: processedTranscriptText,
+      rawSegments,
+      segments,
+      speakerBreakdown: finalSpeakerBreakdown,
+    });
+    const totalWordsExtracted = processedTranscriptText.trim().split(/\s+/).filter(Boolean).length;
+    markStageLedger(
+      stageLedger,
+      correlationId,
+      jobId,
+      resourceId,
+      "TRANSCRIPTION_PROCESSING",
+      "completed",
+      {
+        durationMs: timings.transcriptionMs,
+        detail: `${segments.length} segments, ${totalWordsExtracted} words`,
+      },
+    );
+    markStageLedger(
+      stageLedger,
+      correlationId,
+      jobId,
+      resourceId,
+      "TRANSCRIPTION_COMPLETED",
+      "completed",
+      {
+        durationMs: timings.transcriptionMs,
+        detail: resolvedTranscriptionProvider,
+      },
+    );
+    markStageLedger(
+      stageLedger,
+      correlationId,
+      jobId,
+      resourceId,
+      "TRANSCRIPT_RECEIVED",
+      "completed",
+      {
+        durationMs: timings.transcriptFetchMs ?? 0,
+        detail: `${segments.length} segments (${totalWordsExtracted} words)`,
+      },
+    );
+    logStageTiming(correlationId, "TRANSCRIPTION_COMPLETE", timings.transcriptionMs, {
+      provider: resolvedTranscriptionProvider,
+      asrModel: resolvedAsrModel,
+      languageConfig: resolvedLanguageConfig,
+      diarizationEnabled: resolvedDiarizationEnabled,
+      averageConfidence: resolvedAverageConfidence,
+      segmentsCount: segments.length,
+    });
+    updateJob(jobId, {
+      status: "Merging",
+      stage: "MergingTranscript",
+      stageProgress: 100,
+      progressPercent: 72,
+      segmentsReceived: segments.length,
+      wordsReceived: totalWordsExtracted,
+      detectedLanguage: resolvedDetectedLanguage,
+      audioDurationSeconds: durationSeconds,
+      currentOperation: "Transcript completed — starting parallel AI analysis...",
+      currentOperationAr: "اكتمل التفريغ الصوتي — بدء التحليل الذكي المتوازي...",
+      transcriptId: resolvedTranscriptId,
+      transcriptionProvider: resolvedTranscriptionProvider,
+      transcriptStatus: "final_verified",
+      asrModel: resolvedAsrModel,
+      languageConfig: resolvedLanguageConfig,
+      diarizationEnabled: resolvedDiarizationEnabled,
+      averageConfidence: resolvedAverageConfidence,
+      timings,
+      stageLedger,
+      milestones: {
+        uploadComplete: true,
+        audioValidated: true,
+        transcriptionStarted: true,
+        languageDetected: true,
+        transcriptionCompleted: true,
+        transcriptSaved: true,
+      },
+    });
+    logObservabilityEvent("info", "transcription_completed", {
+      correlationId,
+      jobId,
+      resourceId,
+      provider: resolvedTranscriptionProvider,
+      transcriptId: resolvedTranscriptId,
+      segmentsCount: segments.length,
+    });
     notifySync({
       type: "TranscriptionCompleted",
       userId: jobOwnerId,
@@ -1433,14 +2643,8 @@ export async function processRecordingJob(
     });
 
     // 5-8. Run the Unified Post-Transcription Intelligence Pipeline (shared identically by Upload & Live Recording)
-    const resourceTitle =
-      resourceType === "meeting"
-        ? db.get("meetings").find((m) => m.id === resourceId)?.title || originalFilename
-        : db.get("lectures").find((l) => l.id === resourceId)?.title || originalFilename;
-    const courseCode =
-      resourceType === "lecture"
-        ? db.get("lectures").find((l) => l.id === resourceId)?.courseCode
-        : undefined;
+    const resourceTitle = resourceTitlePre;
+    const courseCode = courseCodePre;
 
     const jobRecord = db.get("jobs").find((j) => j.id === jobId);
     const pipelineResult = await runUnifiedPostTranscriptionPipeline({
@@ -1448,14 +2652,48 @@ export async function processRecordingJob(
       resourceId,
       title: resourceTitle,
       courseCode,
-      language,
+      language: resolvedDetectedLanguage || language,
       appLanguage: jobRecord?.appLanguage,
       durationSeconds,
       segments,
+      rawSegments,
+      rawTranscript: rawTranscriptText,
+      processedTranscript: processedTranscriptText,
+      asrModel: resolvedAsrModel,
+      languageConfig: resolvedLanguageConfig,
+      diarizationEnabled: resolvedDiarizationEnabled,
+      averageConfidence: resolvedAverageConfidence,
       userId: jobOwnerId,
       jobId,
+      correlationId,
+      transcriptId: resolvedTranscriptId,
+      transcriptionProvider: resolvedTranscriptionProvider,
+      speakerBreakdown: finalSpeakerBreakdown,
+      timings,
+      stageLedger,
+      audioSha256,
       checkCancelled: () => assertNotCancelled(jobId),
     });
+
+    timings.totalMs = (timings.uploadMs || 0) + (Date.now() - jobStartedAt);
+    markStageLedger(stageLedger, correlationId, jobId, resourceId, "JOB_COMPLETED", "completed", {
+      durationMs: timings.totalMs,
+    });
+    logStageTiming(correlationId, "RESULT_READY", timings.totalMs, {
+      provider: resolvedTranscriptionProvider,
+      pipelineMode: timings.pipelineMode,
+      firstResultMs: timings.firstResultMs,
+    });
+
+    if (resourceType === "meeting") {
+      db.update("meetings", (list) =>
+        list.map((m) => (m.id === resourceId ? { ...m, timings } : m)),
+      );
+    } else {
+      db.update("lectures", (list) =>
+        list.map((l) => (l.id === resourceId ? { ...l, timings } : l)),
+      );
+    }
 
     const jobStage =
       pipelineResult.analysisStatus === "Completed"
@@ -1467,9 +2705,43 @@ export async function processRecordingJob(
     updateJob(jobId, {
       status: "Completed",
       stage: jobStage,
+      stageProgress: 100,
       progressPercent: 100,
+      currentOperation: "Processing completed — all outputs ready",
+      currentOperationAr: "اكتملت المعالجة بنجاح — جميع المخرجات جاهزة",
+      transcriptId: resolvedTranscriptId,
+      transcriptionProvider: resolvedTranscriptionProvider,
+      analysisProvider: timings.analysisProvider,
+      timings,
+      stageLedger,
       errorMessage: pipelineResult.analysisError,
     });
+
+    // Optional non-blocking post-completion n8n webhook notification (zero impact on user latency)
+    const postWebhookUrl = (process.env.N8N_POST_COMPLETE_WEBHOOK_URL || "").trim();
+    if (postWebhookUrl && /^https?:\/\//i.test(postWebhookUrl)) {
+      void fetch(postWebhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Correlation-ID": correlationId,
+        },
+        body: JSON.stringify({
+          event: "meetmind.recording.completed",
+          correlationId,
+          jobId,
+          resourceId,
+          resourceType,
+          title: resourceTitle,
+          transcriptId: resolvedTranscriptId,
+          durationSeconds,
+          segmentsCount: segments.length,
+          summary: pipelineResult.executiveSummary || pipelineResult.summary,
+          timings,
+        }),
+        signal: AbortSignal.timeout(10000),
+      }).catch(() => {});
+    }
     logPipelineEvent("info", "job_completed", {
       jobId,
       resourceId,
@@ -1550,6 +2822,7 @@ export async function processRecordingJob(
     updateJob(jobId, {
       status: "Failed",
       stage: "Failed",
+      retryable: category !== "MediaValidationError" && category !== "CancelledByUser",
       failureCategory: category,
       failureTimestamp: new Date().toISOString(),
       errorMessage: errMessage,
@@ -1698,9 +2971,13 @@ export function recoverInterruptedJobs() {
   const interrupted = jobs.filter(
     (j) => j.status !== "Completed" && j.status !== "Failed" && j.status !== "Cancelled",
   );
+  const nowMs = Date.now();
+  const MAX_AUTO_RESUME_AGE_MS = 5 * 60 * 1000;
 
   for (const job of interrupted) {
-    if (job.filePath && fs.existsSync(job.filePath)) {
+    const lastTouchMs = Date.parse(job.updatedAt || job.createdAt || "") || 0;
+    const isFresh = lastTouchMs > 0 && nowMs - lastTouchMs <= MAX_AUTO_RESUME_AGE_MS;
+    if (isFresh && job.filePath && fs.existsSync(job.filePath)) {
       setTimeout(() => {
         void processRecordingJob(
           job.id,
@@ -1712,12 +2989,16 @@ export function recoverInterruptedJobs() {
         );
       }, 250);
     } else {
+      const hasFile = Boolean(job.filePath && fs.existsSync(job.filePath));
       updateJob(job.id, {
         status: "Failed",
         stage: "Failed",
-        failureCategory: "StorageError",
+        retryable: hasFile,
+        failureCategory: hasFile ? "InterruptedOnRestart" : "StorageError",
         failureTimestamp: new Date().toISOString(),
-        errorMessage: "Interrupted job could not resume because source media file is missing.",
+        errorMessage: hasFile
+          ? "Processing was interrupted when the server restarted. Click Retry to process cleanly."
+          : "Interrupted job could not resume because source media file is missing.",
       });
     }
   }
@@ -1868,8 +3149,23 @@ export interface UnifiedPipelineParams {
   appLanguage?: "en" | "ar";
   durationSeconds: number;
   segments: TranscriptSegment[];
+  rawSegments?: TranscriptSegment[];
+  rawTranscript?: string;
+  processedTranscript?: string;
+  asrModel?: string;
+  languageConfig?: string;
+  diarizationEnabled?: boolean;
+  averageConfidence?: number;
   userId: string;
   jobId?: string;
+  correlationId?: string;
+  transcriptId?: string;
+  transcriptionProvider?: "n8n" | "assemblyai" | "gemini" | "whisper-local" | "live";
+  speakerBreakdown?: AssemblyAiSpeakerStat[];
+  timings?: StageTimings;
+  stageLedger?: Record<string, StageTelemetryEntry>;
+  audioSha256?: string;
+  precomputedUnifiedAnalysis?: UnifiedRecordingAnalysisResult;
   recordingPath?: string;
   recordingFileName?: string;
   audioUrl?: string;
@@ -1911,22 +3207,132 @@ export async function runUnifiedPostTranscriptionPipeline(
     appLanguage,
     durationSeconds,
     segments,
+    rawSegments: incomingRawSegments,
+    rawTranscript: incomingRawTranscript,
+    processedTranscript: incomingProcessedTranscript,
+    asrModel,
+    languageConfig,
+    diarizationEnabled,
+    averageConfidence: incomingAverageConfidence,
     userId,
     jobId,
+    correlationId: rawCorrelationId,
+    transcriptId,
+    transcriptionProvider,
+    speakerBreakdown: rawSpeakerBreakdown,
+    timings: sharedTimings,
+    stageLedger: incomingStageLedger,
+    audioSha256,
+    precomputedUnifiedAnalysis,
     recordingPath,
     recordingFileName,
     audioUrl,
     checkCancelled,
   } = params;
 
-  const fullText = segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
+  const correlationId = rawCorrelationId || createCorrelationId("pipe");
+  const analysisStartedAt = Date.now();
+  const stageLedger: Record<string, StageTelemetryEntry> = incomingStageLedger || {};
+  const speakerBreakdown = rawSpeakerBreakdown || computeSpeakerBreakdown(segments);
+  const artifacts = buildTranscriptArtifacts({
+    rawFullText: incomingRawTranscript,
+    rawSegments: incomingRawSegments || segments,
+  });
+  const rawTranscript = incomingRawTranscript || artifacts.rawTranscript;
+  const processedTranscript =
+    incomingProcessedTranscript || segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
+  const finalTranscript = processedTranscript;
+  const rawSegments = incomingRawSegments || artifacts.rawSegments;
+  const averageConfidence = incomingAverageConfidence ?? artifacts.averageConfidence;
+  const fullText = processedTranscript;
   const runId = jobId || `live_${resourceId}_${Date.now()}`;
+  const liveMilestones: NonNullable<JobRecord["milestones"]> = {
+    uploadComplete: true,
+    audioValidated: true,
+    transcriptionStarted: true,
+    languageDetected: true,
+    transcriptionCompleted: true,
+    transcriptSaved: true,
+    analysisStarted: true,
+  };
+  const pushJobProgress = (patch: Partial<JobRecord>) => {
+    if (!jobId) return;
+    updateJob(jobId, {
+      ...patch,
+      stageLedger,
+      milestones: { ...liveMilestones, ...(patch.milestones || {}) },
+      ...(sharedTimings ? { timings: sharedTimings } : {}),
+    });
+  };
 
-  if (jobId) {
-    updateJob(jobId, { status: "Analyzing", stage: "AIAnalysis", progressPercent: 80 });
-  }
+  markStageLedger(
+    stageLedger,
+    correlationId,
+    jobId,
+    resourceId,
+    "AI_ANALYSIS_STARTED",
+    "completed",
+    {
+      durationMs: 0,
+      detail: `${segments.length} segments`,
+    },
+  );
+  logStageTiming(correlationId, "GEMINI_START");
+  pushJobProgress({
+    status: "Analyzing",
+    stage: "AIAnalysis",
+    stageProgress: 10,
+    progressPercent: 76,
+    currentOperation: "Generating keywords, summary, action items, quiz & flashcards...",
+    currentOperationAr: "جاري توليد الكلمات المفتاحية والملخص والمهام والاختبار والبطاقات...",
+  });
+  logObservabilityEvent("info", "ai_analysis_started", {
+    correlationId,
+    jobId,
+    resourceId,
+    resourceType,
+    segmentsCount: segments.length,
+  });
   notifySync({
     type: "AIAnalysisStarted",
+    userId,
+    id: resourceId,
+    resourceId,
+    resourceType,
+    jobId,
+    progress: 76,
+  });
+
+  // 1. Transcript-derived Keywords & Cue Highlights (instant <5ms, streamed immediately!)
+  const keywordsStartAt = Date.now();
+  const keywords = extractKeywordsWithFrequency(segments, 12);
+  const cueHighlights = extractHighlightsFromSegments(segments);
+  const keywordsMs = Math.max(1, Date.now() - keywordsStartAt);
+  if (sharedTimings) sharedTimings.keywordsMs = keywordsMs;
+  markStageLedger(
+    stageLedger,
+    correlationId,
+    jobId,
+    resourceId,
+    "KEYWORDS_COMPLETED",
+    "completed",
+    {
+      durationMs: keywordsMs,
+      detail: `${keywords.length} keywords`,
+    },
+  );
+  liveMilestones.keywordsReady = true;
+  pushJobProgress({
+    progressPercent: 80,
+    stageProgress: 22,
+    currentOperation: "Keywords extracted — generating summary, tasks, quiz & flashcards...",
+    currentOperationAr:
+      "تم استخراج الكلمات المفتاحية — جاري توليد الملخص والمهام والاختبار والبطاقات...",
+    progressiveKeywords: keywords.slice(0, 12).map((k) => k.term),
+    progressiveKeywordsCount: keywords.length,
+  });
+  notifySync({
+    type: "KeywordsReady",
     userId,
     id: resourceId,
     resourceId,
@@ -1935,22 +3341,8 @@ export async function runUnifiedPostTranscriptionPipeline(
     progress: 80,
   });
 
-  // 1. Transcript-derived Keywords & Cue Highlights (always computed & preserved directly from verbatim speech)
-  const keywords = extractKeywordsWithFrequency(segments, 12);
-  const cueHighlights = extractHighlightsFromSegments(segments);
-  notifySync({
-    type: "KeywordsReady",
-    userId,
-    id: resourceId,
-    resourceId,
-    resourceType,
-    jobId,
-    progress: 83,
-  });
-
-  // STEP 1: IMMEDIATELY save transcript, audio, duration, and keywords to DB!
-  // This guarantees that even if Gemini returns 503 UNAVAILABLE or network drops,
-  // the real audio and verified transcript segments are already committed to DB and disk.
+  // STEP 1: IMMEDIATELY save verified raw + final transcript, audio, duration, and keywords to DB!
+  // Users can immediately read the verified transcript & keywords while Gemini analysis runs.
   const initialNow = new Date().toISOString();
   if (resourceType === "meeting") {
     db.update("meetings", (meetings) =>
@@ -1960,7 +3352,14 @@ export async function runUnifiedPostTranscriptionPipeline(
           ...m,
           status: "Completed",
           transcriptionStatus: "Completed",
+          transcriptStatus: "final_verified",
           analysisStatus: "Processing",
+          transcriptId: transcriptId || m.transcriptId,
+          transcriptionProvider: transcriptionProvider || m.transcriptionProvider,
+          asrModel: asrModel || m.asrModel,
+          languageConfig: languageConfig || m.languageConfig,
+          diarizationEnabled: diarizationEnabled ?? m.diarizationEnabled,
+          averageConfidence: averageConfidence ?? m.averageConfidence,
           language,
           appLanguage:
             appLanguage || (language === "ar" ? "ar" : language === "en" ? "en" : undefined),
@@ -1970,6 +3369,10 @@ export async function runUnifiedPostTranscriptionPipeline(
           audioUrl: audioUrl || m.audioUrl,
           keywords,
           highlights: cueHighlights,
+          rawTranscript,
+          finalTranscript,
+          processedTranscript,
+          rawSegments,
           fullText,
           segments,
           updatedAt: initialNow,
@@ -1984,7 +3387,14 @@ export async function runUnifiedPostTranscriptionPipeline(
           ...l,
           status: "Completed",
           transcriptionStatus: "Completed",
+          transcriptStatus: "final_verified",
           analysisStatus: "Processing",
+          transcriptId: transcriptId || l.transcriptId,
+          transcriptionProvider: transcriptionProvider || l.transcriptionProvider,
+          asrModel: asrModel || l.asrModel,
+          languageConfig: languageConfig || l.languageConfig,
+          diarizationEnabled: diarizationEnabled ?? l.diarizationEnabled,
+          averageConfidence: averageConfidence ?? l.averageConfidence,
           language,
           appLanguage:
             appLanguage || (language === "ar" ? "ar" : language === "en" ? "en" : undefined),
@@ -1994,6 +3404,10 @@ export async function runUnifiedPostTranscriptionPipeline(
           audioUrl: audioUrl || l.audioUrl,
           keywords,
           highlights: cueHighlights,
+          rawTranscript,
+          finalTranscript,
+          processedTranscript,
+          rawSegments,
           fullText,
           segments,
           updatedAt: initialNow,
@@ -2002,142 +3416,474 @@ export async function runUnifiedPostTranscriptionPipeline(
     );
   }
 
-  // STEP 2: Concurrently execute independent AI operations with bounded concurrency + per-task timeouts
-  // Partial failures (e.g. 503 or timeout on one stage) will NEVER discard the other successful results!
-  async function withStageTimeout<T>(
-    task: () => Promise<T>,
-    label: string,
-    timeoutMs = 60000,
-  ): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      return await Promise.race([
-        task(),
-        new Promise<T>((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error(`AI pipeline stage "${label}" timed out after ${timeoutMs}ms.`));
-          }, timeoutMs);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  async function runControlledConcurrency<T extends readonly (() => Promise<unknown>)[]>(
-    tasks: T,
-    maxConcurrency = 3,
-  ): Promise<{ [K in keyof T]: PromiseSettledResult<Awaited<ReturnType<T[K]>>> }> {
-    const results: PromiseSettledResult<unknown>[] = new Array(tasks.length);
-    let nextIndex = 0;
-    async function worker() {
-      while (nextIndex < tasks.length) {
-        const idx = nextIndex++;
-        try {
-          const val = await tasks[idx]();
-          results[idx] = { status: "fulfilled", value: val };
-        } catch (err) {
-          results[idx] = { status: "rejected", reason: err };
-        }
-      }
-    }
-    const workers = Array.from({ length: Math.min(maxConcurrency, tasks.length) }, () => worker());
-    await Promise.all(workers);
-    return results as unknown as {
-      [K in keyof T]: PromiseSettledResult<Awaited<ReturnType<T[K]>>>;
-    };
-  }
-
-  const [summarySettled, deepSettled, quizSettled, cardsSettled, mindMapSettled] =
-    (await runControlledConcurrency(
-      [
-        () =>
-          withStageTimeout(
-            () => generateAiSummary(title, segments, resourceType, courseCode, appLanguage),
-            "summary",
-            60000,
-          ),
-        () =>
-          withStageTimeout(
-            () => generateAiLectureAnalysis(title, segments, resourceType, courseCode, appLanguage),
-            "deep_analysis",
-            45000,
-          ),
-        () =>
-          withStageTimeout(
-            () => generateAiQuiz(title, segments, undefined, courseCode, { appLanguage }),
-            "quiz",
-            55000,
-          ),
-        () =>
-          withStageTimeout(
-            () => generateAiFlashcards(title, segments, undefined, courseCode, appLanguage),
-            "flashcards",
-            45000,
-          ),
-        () =>
-          withStageTimeout(
-            () => generateAiMindMap(title, segments, undefined, courseCode, appLanguage),
-            "mindmap",
-            45000,
-          ),
-      ],
-      3,
-    )) as [
-      PromiseSettledResult<Awaited<ReturnType<typeof generateAiSummary>>>,
-      PromiseSettledResult<Awaited<ReturnType<typeof generateAiLectureAnalysis>>>,
-      PromiseSettledResult<Awaited<ReturnType<typeof generateAiQuiz>>>,
-      PromiseSettledResult<Awaited<ReturnType<typeof generateAiFlashcards>>>,
-      PromiseSettledResult<Awaited<ReturnType<typeof generateAiMindMap>>>,
-    ];
-
-  checkCancelled?.();
-
-  // Evaluate AI Summary result
+  // STEP 2: Controlled Parallel AI Analysis Execution (default: parallel progressive commits!)
+  // Runs Summary+Tasks, DeepAnalysis, Grounded Quiz, and Flashcards concurrently so each artifact
+  // persists and streams to the modal the instant it completes (~2.5-6s total wall-clock!).
   let analysisStatus: "Completed" | "Unavailable" | "Failed" = "Completed";
   let analysisError: string | undefined = undefined;
   let analysisRetryable = false;
   let analyzedAt: string | undefined = undefined;
   let analysis: Awaited<ReturnType<typeof generateAiSummary>> | undefined = undefined;
+  let deepAnalysis: Awaited<ReturnType<typeof generateAiLectureAnalysis>> | undefined = undefined;
+  let generatedQuiz: Awaited<ReturnType<typeof generateAiQuiz>> | undefined = undefined;
+  let generatedCards: Awaited<ReturnType<typeof generateAiFlashcards>> = [];
+  let generatedMindMap: Awaited<ReturnType<typeof generateAiMindMap>> | undefined = undefined;
 
-  if (summarySettled.status === "fulfilled") {
-    analysis = summarySettled.value;
-    analysisStatus = "Completed";
-    analysisRetryable = false;
-    analyzedAt = new Date().toISOString();
-    notifySync({
-      type: "SummaryReady",
-      userId,
-      id: resourceId,
-      resourceId,
-      resourceType,
-      jobId,
-      progress: 88,
-    });
-  } else {
-    const reason = summarySettled.reason;
-    const status = extractHttpStatus(reason);
-    const retryable = isRetryableGeminiError(reason);
-    if (retryable) {
-      analysisStatus = "Unavailable";
-      analysisRetryable = true;
-      analysisError =
-        status === 503
-          ? "التحليل الذكي غير متاح مؤقتاً بسبب الضغط العالي على خوادم الذكاء الاصطناعي (HTTP 503 UNAVAILABLE). النص والتسجيل محفوظان بالكامل ويمكنك إعادة محاولة التحليل دون إعادة التسجيل."
-          : status === 429
-            ? "تم تجاوز حد الطلبات مؤقتاً (HTTP 429). النص والتسجيل محفوظان، يمكنك إعادة المحاولة بعد لحظات."
-            : `التحليل الذكي غير متاح مؤقتاً (${reason instanceof Error ? reason.message : String(reason)}). النص والتسجيل محفوظان، يمكنك إعادة المحاولة.`;
-    } else {
-      analysisStatus = "Failed";
+  const useParallelMode =
+    !precomputedUnifiedAnalysis &&
+    (process.env.AI_ANALYSIS_MODE || "parallel").trim().toLowerCase() !== "unified";
+
+  if (!useParallelMode) {
+    try {
+      const unified =
+        precomputedUnifiedAnalysis ||
+        (await generateUnifiedRecordingAnalysis({
+          title,
+          segments,
+          resourceType,
+          courseCode,
+          appLanguage,
+        }));
+
+      analysis = unified.summary;
+      deepAnalysis = unified.deepAnalysis;
+      generatedQuiz = unified.quiz;
+      generatedCards = unified.flashcards;
+      generatedMindMap = unified.mindMap;
+      analysisStatus = "Completed";
       analysisRetryable = false;
-      analysisError = reason instanceof Error ? reason.message : String(reason);
+      analyzedAt = new Date().toISOString();
+
+      if (sharedTimings) {
+        sharedTimings.analysisProvider = unified.provider;
+        sharedTimings.transcriptHash = unified.transcriptHash.slice(0, 16);
+        sharedTimings.analysisHash = unified.analysisHash.slice(0, 16);
+        if (precomputedUnifiedAnalysis || unified.cacheHit) {
+          sharedTimings.analysisCacheHit = true;
+        }
+      }
+
+      if (audioSha256 && !precomputedUnifiedAnalysis) {
+        attachCachedAnalysisToAudioHash({
+          audioSha256,
+          language,
+          provider: transcriptionProvider,
+          analysis: unified,
+        });
+      }
+
+      liveMilestones.summaryReady = Boolean(analysis.summary);
+      if ((analysis.actionItems?.length || 0) > 0) liveMilestones.tasksReady = true;
+      if ((generatedQuiz?.questions.length || 0) > 0) liveMilestones.quizReady = true;
+      if (generatedCards.length > 0) liveMilestones.flashcardsReady = true;
+      pushJobProgress({
+        progressPercent: 94,
+        analysisProvider: unified.provider,
+        progressiveSummary: analysis.executiveSummary || analysis.summary,
+        progressiveTasks: (analysis.actionItems || []).slice(0, 8).map((a) => ({
+          title: a.title,
+          ownerName: a.ownerName,
+          dueDate: a.dueDate,
+        })),
+        progressiveTasksCount: analysis.actionItems?.length || 0,
+        progressiveQuizCount: generatedQuiz?.questions.length || 0,
+        progressiveFlashcardsCount: generatedCards.length,
+      });
+      notifySync({
+        type: "SummaryReady",
+        userId,
+        id: resourceId,
+        resourceId,
+        resourceType,
+        jobId,
+        progress: 90,
+      });
+    } catch (reason) {
+      const status = extractHttpStatus(reason);
+      const retryable = isRetryableGeminiError(reason);
+      if (retryable) {
+        analysisStatus = "Unavailable";
+        analysisRetryable = true;
+        analysisError =
+          status === 503
+            ? "التحليل الذكي غير متاح مؤقتاً بسبب الضغط العالي على خوادم الذكاء الاصطناعي (HTTP 503 UNAVAILABLE). النص والتسجيل محفوظان بالكامل ويمكنك إعادة محاولة التحليل دون إعادة التسجيل."
+            : status === 429
+              ? "تم تجاوز حد الطلبات مؤقتاً (HTTP 429). النص والتسجيل محفوظان، يمكنك إعادة المحاولة بعد لحظات."
+              : `التحليل الذكي غير متاح مؤقتاً (${reason instanceof Error ? reason.message : String(reason)}). النص والتسجيل محفوظان، يمكنك إعادة المحاولة.`;
+      } else {
+        analysisStatus = "Failed";
+        analysisRetryable = false;
+        analysisError = reason instanceof Error ? reason.message : String(reason);
+      }
     }
+  } else {
+    async function withStageTimeout<T>(
+      task: () => Promise<T>,
+      label: string,
+      timeoutMs = 60000,
+    ): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          task(),
+          new Promise<T>((_, reject) => {
+            timer = setTimeout(() => {
+              reject(new Error(`AI pipeline stage "${label}" timed out after ${timeoutMs}ms.`));
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    async function runControlledConcurrency<T extends readonly (() => Promise<unknown>)[]>(
+      tasks: T,
+      maxConcurrency = 4,
+    ): Promise<{ [K in keyof T]: PromiseSettledResult<Awaited<ReturnType<T[K]>>> }> {
+      const results: PromiseSettledResult<unknown>[] = new Array(tasks.length);
+      let nextIndex = 0;
+      async function worker() {
+        while (nextIndex < tasks.length) {
+          const idx = nextIndex++;
+          try {
+            const val = await tasks[idx]();
+            results[idx] = { status: "fulfilled", value: val };
+          } catch (err) {
+            results[idx] = { status: "rejected", reason: err };
+          }
+        }
+      }
+      const workers = Array.from({ length: Math.min(maxConcurrency, tasks.length) }, () =>
+        worker(),
+      );
+      await Promise.all(workers);
+      return results as unknown as {
+        [K in keyof T]: PromiseSettledResult<Awaited<ReturnType<T[K]>>>;
+      };
+    }
+
+    let completedBranches = 0;
+    const bumpParallelPct = (opEn: string, opAr: string, extra?: Partial<JobRecord>) => {
+      completedBranches++;
+      const stagePct = Math.min(95, 25 + Math.round((completedBranches / 4) * 70));
+      const overallPct = Math.min(95, 80 + Math.round((completedBranches / 4) * 15));
+      pushJobProgress({
+        progressPercent: overallPct,
+        stageProgress: stagePct,
+        currentOperation: opEn,
+        currentOperationAr: opAr,
+        ...(extra || {}),
+      });
+    };
+
+    markStageLedger(stageLedger, correlationId, jobId, resourceId, "SUMMARY_COMPLETED", "running");
+    markStageLedger(stageLedger, correlationId, jobId, resourceId, "TASKS_COMPLETED", "running");
+    markStageLedger(stageLedger, correlationId, jobId, resourceId, "QUIZ_COMPLETED", "running");
+    markStageLedger(
+      stageLedger,
+      correlationId,
+      jobId,
+      resourceId,
+      "FLASHCARDS_COMPLETED",
+      "running",
+    );
+
+    const [summarySettled, deepSettled, quizSettled, cardsSettled, mindMapSettled] =
+      (await runControlledConcurrency(
+        [
+          () =>
+            withStageTimeout(
+              async () => {
+                const t0 = Date.now();
+                const res = await generateAiSummary(
+                  title,
+                  segments,
+                  resourceType,
+                  courseCode,
+                  appLanguage,
+                  { fastFallback: true },
+                );
+                const durMs = Math.max(1, Date.now() - t0);
+                if (sharedTimings) {
+                  sharedTimings.summaryMs = durMs;
+                  sharedTimings.tasksMs = durMs;
+                }
+                markStageLedger(
+                  stageLedger,
+                  correlationId,
+                  jobId,
+                  resourceId,
+                  "SUMMARY_COMPLETED",
+                  "completed",
+                  { durationMs: durMs },
+                );
+                markStageLedger(
+                  stageLedger,
+                  correlationId,
+                  jobId,
+                  resourceId,
+                  "TASKS_COMPLETED",
+                  "completed",
+                  {
+                    durationMs: durMs,
+                    detail: `${res.actionItems?.length || 0} tasks`,
+                  },
+                );
+                liveMilestones.summaryReady = true;
+                liveMilestones.tasksReady = true;
+
+                // Immediately persist summary to DB so users see it without waiting for Quiz/Flashcards
+                const tsNow = new Date().toISOString();
+                if (resourceType === "meeting") {
+                  db.update("meetings", (list) =>
+                    list.map((m) =>
+                      m.id === resourceId
+                        ? {
+                            ...m,
+                            summary: res.summary,
+                            executiveSummary: res.executiveSummary || res.summary,
+                            detailedSummary: res.detailedSummary || res.summary,
+                            keyPoints: res.keyPoints || [],
+                            decisions: res.decisions || [],
+                            updatedAt: tsNow,
+                          }
+                        : m,
+                    ),
+                  );
+                } else {
+                  db.update("lectures", (list) =>
+                    list.map((l) =>
+                      l.id === resourceId
+                        ? {
+                            ...l,
+                            studyNotes: res.summary,
+                            summary: res.summary,
+                            executiveSummary: res.executiveSummary || res.summary,
+                            detailedSummary: res.detailedSummary || res.summary,
+                            updatedAt: tsNow,
+                          }
+                        : l,
+                    ),
+                  );
+                }
+
+                bumpParallelPct(
+                  "Summary & action items ready — finishing quiz & flashcards...",
+                  "الملخص والمهام جاهزان — جاري استكمال الاختبار والبطاقات...",
+                  {
+                    progressiveSummary: res.executiveSummary || res.summary,
+                    progressiveTasks: (res.actionItems || []).slice(0, 8).map((a) => ({
+                      title: a.title,
+                      ownerName: a.ownerName,
+                      dueDate: a.dueDate,
+                    })),
+                    progressiveTasksCount: res.actionItems?.length || 0,
+                  },
+                );
+                return res;
+              },
+              "summary",
+              60000,
+            ),
+          () =>
+            withStageTimeout(
+              () =>
+                generateAiLectureAnalysis(title, segments, resourceType, courseCode, appLanguage),
+              "deep_analysis",
+              45000,
+            ),
+          () =>
+            withStageTimeout(
+              async () => {
+                const t0 = Date.now();
+                const res = await generateAiQuiz(title, segments, undefined, courseCode, {
+                  appLanguage,
+                  fastFallback: true,
+                });
+                const durMs = Math.max(1, Date.now() - t0);
+                if (sharedTimings) sharedTimings.quizMs = durMs;
+                markStageLedger(
+                  stageLedger,
+                  correlationId,
+                  jobId,
+                  resourceId,
+                  "QUIZ_COMPLETED",
+                  "completed",
+                  {
+                    durationMs: durMs,
+                    detail: `${res.questions.length} questions`,
+                  },
+                );
+                liveMilestones.quizReady = true;
+
+                if (res.questions.length > 0) {
+                  const tsNow = new Date().toISOString();
+                  db.update("quizzes", (quizzes) => [
+                    {
+                      id: `quiz_${runId}`,
+                      ...(resourceType === "meeting"
+                        ? { meetingId: resourceId }
+                        : { lectureId: resourceId }),
+                      title: res.title,
+                      courseCode,
+                      questions: res.questions,
+                      attemptsCount: 0,
+                      createdAt: tsNow,
+                    },
+                    ...quizzes.filter((q) =>
+                      resourceType === "meeting"
+                        ? q.meetingId !== resourceId
+                        : q.lectureId !== resourceId,
+                    ),
+                  ]);
+                }
+
+                bumpParallelPct(
+                  `Quiz ready (${res.questions.length} questions)...`,
+                  `الاختبار جاهز (${res.questions.length} أسئلة)...`,
+                  { progressiveQuizCount: res.questions.length },
+                );
+                return res;
+              },
+              "quiz",
+              55000,
+            ),
+          () =>
+            withStageTimeout(
+              async () => {
+                const t0 = Date.now();
+                const res = await generateAiFlashcards(
+                  title,
+                  segments,
+                  undefined,
+                  courseCode,
+                  appLanguage,
+                );
+                const durMs = Math.max(1, Date.now() - t0);
+                if (sharedTimings) sharedTimings.flashcardsMs = durMs;
+                markStageLedger(
+                  stageLedger,
+                  correlationId,
+                  jobId,
+                  resourceId,
+                  "FLASHCARDS_COMPLETED",
+                  "completed",
+                  {
+                    durationMs: durMs,
+                    detail: `${res.length} flashcards`,
+                  },
+                );
+                liveMilestones.flashcardsReady = true;
+
+                if (res.length > 0) {
+                  const tsNow = new Date().toISOString();
+                  db.update("flashcards", (cards) => [
+                    ...res.map((c, idx) => ({
+                      id: `fc_${runId}_${idx + 1}`,
+                      deckId: `deck_${resourceId}`,
+                      deckTitle: title.length > 35 ? title.slice(0, 35) + "..." : title,
+                      ...(resourceType === "meeting"
+                        ? { meetingId: resourceId }
+                        : { lectureId: resourceId }),
+                      front: c.front,
+                      back: c.back,
+                      sourceReference: c.sourceReference,
+                      topic: c.topic,
+                      difficulty: c.difficulty,
+                      mastered: false,
+                      reviewCount: 0,
+                      createdAt: tsNow,
+                    })),
+                    ...cards.filter((c) =>
+                      resourceType === "meeting"
+                        ? c.meetingId !== resourceId
+                        : c.lectureId !== resourceId,
+                    ),
+                  ]);
+                }
+
+                bumpParallelPct(
+                  `Flashcards ready (${res.length} cards)...`,
+                  `البطاقات التعليمية جاهزة (${res.length} بطاقة)...`,
+                  { progressiveFlashcardsCount: res.length },
+                );
+                return res;
+              },
+              "flashcards",
+              45000,
+            ),
+          () =>
+            withStageTimeout(
+              () => generateAiMindMap(title, segments, undefined, courseCode, appLanguage),
+              "mindmap",
+              45000,
+            ),
+        ],
+        4,
+      )) as [
+        PromiseSettledResult<Awaited<ReturnType<typeof generateAiSummary>>>,
+        PromiseSettledResult<Awaited<ReturnType<typeof generateAiLectureAnalysis>>>,
+        PromiseSettledResult<Awaited<ReturnType<typeof generateAiQuiz>>>,
+        PromiseSettledResult<Awaited<ReturnType<typeof generateAiFlashcards>>>,
+        PromiseSettledResult<Awaited<ReturnType<typeof generateAiMindMap>>>,
+      ];
+
+    if (summarySettled.status === "fulfilled") {
+      analysis = summarySettled.value;
+      analysisStatus = "Completed";
+      analysisRetryable = false;
+      analyzedAt = new Date().toISOString();
+      notifySync({
+        type: "SummaryReady",
+        userId,
+        id: resourceId,
+        resourceId,
+        resourceType,
+        jobId,
+        progress: 88,
+      });
+    } else {
+      const reason = summarySettled.reason;
+      const status = extractHttpStatus(reason);
+      const retryable = isRetryableGeminiError(reason);
+      if (retryable) {
+        analysisStatus = "Unavailable";
+        analysisRetryable = true;
+        analysisError =
+          status === 503
+            ? "التحليل الذكي غير متاح مؤقتاً بسبب الضغط العالي على خوادم الذكاء الاصطناعي (HTTP 503 UNAVAILABLE). النص والتسجيل محفوظان بالكامل ويمكنك إعادة محاولة التحليل دون إعادة التسجيل."
+            : status === 429
+              ? "تم تجاوز حد الطلبات مؤقتاً (HTTP 429). النص والتسجيل محفوظان، يمكنك إعادة المحاولة بعد لحظات."
+              : `التحليل الذكي غير متاح مؤقتاً (${reason instanceof Error ? reason.message : String(reason)}). النص والتسجيل محفوظان، يمكنك إعادة المحاولة.`;
+      } else {
+        analysisStatus = "Failed";
+        analysisRetryable = false;
+        analysisError = reason instanceof Error ? reason.message : String(reason);
+      }
+    }
+
+    deepAnalysis = deepSettled.status === "fulfilled" ? deepSettled.value : undefined;
+    generatedQuiz = quizSettled.status === "fulfilled" ? quizSettled.value : undefined;
+    generatedCards = cardsSettled.status === "fulfilled" ? cardsSettled.value : [];
+    generatedMindMap = mindMapSettled.status === "fulfilled" ? mindMapSettled.value : undefined;
   }
 
-  const deepAnalysis = deepSettled.status === "fulfilled" ? deepSettled.value : undefined;
-  const generatedQuiz = quizSettled.status === "fulfilled" ? quizSettled.value : undefined;
-  const generatedCards = cardsSettled.status === "fulfilled" ? cardsSettled.value : [];
-  const generatedMindMap = mindMapSettled.status === "fulfilled" ? mindMapSettled.value : undefined;
+  const geminiAnalysisMs = precomputedUnifiedAnalysis ? 0 : Date.now() - analysisStartedAt;
+  if (sharedTimings) {
+    sharedTimings.geminiAnalysisMs = geminiAnalysisMs;
+    if (precomputedUnifiedAnalysis || geminiAnalysisMs < 15) {
+      sharedTimings.analysisCacheHit =
+        sharedTimings.analysisCacheHit ?? Boolean(precomputedUnifiedAnalysis);
+    }
+  }
+  logStageTiming(correlationId, "GEMINI_COMPLETE", geminiAnalysisMs, {
+    mode: useParallelMode ? "parallel" : "unified",
+    provider: sharedTimings?.analysisProvider || "gemini",
+    cacheHit: Boolean(sharedTimings?.analysisCacheHit),
+  });
+
+  checkCancelled?.();
 
   // Merge AI-detected important sentences with cue-based highlights (preserving timestamps)
   const highlights = [...cueHighlights];
@@ -2225,6 +3971,24 @@ export async function runUnifiedPostTranscriptionPipeline(
   }
 
   const now = new Date().toISOString();
+  const dbSaveStartedAt = Date.now();
+  liveMilestones.completed = true;
+  if (combinedTasks.length > 0) liveMilestones.tasksReady = true;
+  pushJobProgress({
+    status: "Generating Results",
+    stage: "GeneratingResults",
+    progressPercent: 96,
+    progressiveTasksCount: combinedTasks.length,
+  });
+  logObservabilityEvent("info", "ai_analysis_completed", {
+    correlationId,
+    jobId,
+    resourceId,
+    analysisStatus,
+    quizQuestionsCount: generatedQuiz?.questions.length || 0,
+    flashcardsCount: generatedCards.length,
+    tasksCount: combinedTasks.length,
+  });
 
   // STEP 3: Persist Complete Record + Any Derived Intelligence Artifacts
   if (resourceType === "meeting") {
@@ -2238,10 +4002,19 @@ export async function runUnifiedPostTranscriptionPipeline(
           ...m,
           status: "Completed",
           transcriptionStatus: "Completed",
+          transcriptStatus: "final_verified",
           analysisStatus,
           analysisError,
           analysisRetryable,
           analyzedAt,
+          transcriptId: transcriptId || m.transcriptId,
+          transcriptionProvider: transcriptionProvider || m.transcriptionProvider,
+          asrModel: asrModel || m.asrModel,
+          languageConfig: languageConfig || m.languageConfig,
+          diarizationEnabled: diarizationEnabled ?? m.diarizationEnabled,
+          averageConfidence: averageConfidence ?? m.averageConfidence,
+          correlationId,
+          speakerBreakdown,
           language,
           durationSeconds: Math.max(1, durationSeconds, m.durationSeconds || 1),
           recordingPath: recordingPath || m.recordingPath,
@@ -2270,6 +4043,10 @@ export async function runUnifiedPostTranscriptionPipeline(
                 reviewAreas: deepAnalysis.reviewAreas,
               }
             : undefined,
+          rawTranscript,
+          finalTranscript,
+          processedTranscript,
+          rawSegments,
           fullText,
           segments,
           updatedAt: now,
@@ -2371,10 +4148,19 @@ export async function runUnifiedPostTranscriptionPipeline(
           ...l,
           status: "Completed",
           transcriptionStatus: "Completed",
+          transcriptStatus: "final_verified",
           analysisStatus,
           analysisError,
           analysisRetryable,
           analyzedAt,
+          transcriptId: transcriptId || l.transcriptId,
+          transcriptionProvider: transcriptionProvider || l.transcriptionProvider,
+          asrModel: asrModel || l.asrModel,
+          languageConfig: languageConfig || l.languageConfig,
+          diarizationEnabled: diarizationEnabled ?? l.diarizationEnabled,
+          averageConfidence: averageConfidence ?? l.averageConfidence,
+          correlationId,
+          speakerBreakdown,
           language,
           durationSeconds: Math.max(1, durationSeconds, l.durationSeconds || 1),
           recordingPath: recordingPath || l.recordingPath,
@@ -2408,6 +4194,10 @@ export async function runUnifiedPostTranscriptionPipeline(
                 reviewAreas: deepAnalysis.reviewAreas,
               }
             : undefined,
+          rawTranscript,
+          finalTranscript,
+          processedTranscript,
+          rawSegments,
           fullText,
           segments,
           updatedAt: now,
@@ -2554,6 +4344,16 @@ export async function runUnifiedPostTranscriptionPipeline(
       progress: 100,
     });
   }
+
+  const dbSaveMs = Date.now() - dbSaveStartedAt;
+  if (sharedTimings) {
+    sharedTimings.databaseSaveMs = dbSaveMs;
+  }
+  liveMilestones.databaseSaved = true;
+  markStageLedger(stageLedger, correlationId, jobId, resourceId, "DATABASE_SAVED", "completed", {
+    durationMs: dbSaveMs,
+  });
+  logStageTiming(correlationId, "DATABASE_SAVE", dbSaveMs);
 
   return {
     summary: analysis?.summary,

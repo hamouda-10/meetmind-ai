@@ -163,6 +163,38 @@ const STOP_WORDS = new Set([
   "ده",
   "دي",
   "تم",
+  "دلوقتي",
+  "عندي",
+  "عندك",
+  "عندنا",
+  "طيب",
+  "واحد",
+  "واحده",
+  "تاني",
+  "تانيه",
+  "حاجه",
+  "حاجات",
+  "بقي",
+  "بقيت",
+  "مثلا",
+  "طبعا",
+  "اكيد",
+  "خلاص",
+  "ببساطه",
+  "ليه",
+  "ازاي",
+  "لازم",
+  "كمان",
+  "برضو",
+  "اوي",
+  "فقط",
+  "ايضا",
+  "لو",
+  "بس",
+  "مش",
+  "ولا",
+  "شخص",
+  "فاهم",
   "رحمه",
   "الله",
   "السلام",
@@ -519,15 +551,16 @@ function extractStructuredFacts(segments: TranscriptSegment[]): ExtractedFact[] 
       });
     }
 
-    // 2. Location / zone / code identifiers (e.g. "في مدينتي منطقة B11", "في مدينتي منبتقد B11")
+    // 2. Location / zone / code identifiers (e.g. "في مدينتي منطقة B11", "في مدينتي منبتقد B11", "منطقة النرجس")
+    // Strictly avoid matching generic Arabic prepositions like "في حياتك" or "في البرمجة".
     const locRegex =
-      /(?:في|بـ|منطقة|مدينة|حي|مشروع|كمبوند)\s+([\u0600-\u06FFA-Za-z0-9]{2,}(?:\s+(?:منطقة|منطقه|منبتقد|مبتائد|حي|مرحلة|قطاع|بوابة)?\s*[\u0600-\u06FFA-Za-z0-9]{1,}){0,3})/g;
+      /(?:(?:منطقة|منطقه|مدينة|مدينه|حي|مشروع|كمبوند)\s+([\u0600-\u06FFA-Za-z0-9]{2,}(?:\s+(?:منطقة|منطقه|منبتقد|مبتائد|حي|مرحلة|قطاع|بوابة)?\s*[\u0600-\u06FFA-Za-z0-9]{1,}){0,3})|(?:في|بـ)\s+((?:مدينتي|التجمع(?:\s+(?:الخامس|الأول|الاول|الثالث))?|الشيخ\s+زايد|أكتوبر|اكتوبر|6\s*(?:أكتوبر|اكتوبر)|العاصمة(?:\s+الإدارية)?|القاهرة(?:\s+الجديدة)?|الإسكندرية|الاسكندرية|المعادي|مدينة\s+نصر|مصر\s+الجديدة|المهندسين|الدقي|الرحاب|الشروق|العبور|بدر|الجيزة)(?:\s+(?:منطقة|منطقه|منبتقد|مبتائد|حي|مرحلة|قطاع|بوابة)?\s*[\u0600-\u06FFA-Za-z0-9]{1,}){0,3}|[\u0600-\u06FFA-Za-z0-9]{2,}\s+(?:منطقة|منطقه|منبتقد|مبتائد|حي|مرحلة|قطاع|بوابة)\s*[\u0600-\u06FFA-Za-z0-9]{1,}))/g;
     const nonLocationPattern =
-      /^(?:حدود|نطاق|حوالي|تقريبا|قرابه|متوسط|المتوسط|حاله|حالة|وقت|بدايه|نهايه|المقام|يوغاردن|جاردن|فيو|اطلاله|\d)/i;
+      /^(?:حدود|نطاق|حوالي|تقريبا|قرابه|متوسط|المتوسط|حاله|حالة|وقت|بدايه|نهايه|المقام|يوغاردن|جاردن|فيو|اطلاله|حياتك|حياتنا|حياتي|البرمجه|البرمجة|الكورس|المحاضره|المحاضرة|الفيديو|الكمبيوتر|الاول|الأول|الاخر|الآخر|\d)/i;
     const currencyOrUnitInLoc = /(?:مليون|جنيه|دولار|ريال|يورو|متر|متل|غرف|حمام|دقيق|ساع)/i;
     let locMatch: RegExpExecArray | null;
     while ((locMatch = locRegex.exec(rawText)) !== null) {
-      const rawLoc = (locMatch[1] || "")
+      const rawLoc = (locMatch[1] || locMatch[2] || "")
         .replace(/\s+(?:في\s+حدود|بحدود|بسعر|بمساحة|مساحة).*$/i, "")
         .replace(/\s+(?:منبتقد|مبتائد|منطقه)\s+/g, " - منطقة ")
         .replace(/[،,.!?؟]+$/, "")
@@ -649,16 +682,27 @@ function extractStructuredFacts(segments: TranscriptSegment[]): ExtractedFact[] 
     }
   }
 
-  // 6. Explicit definitions across clauses
+  // 6. Explicit definitions across clauses (strictly genuine academic/technical definitions,
+  // avoiding conversational Arabic filler like "فغالبا السبب هو" or "فا يعني")
+  const conversationalNonTermRx =
+    /\b(?:انا|أنا|انت|أنت|عندي|عندك|غالبا|فغالبا|السبب|وقلت|خلاص|كده|دلوقتي|طيب|يعني|لو|عشان|علشان|ممكن|عايز|تاني|حاجة|حاجه)\b/i;
   for (const cl of clauses) {
     const defMatch = cl.text.match(
-      /([^.!؟?\n]{3,42}?)\s+(?:is defined as|is a|means|refers to|stands for|هو|هي|يعني|يُعرف\s*بأنه|عبارة\s*عن)\s+([^.!؟?\n]{10,160})/i,
+      /^([\u0600-\u06FFA-Za-z0-9\s()-]{3,28}?)\s+(?:is defined as|refers to|stands for|يُعرف\s*بأنه|يعرف\s*بأنه|تعريفه\s*هو|معناه\s*هو|يُقصد\s*به|يقصد\s*به|هو\s+عبارة\s*عن|هي\s+عبارة\s*عن|عبارة\s*عن)\s+([^.!؟?\n]{10,160})/i,
     );
     if (defMatch) {
-      const term = defMatch[1].trim();
+      const term = defMatch[1].replace(/^[،,.\s]+|[،,.\s]+$/g, "").trim();
       const def = defMatch[2].trim();
+      const termWords = term.split(/\s+/).filter(Boolean);
       const key = `def:${normalizeText(term)}`;
-      if (term.length >= 2 && def.length >= 8 && !seenValues.has(key)) {
+      if (
+        term.length >= 3 &&
+        termWords.length <= 4 &&
+        def.length >= 10 &&
+        !conversationalNonTermRx.test(term) &&
+        !STOP_WORDS.has(normalizeText(term)) &&
+        !seenValues.has(key)
+      ) {
         seenValues.add(key);
         facts.push({
           kind: "definition",
@@ -1204,10 +1248,10 @@ const KNOWLEDGE_BASE: KnowledgeTopic[] = [
 // MANDATORY AI IDENTITY HANDLER (ARABIC & ENGLISH — CONTEXT-AWARE, NON-REPETITIVE)
 // ============================================================================
 export const MEETMIND_IDENTITY_AR =
-  "أنا MeetMind AI، المساعد الذكي داخل منصة MeetMind AI.\nتم تطويري وبرمجتي بواسطة مجموعة من مهندسي البرمجة من قسم علوم الحاسب في Modern Academy.";
+  "تم تطويري بواسطة مجموعة من طلاب هندسة البرمجيات من قسم علوم الحاسب في Modern Academy كجزء من مشروع التخرج MeetMind AI.";
 
 export const MEETMIND_IDENTITY_EN =
-  "I am MeetMind AI, the intelligent assistant integrated into the MeetMind AI platform.\nI was programmed and developed by a group of software engineering students from the Computer Science Department at Modern Academy.";
+  "I was developed by a group of software engineering students from the Computer Science Department at Modern Academy as part of the MeetMind AI graduation project.";
 
 export function tryAnswerIdentityQuery(
   question: string,
@@ -1675,27 +1719,36 @@ export function buildBuiltInSummary(
     for (const cl of clauses.slice(0, 4)) pushPoint(cl.text);
   }
 
-  const themeList = (keyPhrases.length > 0 ? keyPhrases : terms).slice(0, 4);
-  const specDigest = facts
-    .filter((f) => f.kind === "spec" || f.kind === "entity")
+  const themeList = (keyPhrases.length > 0 ? keyPhrases : terms).slice(0, 5);
+  const highValueSpecs = facts.filter(
+    (f) =>
+      (f.kind === "spec" && f.labelAr !== "المدة الزمنية" && f.labelAr !== "القيمة الرقمية") ||
+      f.kind === "entity",
+  );
+  const specDigest = highValueSpecs
     .slice(0, 4)
     .map((f) => (isAr ? `${f.labelAr}: ${f.value}` : `${f.labelEn}: ${f.value}`));
 
   const leadSnippet = clauses[0]?.text.slice(0, 190) || scoredSegs[0]?.seg.text.slice(0, 190) || "";
+  const secondSnippet =
+    scoredSegs
+      .map((s) => s.seg.text.trim())
+      .find((t) => t.length >= 25 && t !== clauses[0]?.segmentText)
+      ?.slice(0, 180) || "";
 
   const executiveSummary = isAr
     ? `تتناول ${type === "lecture" ? "المحاضرة" : "الجلسة"} «${title}»${courseCode ? ` (${courseCode})` : ""} ${
-        specDigest.length > 0
+        specDigest.length > 0 && type !== "lecture"
           ? `مجموعة من التفاصيل والمواصفات المحددة تشمل: ${specDigest.join("، ")}.`
           : themeList.length > 0
-            ? `محاور أساسية أبرزها: ${themeList.join("، ")}.`
+            ? `محاور أساسية أبرزها: ${themeList.join("، ")}.${secondSnippet ? ` ومن أبرز ما ورد فيها: «${secondSnippet}».` : ""}`
             : `${leadSnippet}`
       }`
     : `This ${type} ("${title}"${courseCode ? ` — ${courseCode}` : ""}) covers ${
-        specDigest.length > 0
+        specDigest.length > 0 && type !== "lecture"
           ? `specific details including ${specDigest.join(", ")}.`
           : themeList.length > 0
-            ? `key topics including ${themeList.join(", ")}.`
+            ? `key topics including ${themeList.join(", ")}.${secondSnippet ? ` Key takeaway: "${secondSnippet}".` : ""}`
             : leadSnippet
       }`;
 

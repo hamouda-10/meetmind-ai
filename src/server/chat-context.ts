@@ -356,13 +356,13 @@ export function buildConversationalIdentityReply(intent: ChatIntentProfile): str
 
   if (intent.identityAlreadyAnsweredRecently) {
     return intent.isArabic
-      ? "أنا MeetMind AI 😄\nولو تقصد مين اللي طورني، فأنا تم تطويري بواسطة مجموعة من مهندسي البرمجة من قسم علوم الحاسب في Modern Academy. تحب أساعدك في إيه دلوقتي؟"
-      : "Still me — MeetMind AI! As mentioned, I was developed by software engineering students from the Computer Science Department at Modern Academy. What would you like to explore next?";
+      ? "أنا MeetMind AI 😄\nوكما ذكرت، تم تطويري بواسطة مجموعة من طلاب هندسة البرمجيات من قسم علوم الحاسب في Modern Academy كجزء من مشروع التخرج MeetMind AI. تحب أساعدك في إيه دلوقتي؟"
+      : "Still me — MeetMind AI! As mentioned, I was developed by a group of software engineering students from the Computer Science Department at Modern Academy as part of the MeetMind AI graduation project. What would you like to explore next?";
   }
 
   return intent.isArabic
-    ? "أنا MeetMind AI، المساعد الذكي داخل منصة MeetMind AI.\nتم تطويري وبرمجتي بواسطة مجموعة من مهندسي البرمجة من قسم علوم الحاسب في Modern Academy."
-    : "I am MeetMind AI, the intelligent assistant integrated into the MeetMind AI platform.\nI was programmed and developed by a group of software engineering students from the Computer Science Department at Modern Academy.";
+    ? "تم تطويري بواسطة مجموعة من طلاب هندسة البرمجيات من قسم علوم الحاسب في Modern Academy كجزء من مشروع التخرج MeetMind AI."
+    : "I was developed by a group of software engineering students from the Computer Science Department at Modern Academy as part of the MeetMind AI graduation project.";
 }
 
 /**

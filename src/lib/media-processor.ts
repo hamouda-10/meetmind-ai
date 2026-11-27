@@ -194,31 +194,57 @@ async function uploadLargeFileInChunks(params: {
   }
 
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE_BYTES);
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE_BYTES;
-    const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
-    const chunkBlob = file.slice(start, end);
+  const chunkLoadedBytes = new Array<number>(totalChunks).fill(0);
+  const reportBytesProgress = () => {
+    if (!onUploadProgress || file.size <= 0) return;
+    let totalLoaded = 0;
+    for (let k = 0; k < chunkLoadedBytes.length; k++) totalLoaded += chunkLoadedBytes[k];
+    const pct = Math.min(99, Math.max(1, Math.round((totalLoaded / file.size) * 100)));
+    onUploadProgress(pct);
+  };
 
-    let uploaded = false;
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await api.uploadChunk(initRes.uploadId, i, chunkBlob);
-        uploaded = true;
+  // Parallel binary chunk upload (concurrency = 4) with real byte-level XHR progress
+  const maxConcurrency = Math.min(4, totalChunks);
+  let nextChunkIndex = 0;
+  let fatalErr: unknown = null;
+
+  const uploadWorker = async () => {
+    while (!fatalErr) {
+      const i = nextChunkIndex++;
+      if (i >= totalChunks) break;
+      const start = i * CHUNK_SIZE_BYTES;
+      const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
+      const chunkBlob = file.slice(start, end);
+      const chunkSize = end - start;
+
+      let uploaded = false;
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await api.uploadChunk(initRes.uploadId!, i, chunkBlob, (loaded) => {
+            chunkLoadedBytes[i] = Math.min(chunkSize, loaded);
+            reportBytesProgress();
+          });
+          chunkLoadedBytes[i] = chunkSize;
+          reportBytesProgress();
+          uploaded = true;
+          break;
+        } catch (err) {
+          lastErr = err;
+          chunkLoadedBytes[i] = 0;
+          await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+        }
+      }
+      if (!uploaded) {
+        fatalErr = lastErr instanceof Error ? lastErr : new Error("Failed to upload file chunk.");
         break;
-      } catch (err) {
-        lastErr = err;
-        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
       }
     }
-    if (!uploaded) {
-      throw lastErr instanceof Error ? lastErr : new Error("Failed to upload file chunk.");
-    }
+  };
 
-    if (onUploadProgress) {
-      const pct = Math.min(99, Math.round(((i + 1) / totalChunks) * 100));
-      onUploadProgress(pct);
-    }
+  await Promise.all(Array.from({ length: maxConcurrency }, () => uploadWorker()));
+  if (fatalErr) {
+    throw fatalErr;
   }
 
   const doneRes = await api.completeChunkedUpload(initRes.uploadId);
